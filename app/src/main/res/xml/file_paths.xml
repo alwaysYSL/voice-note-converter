@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path name="shared_audio" path="shared_voice_notes/" />
+    <external-path name="public_voice_notes" path="Music/VoiceNoteConverter/" />
+</paths>

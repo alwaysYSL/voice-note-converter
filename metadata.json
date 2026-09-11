@@ -1,0 +1,6 @@
+{
+  "name": "Voice Note Converter",
+  "description": "Convert MP4/MP3 to Telegram voice notes (OGG Opus mono 32kbps) and send directly to Telegram contacts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
