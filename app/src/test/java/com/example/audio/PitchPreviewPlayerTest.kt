@@ -40,16 +40,16 @@ class PitchPreviewPlayerTest {
     }
 
     @Test
-    fun `starting a preview keeps the selected pitch`() {
+    fun `setting pitch after starting a preview updates the selected pitch`() {
         val preview = AudioPreviewPlayer(
             ApplicationProvider.getApplicationContext<Application>(),
             CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         )
         try {
+            preview.play(Uri.parse("content://example/audio"))
             AudioPreviewPlayer::class.java
                 .getDeclaredMethod("setPitchPreview", Float::class.javaPrimitiveType)
                 .invoke(preview, 1.5f)
-            preview.play(Uri.parse("content://example/audio"))
 
             val player = AudioPreviewPlayer::class.java
                 .getDeclaredField("player")
@@ -58,6 +58,31 @@ class PitchPreviewPlayerTest {
                     field.get(preview) as ExoPlayer
                 }
             assertEquals(1.5f, player.playbackParameters.pitch)
+        } finally {
+            preview.release()
+        }
+    }
+
+    @Test
+    fun `starting a new source clears the previous source pitch`() {
+        val preview = AudioPreviewPlayer(
+            ApplicationProvider.getApplicationContext<Application>(),
+            CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        )
+        try {
+            preview.play(Uri.parse("content://example/source"))
+            AudioPreviewPlayer::class.java
+                .getDeclaredMethod("setPitchPreview", Float::class.javaPrimitiveType)
+                .invoke(preview, 1.5f)
+            preview.play(Uri.parse("content://example/converted"))
+
+            val player = AudioPreviewPlayer::class.java
+                .getDeclaredField("player")
+                .let { field ->
+                    field.isAccessible = true
+                    field.get(preview) as ExoPlayer
+                }
+            assertEquals(1f, player.playbackParameters.pitch)
         } finally {
             preview.release()
         }

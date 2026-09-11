@@ -157,15 +157,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val snapped = if (kotlin.math.abs(semitones) < 0.15f) 0f else semitones
         val clamped = snapped.coerceIn(-4f, 4f)
         _uiState.update { it.copy(pitchSemitones = clamped) }
-        val factor = 2.0.pow((clamped / 12f).toDouble()).toFloat()
-        audioPlayer.setPitchPreview(factor)
+        audioPlayer.setPitchPreview(pitchFactorForPreview(_uiState.value))
     }
 
     fun previewTrim() {
         val state = _uiState.value
         val uri = state.selectedFileUri ?: return
         audioPlayer.setClipping(state.trimState.startMs, state.trimState.endMs)
-        audioPlayer.play(uri)
+        audioPlayer.play(uri, pitchFactor = pitchFactorForPreview(state))
         loadedPlaybackUri = uri
     }
 
@@ -175,12 +174,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun togglePlayback() {
-        val source = _uiState.value.previewUri() ?: return
+        val state = _uiState.value
+        val source = state.previewUri() ?: return
         if (loadedPlaybackUri == source && playbackState.value.totalDurationMs > 0L) {
             audioPlayer.togglePlayPause()
         } else {
             audioPlayer.clearClipping()
-            audioPlayer.play(source)
+            audioPlayer.play(source, pitchFactor = pitchFactorForPreview(state))
             loadedPlaybackUri = source
         }
     }
@@ -284,6 +284,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun fail(message: String, canRetry: Boolean) {
         _uiState.update { it.copy(processStatus = ProcessStatus.FAILED, errorMessage = message, canRetry = canRetry) }
+    }
+
+    private fun pitchFactorForPreview(state: MainUiState): Float {
+        if (state.convertedUri != null) return 1f
+        return 2.0.pow((state.pitchSemitones / 12f).toDouble()).toFloat()
     }
 
     override fun onCleared() {

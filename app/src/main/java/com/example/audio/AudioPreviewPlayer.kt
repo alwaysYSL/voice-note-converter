@@ -80,15 +80,19 @@ class AudioPreviewPlayer(
         })
     }
 
-    fun play(uri: Uri) {
+    fun play(uri: Uri, pitchFactor: Float = 1f) {
         stopPlayback(resetPlaybackParameters = false)
+        player.playbackParameters = PlaybackParameters(
+            player.playbackParameters.speed,
+            pitchFactor.coerceIn(0.25f, 4f)
+        )
         currentUri = uri
         player.setMediaItem(mediaItem(uri))
         player.prepare()
         player.playWhenReady = true
     }
 
-    fun play(file: File) = play(file.toUri())
+    fun play(file: File, pitchFactor: Float = 1f) = play(file.toUri(), pitchFactor)
 
     fun pause() {
         player.playWhenReady = false
