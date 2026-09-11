@@ -13,6 +13,7 @@
 /captures
 .externalNativeBuild
 .cxx
+.worktrees/
 local.properties
 .env
 debug.keystore
