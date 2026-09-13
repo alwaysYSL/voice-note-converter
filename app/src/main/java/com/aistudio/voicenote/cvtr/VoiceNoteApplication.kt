@@ -4,10 +4,12 @@ import android.app.Application
 import androidx.work.Configuration
 import androidx.work.WorkManager
 import com.aistudio.voicenote.cvtr.work.MaintenanceScheduler
+import com.aistudio.voicenote.cvtr.ui.BatchQueueStore
 
 class VoiceNoteApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        BatchQueueStore(this).clear()
         try {
             MaintenanceScheduler.schedule(this)
         } catch (_: IllegalStateException) {

@@ -10,7 +10,9 @@ data class BatchQueueItem(
     val state: WorkInfo.State,
     val progress: Int,
     val errorMessage: String?,
+    val canRetry: Boolean = false,
     val inputUri: String,
+    val sourceUri: String = inputUri,
     val trimStartMs: Long,
     val trimEndMs: Long,
     val pitchSemitones: Float,
@@ -31,12 +33,21 @@ internal fun WorkInfo.toBatchQueueItem(metadata: BatchQueueMetadata): BatchQueue
             .getString(ConversionWork.RESULT_OUTPUT_FILE_NAME)
             .orEmpty()
             .ifBlank { metadata.outputFileName },
-        state = state,
+        state = if (
+            state == WorkInfo.State.SUCCEEDED &&
+            outputData.getBoolean(ConversionWork.LOGICAL_FAILURE, false)
+        ) {
+            WorkInfo.State.FAILED
+        } else {
+            state
+        },
         progress = (progress.getFloat(ConversionWork.PROGRESS, 0f) * 100f)
             .toInt()
             .coerceIn(0, 100),
         errorMessage = outputData.getString(ConversionWork.ERROR_MESSAGE),
+        canRetry = outputData.getBoolean(ConversionWork.CAN_RETRY, false),
         inputUri = metadata.inputUri,
+        sourceUri = metadata.sourceUri,
         trimStartMs = metadata.trimStartMs,
         trimEndMs = metadata.trimEndMs,
         pitchSemitones = metadata.pitchSemitones,

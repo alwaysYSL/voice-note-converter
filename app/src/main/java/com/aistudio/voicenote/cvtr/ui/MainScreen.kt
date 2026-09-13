@@ -184,6 +184,8 @@ fun MainScreen(
                     message = batchMessage,
                     onRetry = viewModel::retryBatch,
                     onCancel = viewModel::cancelBatch,
+                    onDismissItem = viewModel::dismissBatch,
+                    onDismissAll = viewModel::dismissAllBatch,
                     onDismissMessage = viewModel::clearBatchMessage
                 )
             }

@@ -651,17 +651,16 @@ class MainViewModel(
         val distinctUris = uris.distinct()
         if (distinctUris.isEmpty()) return
         viewModelScope.launch(Dispatchers.IO) {
-            var enqueuedCount = 0
+            val prepared = mutableListOf<Pair<BatchQueueMetadata, androidx.work.OneTimeWorkRequest>>()
             var failedCount = 0
             distinctUris.forEach { uri ->
                 var cachedUri: Uri? = null
-                var batchItemId: String? = null
                 try {
                     val sourceName = MediaInputCache.displayName(context, uri)
                         .orEmpty()
                         .ifBlank { "voice_note" }
                     cachedUri = MediaInputCache.copyToPersistent(context, uri)
-                    batchItemId = UUID.randomUUID().toString()
+                    val batchItemId = UUID.randomUUID().toString()
                     val outputName = VoiceNoteStorage.suggestedOutputFileName(sourceName)
                     val request = ConversionWork.request(
                         inputUri = cachedUri,
@@ -673,30 +672,46 @@ class MainViewModel(
                         batchItemId = batchItemId,
                         sourceFileName = sourceName
                     )
-                    batchStore.put(
-                        BatchQueueMetadata(
-                            id = batchItemId,
-                            workId = request.id,
-                            sourceFileName = sourceName,
-                            outputFileName = outputName,
-                            inputUri = cachedUri.toString()
-                        )
+                    val metadata = BatchQueueMetadata(
+                        id = batchItemId,
+                        workId = request.id,
+                        sourceFileName = sourceName,
+                        outputFileName = outputName,
+                        inputUri = cachedUri.toString(),
+                        sourceUri = uri.toString()
                     )
-                    manager.enqueueUniqueWork(
-                        ConversionWork.batchTag(batchItemId),
-                        androidx.work.ExistingWorkPolicy.REPLACE,
-                        request
-                    )
-                    enqueuedCount += 1
+                    batchStore.put(metadata)
+                    prepared += metadata to request
                 } catch (error: Throwable) {
                     failedCount += 1
                     cachedUri?.let { MediaInputCache.delete(context, it) }
-                    Log.e(TAG, "Gagal memasukkan item batch $uri", error)
-                    batchItemId?.let(batchStore::remove)
+                    Log.e(TAG, "Gagal menyiapkan item batch $uri", error)
                 }
             }
+            if (prepared.isNotEmpty()) {
+                runCatching {
+                    var continuation = manager.beginUniqueWork(
+                        ConversionWork.BATCH_CHAIN_NAME,
+                        androidx.work.ExistingWorkPolicy.APPEND_OR_REPLACE,
+                        prepared.first().second
+                    )
+                    prepared.drop(1).forEach { (_, request) ->
+                        continuation = continuation.then(request)
+                    }
+                    continuation.enqueue()
+                }.onFailure { error ->
+                    failedCount += prepared.size
+                    prepared.forEach { (metadata, _) ->
+                        batchStore.remove(metadata.id)
+                        MediaInputCache.delete(context, Uri.parse(metadata.inputUri))
+                    }
+                    prepared.clear()
+                    Log.e(TAG, "Gagal memasukkan antrean batch", error)
+                }
+            }
+            val enqueuedCount = prepared.size
             _batchMessage.value = when {
-                failedCount == 0 -> "$enqueuedCount file masuk antrean."
+                failedCount == 0 -> "$enqueuedCount file masuk antrean berurutan."
                 enqueuedCount == 0 -> "Tidak ada file yang masuk antrean."
                 else -> "$enqueuedCount file masuk antrean; $failedCount gagal."
             }
@@ -709,9 +724,11 @@ class MainViewModel(
             return
         }
         viewModelScope.launch(Dispatchers.IO) {
+            var cachedUri: Uri? = null
             runCatching {
+                cachedUri = MediaInputCache.copyToPersistent(context, Uri.parse(item.sourceUri))
                 val request = ConversionWork.request(
-                    inputUri = Uri.parse(item.inputUri),
+                    inputUri = requireNotNull(cachedUri),
                     requestedOutputName = item.outputFileName,
                     trimStartMs = item.trimStartMs,
                     trimEndMs = item.trimEndMs,
@@ -723,21 +740,53 @@ class MainViewModel(
                     batchItemId = item.id,
                     sourceFileName = item.sourceFileName
                 )
-                manager.enqueueUniqueWork(
-                    ConversionWork.batchTag(item.id),
-                    androidx.work.ExistingWorkPolicy.REPLACE,
-                    request
+                batchStore.put(
+                    BatchQueueMetadata(
+                        id = item.id,
+                        workId = request.id,
+                        sourceFileName = item.sourceFileName,
+                        outputFileName = item.outputFileName,
+                        inputUri = requireNotNull(cachedUri).toString(),
+                        sourceUri = item.sourceUri,
+                        trimStartMs = item.trimStartMs,
+                        trimEndMs = item.trimEndMs,
+                        pitchSemitones = item.pitchSemitones,
+                        normalizeAudio = item.normalizeAudio,
+                        trimSilence = item.trimSilence
+                    )
                 )
-                batchStore.updateWorkId(item.id, request.id)
+                manager.beginUniqueWork(
+                    ConversionWork.BATCH_CHAIN_NAME,
+                    androidx.work.ExistingWorkPolicy.APPEND_OR_REPLACE,
+                    request
+                ).enqueue()
             }.onFailure { error ->
-                _batchMessage.value = "Gagal mengulang ${item.sourceFileName}: " +
-                    technicalMessage(error, "enqueue gagal")
+                cachedUri?.let { MediaInputCache.delete(context, it) }
+                _batchMessage.value = "Gagal mengulang ${item.sourceFileName}: pilih ulang file."
+                Log.e(TAG, "Gagal mengulang item batch", error)
             }
         }
     }
 
-    fun cancelBatch(item: BatchQueueItem) {
-        workManager?.cancelUniqueWork(ConversionWork.batchTag(item.id))
+    fun cancelBatch(@Suppress("UNUSED_PARAMETER") item: BatchQueueItem) {
+        workManager?.cancelUniqueWork(ConversionWork.BATCH_CHAIN_NAME)
+        batchStore.all().forEach { metadata ->
+            MediaInputCache.delete(context, Uri.parse(metadata.inputUri))
+        }
+        batchStore.clear()
+        _batchItems.value = emptyList()
+        _batchMessage.value = "Antrean batch dibatalkan."
+    }
+
+    fun dismissBatch(item: BatchQueueItem) {
+        batchStore.remove(item.id)
+        _batchItems.update { items -> items.filterNot { it.id == item.id } }
+    }
+
+    fun dismissAllBatch() {
+        batchStore.clear()
+        _batchItems.value = emptyList()
+        _batchMessage.value = null
     }
 
     fun clearBatchMessage() {
@@ -749,7 +798,11 @@ class MainViewModel(
             val items = batchStore.all().mapNotNull { metadata ->
                 runCatching {
                     manager.getWorkInfoById(metadata.workId).get()
-                }.getOrNull()?.toBatchQueueItem(metadata)
+                }.getOrNull()?.also { info ->
+                    if (info.state == WorkInfo.State.CANCELLED) {
+                        MediaInputCache.delete(context, Uri.parse(metadata.inputUri))
+                    }
+                }?.toBatchQueueItem(metadata)
             }.sortedWith(
                 compareBy<BatchQueueItem> { it.isTerminal }
                     .thenBy { it.sourceFileName.lowercase() }

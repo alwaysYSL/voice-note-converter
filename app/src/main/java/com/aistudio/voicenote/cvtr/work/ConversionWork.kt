@@ -29,9 +29,15 @@ object ConversionWork {
     const val RESULT_COMPATIBILITY_SUMMARY = "conversion.resultCompatibilitySummary"
     const val RESULT_COMPATIBILITY_WARNING = "conversion.resultCompatibilityWarning"
     const val ERROR_MESSAGE = "conversion.errorMessage"
+    const val ERROR_CODE = "conversion.errorCode"
+    const val ERROR_STAGE = "conversion.errorStage"
+    const val CAN_RETRY = "conversion.canRetry"
+    const val LOGICAL_FAILURE = "conversion.logicalFailure"
+    const val ENCODER_BACKEND = "conversion.encoderBackend"
 
     const val BATCH_TAG = "conversion.batch"
     const val SINGLE_WORK_NAME = "conversion.single"
+    const val BATCH_CHAIN_NAME = "conversion.batch.chain"
 
     fun request(
         inputUri: Uri,

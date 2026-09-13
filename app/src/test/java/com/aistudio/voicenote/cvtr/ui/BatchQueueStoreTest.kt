@@ -14,12 +14,11 @@ import org.robolectric.annotation.Config
 @Config(sdk = [34])
 class BatchQueueStoreTest {
     @Test
-    fun `queue metadata survives store reload and work id replacement`() {
+    fun `queue metadata survives store reload`() {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val store = BatchQueueStore(app)
         val itemId = "test-${UUID.randomUUID()}"
         val firstWorkId = UUID.randomUUID()
-        val secondWorkId = UUID.randomUUID()
         try {
             store.put(
                 BatchQueueMetadata(
@@ -28,19 +27,39 @@ class BatchQueueStoreTest {
                     sourceFileName = "source.m4a",
                     outputFileName = "source.ogg",
                     inputUri = "file:///cache/source.m4a",
+                    sourceUri = "content://picker/source.m4a",
                     normalizeAudio = true,
                     trimSilence = true
                 )
             )
-            store.updateWorkId(itemId, secondWorkId)
 
             val restored = store.all().single { it.id == itemId }
-            assertEquals(secondWorkId, restored.workId)
+            assertEquals(firstWorkId, restored.workId)
             assertEquals("source.m4a", restored.sourceFileName)
+            assertEquals("content://picker/source.m4a", restored.sourceUri)
             assertTrue(restored.normalizeAudio)
             assertTrue(restored.trimSilence)
         } finally {
             store.remove(itemId)
         }
+    }
+
+    @Test
+    fun `clear removes queue state before a new app session`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val store = BatchQueueStore(app)
+        store.put(
+            BatchQueueMetadata(
+                id = "stale-${UUID.randomUUID()}",
+                workId = UUID.randomUUID(),
+                sourceFileName = "stale.m4a",
+                outputFileName = "stale.ogg",
+                inputUri = "file:///cache/stale.m4a"
+            )
+        )
+
+        store.clear()
+
+        assertTrue(store.all().isEmpty())
     }
 }

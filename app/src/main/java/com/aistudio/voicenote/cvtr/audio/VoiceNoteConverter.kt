@@ -6,6 +6,7 @@ import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
+import android.os.Build
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Log
@@ -30,7 +31,8 @@ data class AudioConversionResult(
     val sampleRate: Int = 48000,
     val channels: Int = 1,
     val originalFileName: String,
-    val originalSize: Long
+    val originalSize: Long,
+    val encoderBackend: String = "unknown"
 )
 
 sealed class AudioConversionException(message: String) : Exception(message)
@@ -203,19 +205,20 @@ internal class StreamingPcmProcessor(
     }
 }
 
-private class StreamingOpusEncoder(
+private class HardwareOpusEncoder(
     codecName: String,
     private val oggWriter: OggOpusWriter,
     private val checkActive: () -> Unit
-) {
+) : StreamingAudioEncoder {
     private val encoder = MediaCodec.createByCodecName(codecName)
     private val bufferInfo = MediaCodec.BufferInfo()
     private var submittedSamples = 0L
     private var outputEnded = false
     private var started = false
     private var released = false
-    var preSkipSamples: Int? = null
+    override var preSkipSamples: Int? = null
         private set
+    override val backendName: String = codecName
 
     init {
         val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, 48_000, 1).apply {
@@ -233,7 +236,7 @@ private class StreamingOpusEncoder(
         }
     }
 
-    fun write(samples: ShortArray) {
+    override fun write(samples: ShortArray) {
         var offset = 0
         var emptyPolls = 0
         while (offset < samples.size) {
@@ -264,7 +267,7 @@ private class StreamingOpusEncoder(
         }
     }
 
-    fun finish() {
+    override fun finish() {
         try {
             var queued = false
             var emptyPolls = 0
@@ -294,7 +297,7 @@ private class StreamingOpusEncoder(
         }
     }
 
-    fun release() {
+    override fun release() {
         if (released) return
         if (started) runCatching { encoder.stop() }
         runCatching { encoder.release() }
@@ -545,9 +548,14 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
         val extractor = MediaExtractor()
         try {
             extractor.setDataSource(context, inputUri, null)
-        } catch (e: Exception) {
+        } catch (error: Exception) {
             extractor.release()
-            throw UnsupportedAudioFormatException("Gagal membaca file media: ${e.localizedMessage}")
+            throw ConversionPipelineException(
+                ConversionErrorCode.INPUT_UNREADABLE,
+                ConversionStage.OPEN_EXTRACTOR,
+                "File media tidak dapat dibaca. Pilih ulang atau gunakan format lain.",
+                error
+            )
         }
 
         var audioTrackIndex = -1
@@ -564,8 +572,11 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
             }
         } catch (error: Exception) {
             extractor.release()
-            throw UnsupportedAudioFormatException(
-                "Gagal membaca track audio: ${error.localizedMessage}"
+            throw ConversionPipelineException(
+                ConversionErrorCode.INPUT_UNREADABLE,
+                ConversionStage.OPEN_EXTRACTOR,
+                "Track audio tidak dapat dibaca. Gunakan file audio lain.",
+                error
             )
         }
 
@@ -586,8 +597,11 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
             }
         } catch (error: Exception) {
             extractor.release()
-            throw UnsupportedAudioFormatException(
-                "Gagal menyiapkan track audio: ${error.localizedMessage}"
+            throw ConversionPipelineException(
+                ConversionErrorCode.INPUT_UNREADABLE,
+                ConversionStage.OPEN_EXTRACTOR,
+                "Track audio tidak dapat disiapkan. Gunakan file audio lain.",
+                error
             )
         }
 
@@ -615,25 +629,22 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
         val inputMime = audioFormat.getString(MediaFormat.KEY_MIME) ?: ""
         val decoder = try {
             MediaCodec.createDecoderByType(inputMime)
-        } catch (e: Exception) {
+        } catch (error: Exception) {
             extractor.release()
-            throw UnsupportedAudioFormatException("Decoder untuk $inputMime tidak ditemukan pada perangkat.")
+            throw ConversionPipelineException(
+                ConversionErrorCode.DECODER_UNAVAILABLE,
+                ConversionStage.CREATE_DECODER,
+                "Decoder untuk $inputMime tidak tersedia. Gunakan format audio lain.",
+                error
+            )
         }
 
-        val opusCodecName = findOpusEncoder()
-            ?: run {
-                extractor.release()
-                decoder.release()
-                throw UnsupportedAudioFormatException(
-                    "Perangkat ini tidak memiliki encoder Opus. Konversi tidak dapat dilakukan."
-                )
-            }
         val cacheFile = File(
             context.cacheDir,
             "voice_note_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}.ogg"
         )
         var oggWriter: OggOpusWriter? = null
-        var opusEncoder: StreamingOpusEncoder? = null
+        var opusEncoder: StreamingAudioEncoder? = null
         var pitchShifter: StreamingPitchShifter? = null
         var decoderStarted = false
         var decoderReleased = false
@@ -659,7 +670,7 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
             val writer = OggOpusWriter(FileOutputStream(cacheFile))
             oggWriter = writer
             val conversionContext = currentCoroutineContext()
-            val encoder = StreamingOpusEncoder(opusCodecName, writer) {
+            val encoder = createOpusEncoder(writer) {
                 conversionContext.ensureActive()
             }
             opusEncoder = encoder
@@ -675,7 +686,18 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
 
             fun writeOutputChunk(samples: ShortArray) {
                 if (samples.isEmpty()) return
-                encoder.write(samples)
+                try {
+                    encoder.write(samples)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    throw ConversionPipelineException(
+                        ConversionErrorCode.OPUS_CONFIGURE_FAILED,
+                        ConversionStage.ENCODE,
+                        "Encoder Opus gagal memproses audio.",
+                        error
+                    )
+                }
                 encodedSampleCount += samples.size
                 waveformAccumulator.add(samples)
             }
@@ -820,13 +842,33 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
             decoderStarted = false
             decoder.release()
             decoderReleased = true
-            encoder.finish()
+            try {
+                encoder.finish()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                throw ConversionPipelineException(
+                    ConversionErrorCode.OPUS_CONFIGURE_FAILED,
+                    ConversionStage.ENCODE,
+                    "Encoder Opus gagal menyelesaikan output.",
+                    error
+                )
+            }
             encoderFinished = true
             val preSkipSamples = encoder.preSkipSamples
                 ?: throw ConversionFailedException(
                     "Encoder Opus tidak melaporkan delay untuk container Ogg."
                 )
-            writer.close(finalGranulePosition = encodedSampleCount + preSkipSamples)
+            try {
+                writer.close(finalGranulePosition = encodedSampleCount + preSkipSamples)
+            } catch (error: Throwable) {
+                throw ConversionPipelineException(
+                    ConversionErrorCode.OUTPUT_INVALID,
+                    ConversionStage.WRITE_OGG,
+                    "Container OGG gagal diselesaikan.",
+                    error
+                )
+            }
             writerClosed = true
 
             if (encodedSampleCount == 0L) {
@@ -848,7 +890,8 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
                 sampleRate = TARGET_SAMPLE_RATE,
                 channels = TARGET_CHANNELS,
                 originalFileName = fileName,
-                originalSize = originalSize
+                originalSize = originalSize,
+                encoderBackend = encoder.backendName
             )
         } finally {
             if (!decoderReleased) {
@@ -862,6 +905,60 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
             }
             pitchShifter?.close()
             if (!completed) cacheFile.delete()
+        }
+    }
+
+    private fun createOpusEncoder(
+        writer: OggOpusWriter,
+        checkActive: () -> Unit
+    ): StreamingAudioEncoder {
+        var softwareError: Throwable? = null
+        when (val availability = OpusEncoderProbe.probeSoftware()) {
+            is EncoderAvailability.Available -> {
+                try {
+                    return SoftwareOpusEncoder(writer, checkActive).also { encoder ->
+                        Log.i(
+                            TAG,
+                            "Opus backend=${encoder.backendName}, api=${Build.VERSION.SDK_INT}, " +
+                                "abi=${Build.SUPPORTED_ABIS.joinToString()}"
+                        )
+                    }
+                } catch (error: Throwable) {
+                    softwareError = error
+                }
+            }
+            EncoderAvailability.Missing -> {
+                softwareError = UnsatisfiedLinkError("Bundled libopus tidak dapat dimuat")
+            }
+            is EncoderAvailability.Broken -> {
+                softwareError = availability.cause
+            }
+        }
+
+        val hardwareCodec = findOpusEncoder()
+            ?: throw ConversionPipelineException(
+                errorCode = ConversionErrorCode.OPUS_ENCODER_UNAVAILABLE,
+                stage = ConversionStage.CREATE_ENCODER,
+                safeMessage = "Encoder Opus software gagal dimuat dan perangkat tidak menyediakan fallback.",
+                cause = softwareError
+            )
+        return try {
+            HardwareOpusEncoder(hardwareCodec, writer, checkActive).also { encoder ->
+                Log.w(
+                    TAG,
+                    "Software Opus unavailable; fallback=${encoder.backendName}, " +
+                        "api=${Build.VERSION.SDK_INT}, abi=${Build.SUPPORTED_ABIS.joinToString()}",
+                    softwareError
+                )
+            }
+        } catch (hardwareFailure: Throwable) {
+            softwareError?.let(hardwareFailure::addSuppressed)
+            throw ConversionPipelineException(
+                errorCode = ConversionErrorCode.OPUS_CONFIGURE_FAILED,
+                stage = ConversionStage.CREATE_ENCODER,
+                safeMessage = "Semua backend encoder Opus gagal dimulai.",
+                cause = hardwareFailure
+            )
         }
     }
 
