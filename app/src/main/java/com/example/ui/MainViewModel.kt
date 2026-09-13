@@ -11,8 +11,6 @@ import com.example.audio.VoiceNoteConverter
 import com.example.audio.VoiceNoteStorage
 import com.example.data.local.AppDatabase
 import com.example.data.local.ConversionHistory
-import com.example.data.local.RecentContact
-import com.example.data.repository.ContactRepository
 import com.example.data.repository.ConversionHistoryRepository
 import com.example.telegram.SendResult
 import com.example.telegram.TelegramSender
@@ -23,10 +21,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlin.math.pow
@@ -42,7 +38,6 @@ data class MainUiState(
     val statusMessage: String = "",
     val errorMessage: String? = null,
     val canRetry: Boolean = false,
-    val selectedContact: RecentContact? = null,
     val trimState: TrimState = TrimState(),
     val waveform: List<Int> = emptyList(),
     val convertedUri: Uri? = null,
@@ -56,17 +51,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val context: Context
         get() = getApplication<Application>().applicationContext
     private val database = AppDatabase.getDatabase(context)
-    private val contacts = ContactRepository(database.recentContactDao())
     private val history = ConversionHistoryRepository(database.conversionHistoryDao())
     private val telegramSender = TelegramSender()
 
     val audioPlayer = AudioPreviewPlayer(context, viewModelScope)
     val playbackState: StateFlow<PlaybackState> = audioPlayer.playbackState
-    val recentContacts: StateFlow<List<RecentContact>> = contacts.recentContacts.stateIn(
-        viewModelScope,
-        SharingStarted.WhileSubscribed(5_000),
-        emptyList()
-    )
 
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
@@ -101,22 +90,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } catch (error: Exception) {
                 fail("Gagal memproses file: ${error.localizedMessage}", canRetry = false)
             }
-        }
-    }
-
-    fun selectContact(contact: RecentContact) {
-        _uiState.update { it.copy(selectedContact = contact) }
-    }
-
-    fun addNewContactAndSelect(
-        name: String,
-        chatId: Long,
-        username: String? = null,
-        phone: String? = null
-    ) {
-        viewModelScope.launch {
-            contacts.saveContactUsage(name, chatId, username, phone)
-            selectContact(RecentContact(chatId = chatId, name = name, username = username, phone = phone))
         }
     }
 
@@ -264,12 +237,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val state = _uiState.value
         val uri = state.convertedUri ?: return
         _uiState.update { it.copy(processStatus = ProcessStatus.SENDING, errorMessage = null) }
-        when (val result = telegramSender.sendVoiceNoteViaTelegramApp(context, uri, state.selectedContact?.name)) {
+        when (val result = telegramSender.sendVoiceNoteViaTelegramApp(context, uri)) {
             is SendResult.IntentLaunched -> {
                 _uiState.update { it.copy(processStatus = ProcessStatus.SENT, statusMessage = result.details) }
                 viewModelScope.launch {
-                    state.lastConversionId?.let { history.updateSendStatus(it, state.selectedContact?.name ?: "Telegram") }
-                    state.selectedContact?.let { contacts.saveContactUsage(it.name, it.chatId, it.username, it.phone) }
+                    state.lastConversionId?.let { history.updateSendStatus(it, "Telegram") }
                 }
             }
             is SendResult.Failure -> fail(result.errorMessage, result.canRetry)

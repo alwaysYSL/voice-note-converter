@@ -16,35 +16,37 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCut
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -66,8 +68,6 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.data.local.RecentContact
-import com.example.ui.components.AddContactDialog
 import com.example.ui.components.PitchControl
 import com.example.ui.components.TrimControls
 import com.example.ui.components.TrimState
@@ -77,7 +77,7 @@ import com.example.ui.theme.AccentRoyalBlue
 import com.example.ui.theme.AppCanvasBackground
 import com.example.ui.theme.CardSurfaceWhite
 import com.example.ui.theme.DeepNavyDisplay
-import com.example.ui.theme.PastelMintCardBg
+import com.example.ui.theme.MutedInputBackground
 import com.example.ui.theme.PastelMintText
 import com.example.ui.theme.PastelPeachCardBg
 import com.example.ui.theme.PastelPeriwinkleCardBg
@@ -85,18 +85,23 @@ import com.example.ui.theme.SubtitleSlate
 import com.example.ui.theme.SubtleBorder
 
 @Composable
-fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
+fun MainScreen(
+    viewModel: MainViewModel,
+    modifier: Modifier = Modifier,
+    bottomOverlayClearance: Dp = 0.dp,
+    statusBarInset: Dp? = null
+) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val playback by viewModel.playbackState.collectAsStateWithLifecycle()
-    val contacts by viewModel.recentContacts.collectAsStateWithLifecycle()
     val hasConvertedResult = state.convertedUri != null
+    val safeTopInset = statusBarInset
+        ?: WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val sourceSelectionEnabled = state.processStatus !in setOf(
         ProcessStatus.ANALYZING,
         ProcessStatus.CONVERTING,
         ProcessStatus.SENDING
     )
     val context = LocalContext.current
-    var showAddContact by remember { mutableStateOf(false) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {
         it?.let(viewModel::handleIncomingUri)
     }
@@ -122,71 +127,78 @@ fun MainScreen(viewModel: MainViewModel, modifier: Modifier = Modifier) {
         viewModel.pausePlayback()
     }
 
-    if (showAddContact) {
-        AddContactDialog(
-            onDismiss = { showAddContact = false },
-            onConfirm = { name, chatId, username, phone ->
-                viewModel.addNewContactAndSelect(name, chatId, username, phone)
-                showAddContact = false
-            }
-        )
-    }
-
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(AppCanvasBackground)
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 20.dp)
-            .padding(top = 24.dp, bottom = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+            .background(AppCanvasBackground),
     ) {
-        ConverterHeader()
-        SourcePickerCard(
-            selectedFileName = state.fileName,
-            enabled = sourceSelectionEnabled,
-            onPick = { picker.launch(arrayOf("audio/*", "video/*")) }
-        )
-
-        state.fileName?.let { fileName ->
-            PreviewCard(
-                fileName = fileName,
-                hasConvertedResult = hasConvertedResult,
-                waveform = state.waveform,
-                progress = playback.progress,
-                isPlaying = playback.isPlaying,
-                currentPositionMs = playback.currentPositionMs,
-                fallbackDurationSec = state.fileDurationSec,
-                trimState = state.trimState,
-                processStatus = state.processStatus,
-                onTogglePlayback = viewModel::togglePlayback,
-                onSeek = viewModel::seekToFraction,
-                onTrimRangeChange = { viewModel.updateTrimRange(it.start, it.endInclusive) },
-                onToggleTrim = viewModel::toggleTrim,
-                onPreviewTrim = viewModel::previewTrim,
-                onResetTrim = viewModel::resetTrim,
-                pitchSemitones = state.pitchSemitones,
-                onPitchChange = viewModel::updatePitch,
-                playbackError = playback.errorMessage
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp)
+                .padding(top = 20.dp + safeTopInset, bottom = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            ConverterHeader()
+            SourcePickerCard(
+                hasSelection = state.selectedFileUri != null,
+                selectedFileName = state.fileName,
+                enabled = sourceSelectionEnabled,
+                onPick = { picker.launch(arrayOf("audio/*", "video/*")) }
             )
+
+            state.fileName?.let { fileName ->
+                PreviewCard(
+                    fileName = fileName,
+                    hasConvertedResult = hasConvertedResult,
+                    waveform = state.waveform,
+                    progress = playback.progress,
+                    isPlaying = playback.isPlaying,
+                    currentPositionMs = playback.currentPositionMs,
+                    fallbackDurationSec = state.fileDurationSec,
+                    trimState = state.trimState,
+                    processStatus = state.processStatus,
+                    onTogglePlayback = viewModel::togglePlayback,
+                    onSeek = viewModel::seekToFraction,
+                    onTrimRangeChange = { viewModel.updateTrimRange(it.start, it.endInclusive) },
+                    onToggleTrim = viewModel::toggleTrim,
+                    onPreviewTrim = viewModel::previewTrim,
+                    onResetTrim = viewModel::resetTrim,
+                    pitchSemitones = state.pitchSemitones,
+                    onPitchChange = viewModel::updatePitch,
+                    playbackError = playback.errorMessage
+                )
+            }
         }
 
         if (state.selectedFileUri != null) {
-            ContactCard(
-                contacts = contacts,
-                selectedContact = state.selectedContact,
-                onAddContact = { showAddContact = true },
-                onSelectContact = viewModel::selectContact
-            )
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 20.dp, end = 20.dp, bottom = bottomOverlayClearance)
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("converter_action_bar"),
+                    shape = RoundedCornerShape(20.dp),
+                    color = CardSurfaceWhite,
+                    tonalElevation = 1.dp,
+                    shadowElevation = 6.dp
+                ) {
+                    Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                        ProcessActionArea(
+                            state = state,
+                            hasConvertedResult = hasConvertedResult,
+                            onConvert = startConversionWithPermission,
+                            onSend = viewModel::sendConverted,
+                            onReset = viewModel::resetForNewFile
+                        )
+                    }
+                }
+            }
         }
-
-        ProcessActionArea(
-            state = state,
-            hasConvertedResult = hasConvertedResult,
-            onConvert = startConversionWithPermission,
-            onSend = viewModel::sendConverted,
-            onReset = viewModel::resetForNewFile
-        )
     }
 }
 
@@ -206,13 +218,13 @@ private fun ConverterHeader() {
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                text = "Buat voice note yang siap dikirim.",
+                text = "Ubah jadi voice note.",
                 style = MaterialTheme.typography.displaySmall,
                 color = DeepNavyDisplay
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "Ubah audio atau video menjadi voice note Telegram dengan lebih tenang.",
+                text = "Audio atau video menjadi OGG Opus yang siap dibuka di Telegram.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = SubtitleSlate
             )
@@ -228,11 +240,15 @@ private fun ConverterHeader() {
 
 @Composable
 private fun SourcePickerCard(
+    hasSelection: Boolean,
     selectedFileName: String?,
     enabled: Boolean,
     onPick: () -> Unit
 ) {
-    SoftCard(containerColor = CardSurfaceWhite) {
+    SoftCard(
+        containerColor = CardSurfaceWhite,
+        modifier = if (hasSelection) Modifier.testTag("source_summary") else Modifier
+    ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -245,31 +261,42 @@ private fun SourcePickerCard(
             )
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = if (selectedFileName == null) "Pilih file sumber" else "Sumber audio",
+                    text = if (hasSelection) "Sumber audio" else "Pilih file sumber",
                     style = MaterialTheme.typography.titleMedium,
                     color = DeepNavyDisplay
                 )
                 Text(
-                    text = selectedFileName ?: "Audio atau video dari perangkat Anda",
+                    text = when {
+                        selectedFileName != null -> selectedFileName
+                        hasSelection -> "Menyiapkan preview audio..."
+                        else -> "Audio atau video dari perangkat Anda"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = SubtitleSlate,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+                if (hasSelection) {
+                    TextButton(onClick = onPick, enabled = enabled) {
+                        Text("Ganti")
+                    }
+                }
             }
         }
-        Spacer(Modifier.height(16.dp))
-        OutlinedButton(
-            onClick = onPick,
-            enabled = enabled,
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
-                contentColor = DeepNavyDisplay
-            ),
-            border = androidx.compose.foundation.BorderStroke(1.dp, SubtleBorder)
-        ) {
-            Text(if (selectedFileName == null) "Pilih audio atau video" else "Ganti file")
+        if (!hasSelection) {
+            Spacer(Modifier.height(16.dp))
+            OutlinedButton(
+                onClick = onPick,
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                    contentColor = DeepNavyDisplay
+                ),
+                border = androidx.compose.foundation.BorderStroke(1.dp, SubtleBorder)
+            ) {
+                Text("Pilih audio atau video")
+            }
         }
     }
 }
@@ -295,8 +322,9 @@ internal fun PreviewCard(
     onPitchChange: (Float) -> Unit = {},
     playbackError: String?
 ) {
-    val cardColor = if (hasConvertedResult) PastelMintCardBg else CardSurfaceWhite
-    SoftCard(containerColor = cardColor) {
+    var showAudioEditor by remember(fileName) { mutableStateOf(false) }
+
+    SoftCard(containerColor = CardSurfaceWhite) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.Top,
@@ -372,66 +400,43 @@ internal fun PreviewCard(
         }
         if (!hasConvertedResult && processStatus == ProcessStatus.IDLE) {
             Spacer(Modifier.height(8.dp))
-            HorizontalDivider(
-                modifier = Modifier
-                    .padding(vertical = 4.dp)
-                    .testTag("preview_tools_divider"),
-                color = SubtleBorder,
-                thickness = 0.5.dp
-            )
-            Spacer(Modifier.height(4.dp))
-            TrimControls(
-                trimState = trimState,
-                onToggleTrim = onToggleTrim,
-                onPreviewTrim = onPreviewTrim,
-                onResetTrim = onResetTrim
-            )
-            Spacer(Modifier.height(12.dp))
-            PitchControl(
-                pitchSemitones = pitchSemitones,
-                onPitchChange = onPitchChange,
-                enabled = true
-            )
-        }
-    }
-}
-
-@Composable
-private fun ContactCard(
-    contacts: List<RecentContact>,
-    selectedContact: RecentContact?,
-    onAddContact: () -> Unit,
-    onSelectContact: (RecentContact) -> Unit
-) {
-    SoftCard(containerColor = PastelMintCardBg) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text("Tujuan Telegram", style = MaterialTheme.typography.titleMedium, color = DeepNavyDisplay)
-                Text(
-                    "Opsional. Telegram tetap bisa meminta Anda memilih chat.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = PastelMintText
+            TextButton(
+                onClick = { showAudioEditor = !showAudioEditor },
+                modifier = Modifier.testTag("audio_editor_toggle")
+            ) {
+                Icon(
+                    imageVector = if (showAudioEditor) Icons.Default.ExpandLess else Icons.Default.Tune,
+                    contentDescription = null
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("Edit audio")
+                Spacer(Modifier.weight(1f))
+                Icon(
+                    imageVector = if (showAudioEditor) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    contentDescription = null
                 )
             }
-            TextButton(onClick = onAddContact) {
-                Icon(Icons.Default.Add, contentDescription = null)
-                Spacer(Modifier.width(4.dp))
-                Text("Tambah")
-            }
-        }
-        if (contacts.isNotEmpty()) {
-            Spacer(Modifier.height(12.dp))
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(contacts, key = { it.chatId }) { contact ->
-                    FilterChip(
-                        selected = selectedContact?.chatId == contact.chatId,
-                        onClick = { onSelectContact(contact) },
-                        label = { Text(contact.name) }
-                    )
-                }
+            if (showAudioEditor) {
+                HorizontalDivider(
+                    modifier = Modifier
+                        .padding(vertical = 4.dp)
+                        .testTag("preview_tools_divider"),
+                    color = SubtleBorder,
+                    thickness = 0.5.dp
+                )
+                Spacer(Modifier.height(8.dp))
+                TrimControls(
+                    trimState = trimState,
+                    onToggleTrim = onToggleTrim,
+                    onPreviewTrim = onPreviewTrim,
+                    onResetTrim = onResetTrim
+                )
+                Spacer(Modifier.height(12.dp))
+                PitchControl(
+                    pitchSemitones = pitchSemitones,
+                    onPitchChange = onPitchChange,
+                    enabled = true
+                )
             }
         }
     }
@@ -445,9 +450,9 @@ private fun ProcessActionArea(
     onSend: () -> Unit,
     onReset: () -> Unit
 ) {
-    when (state.processStatus) {
-        ProcessStatus.ANALYZING -> SoftCard(containerColor = PastelPeriwinkleCardBg) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        when (state.processStatus) {
+            ProcessStatus.ANALYZING -> Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(
                     modifier = Modifier.size(22.dp),
                     color = AccentRoyalBlue,
@@ -456,77 +461,76 @@ private fun ProcessActionArea(
                 Spacer(Modifier.width(12.dp))
                 Text("Menyiapkan preview audio", color = DeepNavyDisplay)
             }
-        }
-        ProcessStatus.CONVERTING, ProcessStatus.SENDING -> SoftCard(containerColor = PastelPeachCardBg) {
-            Text(
-                text = if (state.processStatus == ProcessStatus.CONVERTING) "Mengubah menjadi voice note" else "Membuka Telegram",
-                style = MaterialTheme.typography.titleSmall,
-                color = DeepNavyDisplay
-            )
-            Spacer(Modifier.height(10.dp))
-            LinearProgressIndicator(
-                progress = { state.progress },
-                modifier = Modifier.fillMaxWidth(),
-                color = AccentCoral,
-                trackColor = CardSurfaceWhite
-            )
-            Spacer(Modifier.height(6.dp))
-            Text(
-                text = if (state.processStatus == ProcessStatus.CONVERTING) "${(state.progress * 100).toInt()}% selesai" else "Menyiapkan pengiriman",
-                style = MaterialTheme.typography.bodySmall,
-                color = SubtitleSlate
-            )
-        }
-        ProcessStatus.CONVERTED -> PrimaryActionButton(
-            text = "Kirim ke Telegram",
-            icon = Icons.AutoMirrored.Filled.Send,
-            onClick = onSend
-        )
-        ProcessStatus.SENT -> SoftCard(containerColor = PastelMintCardBg) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = PastelMintText)
-                Spacer(Modifier.width(10.dp))
-                Column {
-                    Text("Telegram sudah dibuka", style = MaterialTheme.typography.titleSmall, color = DeepNavyDisplay)
-                    Text(state.statusMessage, style = MaterialTheme.typography.bodySmall, color = PastelMintText)
-                }
+            ProcessStatus.CONVERTING, ProcessStatus.SENDING -> {
+                Text(
+                    text = if (state.processStatus == ProcessStatus.CONVERTING) "Mengubah menjadi voice note" else "Membuka Telegram",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = DeepNavyDisplay
+                )
+                Spacer(Modifier.height(10.dp))
+                LinearProgressIndicator(
+                    progress = { state.progress },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = AccentCoral,
+                    trackColor = MutedInputBackground
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = if (state.processStatus == ProcessStatus.CONVERTING) "${(state.progress * 100).toInt()}% selesai" else "Menyiapkan pengiriman",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SubtitleSlate
+                )
             }
-            Spacer(Modifier.height(14.dp))
-            OutlinedButton(
-                onClick = onReset,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, PastelMintText)
-            ) { Text("Konversi baru", color = DeepNavyDisplay) }
-        }
-        ProcessStatus.FAILED -> SoftCard(containerColor = PastelPeachCardBg) {
-            Text(
-                state.errorMessage ?: "Terjadi kesalahan.",
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodyMedium
+            ProcessStatus.CONVERTED -> PrimaryActionButton(
+                text = "Kirim ke Telegram",
+                icon = Icons.AutoMirrored.Filled.Send,
+                onClick = onSend
             )
-            Spacer(Modifier.height(12.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            ProcessStatus.SENT -> {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = PastelMintText)
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text("Telegram sudah dibuka", style = MaterialTheme.typography.titleSmall, color = DeepNavyDisplay)
+                        Text(state.statusMessage, style = MaterialTheme.typography.bodySmall, color = PastelMintText)
+                    }
+                }
+                Spacer(Modifier.height(14.dp))
                 OutlinedButton(
                     onClick = onReset,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(16.dp)
-                ) { Text("Batal") }
-                if (state.canRetry && state.selectedFileUri != null) {
-                    Button(
-                        onClick = if (hasConvertedResult) onSend else onConvert,
+                ) { Text("Konversi baru") }
+            }
+            ProcessStatus.FAILED -> {
+                Text(
+                    state.errorMessage ?: "Terjadi kesalahan.",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Spacer(Modifier.height(12.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedButton(
+                        onClick = onReset,
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(16.dp)
-                    ) { Text("Coba lagi") }
+                    ) { Text("Batal") }
+                    if (state.canRetry && state.selectedFileUri != null) {
+                        Button(
+                            onClick = if (hasConvertedResult) onSend else onConvert,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(16.dp)
+                        ) { Text("Coba lagi") }
+                    }
                 }
             }
-        }
-        ProcessStatus.IDLE -> if (state.selectedFileUri != null) {
-            PrimaryActionButton(
-                text = "Konversi ke voice note",
-                icon = Icons.Default.ContentCut,
-                onClick = onConvert
-            )
+            ProcessStatus.IDLE -> if (state.selectedFileUri != null) {
+                PrimaryActionButton(
+                    text = "Konversi ke voice note",
+                    icon = Icons.Default.ContentCut,
+                    onClick = onConvert
+                )
+            }
         }
     }
 }
@@ -541,8 +545,8 @@ private fun PrimaryActionButton(
         onClick = onClick,
         modifier = Modifier
             .fillMaxWidth()
-            .height(54.dp),
-        shape = RoundedCornerShape(18.dp),
+            .height(52.dp),
+        shape = RoundedCornerShape(16.dp),
         colors = ButtonDefaults.buttonColors(
             containerColor = AccentCoral,
             contentColor = Color.White
@@ -564,8 +568,8 @@ private fun SoftCard(
     Card(
         modifier = modifier
             .fillMaxWidth()
-            .shadow(2.dp, RoundedCornerShape(26.dp)),
-        shape = RoundedCornerShape(26.dp),
+            .shadow(1.dp, RoundedCornerShape(20.dp)),
+        shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = containerColor),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {

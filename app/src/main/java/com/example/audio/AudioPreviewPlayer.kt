@@ -28,6 +28,21 @@ data class PlaybackState(
     val errorMessage: String? = null
 )
 
+/** The exact source-time window used when previewing a trim selection. */
+internal data class PlaybackWindow(
+    val startMs: Long,
+    val endMs: Long
+) {
+    fun hasReachedEnd(positionMs: Long): Boolean = positionMs >= endMs
+
+    companion object {
+        fun fromTrim(startMs: Long, endMs: Long): PlaybackWindow {
+            val safeStart = startMs.coerceAtLeast(0L)
+            return PlaybackWindow(safeStart, endMs.coerceAtLeast(safeStart))
+        }
+    }
+}
+
 class AudioPreviewPlayer(
     context: Context,
     private val scope: CoroutineScope
@@ -47,6 +62,7 @@ class AudioPreviewPlayer(
     private var currentUri: Uri? = null
     private var clipStart = 0L
     private var clipEnd = Long.MAX_VALUE
+    private var playbackWindow: PlaybackWindow? = null
 
     init {
         player.addListener(object : Player.Listener {
@@ -87,8 +103,10 @@ class AudioPreviewPlayer(
             pitchFactor.coerceIn(0.25f, 4f)
         )
         currentUri = uri
-        player.setMediaItem(mediaItem(uri))
+        playbackWindow = clippingWindow()
+        player.setMediaItem(MediaItem.fromUri(uri))
         player.prepare()
+        playbackWindow?.let { player.seekTo(it.startMs) }
         player.playWhenReady = true
     }
 
@@ -99,7 +117,12 @@ class AudioPreviewPlayer(
     }
 
     fun resume() {
-        if (player.playbackState == Player.STATE_ENDED) player.seekTo(0)
+        val window = playbackWindow
+        if (window != null && window.hasReachedEnd(player.currentPosition)) {
+            player.seekTo(window.startMs)
+        } else if (player.playbackState == Player.STATE_ENDED) {
+            player.seekTo(0)
+        }
         player.playWhenReady = true
     }
 
@@ -114,7 +137,13 @@ class AudioPreviewPlayer(
     }
 
     fun seekTo(positionMs: Long) {
-        player.seekTo(positionMs.coerceAtLeast(0))
+        val window = playbackWindow
+        val safePosition = if (window != null) {
+            positionMs.coerceIn(window.startMs, window.endMs)
+        } else {
+            positionMs.coerceAtLeast(0)
+        }
+        player.seekTo(safePosition)
         update()
     }
 
@@ -147,6 +176,7 @@ class AudioPreviewPlayer(
         currentUri = null
         clipStart = 0L
         clipEnd = Long.MAX_VALUE
+        playbackWindow = null
     }
 
     private fun stopPlayback(resetPlaybackParameters: Boolean = true) {
@@ -164,27 +194,19 @@ class AudioPreviewPlayer(
         player.release()
     }
 
-    private fun mediaItem(uri: Uri): MediaItem =
+    private fun clippingWindow(): PlaybackWindow? =
         if (clipStart > 0 || clipEnd < Long.MAX_VALUE) {
-            MediaItem.Builder()
-                .setUri(uri)
-                .setClippingConfiguration(
-                    MediaItem.ClippingConfiguration.Builder()
-                        .setStartPositionMs(clipStart)
-                        .setEndPositionMs(
-                            if (clipEnd == Long.MAX_VALUE) C.TIME_END_OF_SOURCE else clipEnd
-                        )
-                        .build()
-                )
-                .build()
+            PlaybackWindow.fromTrim(clipStart, clipEnd)
         } else {
-            MediaItem.fromUri(uri)
+            null
         }
 
     private fun replaceItem(uri: Uri) {
         val wasPlaying = player.isPlaying
-        player.setMediaItem(mediaItem(uri))
+        playbackWindow = clippingWindow()
+        player.setMediaItem(MediaItem.fromUri(uri))
         player.prepare()
+        playbackWindow?.let { player.seekTo(it.startMs) }
         player.playWhenReady = wasPlaying
     }
 
@@ -206,6 +228,18 @@ class AudioPreviewPlayer(
     private fun update() {
         val duration = player.duration.coerceAtLeast(0)
         val position = player.currentPosition.coerceIn(0, duration)
+        playbackWindow?.takeIf { it.hasReachedEnd(position) }?.let { window ->
+            player.pause()
+            player.seekTo(window.endMs)
+            stopProgress()
+            _playbackState.value = PlaybackState(
+                isPlaying = false,
+                currentPositionMs = window.endMs,
+                totalDurationMs = duration,
+                progress = if (duration > 0) window.endMs.toFloat() / duration else 0f
+            )
+            return
+        }
         val progress = if (duration > 0) position.toFloat() / duration else 0f
         _playbackState.value = PlaybackState(
             isPlaying = player.isPlaying,

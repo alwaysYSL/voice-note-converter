@@ -7,6 +7,7 @@ import androidx.compose.ui.test.click
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
 import com.example.ui.components.TrimState
 import com.example.ui.theme.MyApplicationTheme
@@ -107,7 +108,7 @@ class PreviewCardB3Test {
     }
 
     @Test
-    fun `ready source preview shows pitch control`() {
+    fun `ready source preview keeps advanced controls collapsed until opened`() {
         composeRule.setContent {
             MyApplicationTheme {
                 PreviewCard(
@@ -131,6 +132,11 @@ class PreviewCardB3Test {
             }
         }
 
+        composeRule.onNodeWithText("Edit audio").assertExists()
+        composeRule.onNodeWithText("🎵  Pitch").assertDoesNotExist()
+        composeRule.onNodeWithTag("preview_tools_divider").assertDoesNotExist()
+
+        composeRule.onNodeWithText("Edit audio").performClick()
         composeRule.onNodeWithText("🎵  Pitch").assertExists()
         composeRule.onNodeWithTag("preview_tools_divider").assertExists()
     }

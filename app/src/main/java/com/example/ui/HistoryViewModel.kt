@@ -14,9 +14,13 @@ import com.example.telegram.SendResult
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
 
 class HistoryViewModel(app: Application) : AndroidViewModel(app) {
     private val repository = ConversionHistoryRepository(
@@ -24,10 +28,36 @@ class HistoryViewModel(app: Application) : AndroidViewModel(app) {
     )
     private val audioPlayer = AudioPreviewPlayer(app, viewModelScope)
 
-    val historyItems = repository.allHistory.stateIn(
+    private val _searchQuery = MutableStateFlow("")
+    val searchQuery = _searchQuery.asStateFlow()
+    private val _historyFilter = MutableStateFlow(HistoryFilter.ALL)
+    val historyFilter = _historyFilter.asStateFlow()
+    private val _historySort = MutableStateFlow(HistorySort.NEWEST)
+    val historySort = _historySort.asStateFlow()
+
+    val historyItems = combine(
+        _searchQuery,
+        _historyFilter,
+        _historySort,
+        repository.allHistory
+    ) { query, filter, sort, items ->
+        filterAndSortHistory(items, query, filter, sort)
+    }.flowOn(Dispatchers.Default).stateIn(
         viewModelScope,
         SharingStarted.WhileSubscribed(5_000),
         emptyList()
+    )
+    val totalHistoryCount = repository.allHistory.map { it.size }.flowOn(Dispatchers.Default).stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        0
+    )
+    val totalHistoryBytes = repository.allHistory.map { items ->
+        items.sumOf { it.fileSizeBytes }
+    }.flowOn(Dispatchers.Default).stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        0L
     )
     val playbackState = audioPlayer.playbackState
     val playbackProgress = playbackState.map { it.progress }.stateIn(
@@ -41,6 +71,18 @@ class HistoryViewModel(app: Application) : AndroidViewModel(app) {
     private val _message = MutableStateFlow<String?>(null)
     val message = _message.asStateFlow()
     private val pendingDatabaseDeletion = mutableSetOf<Long>()
+
+    fun updateSearch(query: String) {
+        _searchQuery.value = query
+    }
+
+    fun setFilter(filter: HistoryFilter) {
+        _historyFilter.value = filter
+    }
+
+    fun setSort(sort: HistorySort) {
+        _historySort.value = sort
+    }
 
     fun playPause(item: ConversionHistory) {
         if (_currentlyPlayingId.value == item.id) {
@@ -68,7 +110,29 @@ class HistoryViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteItem(item: ConversionHistory) {
         viewModelScope.launch {
-            val fileAlreadyRemoved = item.id in pendingDatabaseDeletion
+            deleteItemInternal(item)
+        }
+    }
+
+    fun deleteItems(items: List<ConversionHistory>) {
+        if (items.isEmpty()) return
+        viewModelScope.launch {
+            var deletedCount = 0
+            var failedCount = 0
+            items.distinctBy { it.id }.forEach { item ->
+                if (deleteItemInternal(item)) deletedCount++ else failedCount++
+            }
+            _message.value = when {
+                failedCount == 0 -> "$deletedCount file dihapus."
+                deletedCount == 0 -> "File tidak dapat dihapus; entri riwayat tetap disimpan."
+                else -> "$deletedCount file dihapus; $failedCount file gagal dihapus."
+            }
+        }
+    }
+
+    private suspend fun deleteItemInternal(item: ConversionHistory): Boolean {
+        val fileAlreadyRemoved = item.id in pendingDatabaseDeletion
+        val result = withContext(Dispatchers.IO) {
             val storageDeleted = fileAlreadyRemoved || VoiceNoteStorage.deleteFromStorage(
                 getApplication(),
                 item.outputFilePath
@@ -78,23 +142,41 @@ class HistoryViewModel(app: Application) : AndroidViewModel(app) {
                 item.outputFilePath
             )
             if (!canProceed) {
-                _message.value = "File tidak dapat dihapus; entri riwayat tetap disimpan."
-                return@launch
+                return@withContext DeleteResult(
+                    deleted = false,
+                    message = "File tidak dapat dihapus; entri riwayat tetap disimpan."
+                )
             }
+
             try {
                 repository.delete(item.id)
-                pendingDatabaseDeletion.remove(item.id)
-                if (_currentlyPlayingId.value == item.id) {
-                    audioPlayer.stop()
-                    _currentlyPlayingId.value = null
-                }
+                DeleteResult(deleted = true)
             } catch (error: Exception) {
-                pendingDatabaseDeletion += item.id
-                _message.value =
-                    "File sudah dihapus, tetapi riwayat belum terhapus. Coba hapus lagi."
+                DeleteResult(
+                    deleted = false,
+                    markDatabaseDeletionPending = true,
+                    message = "File sudah dihapus, tetapi riwayat belum terhapus. Coba hapus lagi."
+                )
             }
         }
+        if (result.deleted) {
+            pendingDatabaseDeletion.remove(item.id)
+            if (_currentlyPlayingId.value == item.id) {
+                audioPlayer.stop()
+                _currentlyPlayingId.value = null
+            }
+        } else if (result.markDatabaseDeletionPending) {
+            pendingDatabaseDeletion += item.id
+        }
+        result.message?.let { _message.value = it }
+        return result.deleted
     }
+
+    private data class DeleteResult(
+        val deleted: Boolean,
+        val markDatabaseDeletionPending: Boolean = false,
+        val message: String? = null
+    )
 
     fun clearMessage() {
         _message.value = null
