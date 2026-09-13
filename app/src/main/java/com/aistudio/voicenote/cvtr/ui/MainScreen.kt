@@ -3,6 +3,7 @@ package com.aistudio.voicenote.cvtr.ui
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -46,6 +47,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -93,6 +96,8 @@ fun MainScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val playback by viewModel.playbackState.collectAsStateWithLifecycle()
+    val batchItems by viewModel.batchItems.collectAsStateWithLifecycle()
+    val batchMessage by viewModel.batchMessage.collectAsStateWithLifecycle()
     val hasConvertedResult = state.convertedUri != null
     val safeTopInset = statusBarInset
         ?: WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
@@ -102,6 +107,31 @@ fun MainScreen(
         ProcessStatus.SENDING
     )
     val context = LocalContext.current
+    var pendingBatchUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    val batchStoragePermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) viewModel.enqueueBatch(pendingBatchUris)
+        pendingBatchUris = emptyList()
+    }
+    val enqueueBatchWithPermission: (List<Uri>) -> Unit = { uris ->
+        val needsLegacyPermission = Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) != PackageManager.PERMISSION_GRANTED
+        if (needsLegacyPermission) {
+            pendingBatchUris = uris
+            batchStoragePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            viewModel.enqueueBatch(uris)
+        }
+    }
+    val batchPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        enqueueBatchWithPermission(uris)
+    }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {
         it?.let(viewModel::handleIncomingUri)
     }
@@ -145,18 +175,37 @@ fun MainScreen(
                 hasSelection = state.selectedFileUri != null,
                 selectedFileName = state.fileName,
                 enabled = sourceSelectionEnabled,
-                onPick = { picker.launch(arrayOf("audio/*", "video/*")) }
+                onPick = { picker.launch(arrayOf("audio/*", "video/*")) },
+                onPickBatch = { batchPicker.launch(arrayOf("audio/*", "video/*")) }
             )
-
+            if (batchItems.isNotEmpty() || batchMessage != null) {
+                BatchQueuePanel(
+                    items = batchItems,
+                    message = batchMessage,
+                    onRetry = viewModel::retryBatch,
+                    onCancel = viewModel::cancelBatch,
+                    onDismissMessage = viewModel::clearBatchMessage
+                )
+            }
             state.fileName?.let { fileName ->
+                val previewingConverted = state.previewSource == PreviewSource.CONVERTED &&
+                    state.convertedUri != null
                 PreviewCard(
-                    fileName = fileName,
+                    fileName = if (previewingConverted && state.outputFileName.isNotBlank()) {
+                        state.outputFileName
+                    } else {
+                        fileName
+                    },
                     hasConvertedResult = hasConvertedResult,
-                    waveform = state.waveform,
+                    waveform = state.previewWaveform(),
                     progress = playback.progress,
                     isPlaying = playback.isPlaying,
                     currentPositionMs = playback.currentPositionMs,
-                    fallbackDurationSec = state.fileDurationSec,
+                    fallbackDurationSec = if (previewingConverted) {
+                        (state.convertedDurationMs / 1_000L).toInt()
+                    } else {
+                        state.fileDurationSec
+                    },
                     trimState = state.trimState,
                     processStatus = state.processStatus,
                     onTogglePlayback = viewModel::togglePlayback,
@@ -167,9 +216,20 @@ fun MainScreen(
                     onResetTrim = viewModel::resetTrim,
                     pitchSemitones = state.pitchSemitones,
                     onPitchChange = viewModel::updatePitch,
+                    outputFileName = state.outputFileName,
+                    onOutputFileNameChange = viewModel::updateOutputFileName,
+                    previewSource = state.previewSource,
+                    onPreviewSourceChange = viewModel::setPreviewSource,
+                    normalizeAudio = state.normalizeAudio,
+                    onNormalizeAudioChange = viewModel::setNormalizeAudio,
+                    trimSilence = state.trimSilence,
+                    onTrimSilenceChange = viewModel::setTrimSilence,
+                    compatibilitySummary = state.compatibilitySummary,
+                    compatibilityWarning = state.compatibilityWarning,
                     playbackError = playback.errorMessage
                 )
             }
+
         }
 
         if (state.selectedFileUri != null) {
@@ -244,7 +304,8 @@ private fun SourcePickerCard(
     hasSelection: Boolean,
     selectedFileName: String?,
     enabled: Boolean,
-    onPick: () -> Unit
+    onPick: () -> Unit,
+    onPickBatch: () -> Unit = {}
 ) {
     SoftCard(
         containerColor = CardSurfaceWhite,
@@ -278,8 +339,13 @@ private fun SourcePickerCard(
                     overflow = TextOverflow.Ellipsis
                 )
                 if (hasSelection) {
-                    TextButton(onClick = onPick, enabled = enabled) {
-                        Text("Ganti")
+                    Row {
+                        TextButton(onClick = onPick, enabled = enabled) {
+                            Text("Ganti")
+                        }
+                        TextButton(onClick = onPickBatch, enabled = enabled) {
+                            Text("Pilih beberapa")
+                        }
                     }
                 }
             }
@@ -297,6 +363,19 @@ private fun SourcePickerCard(
                 border = androidx.compose.foundation.BorderStroke(1.dp, SubtleBorder)
             ) {
                 Text("Pilih audio atau video")
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = onPickBatch,
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                    contentColor = DeepNavyDisplay
+                ),
+                border = androidx.compose.foundation.BorderStroke(1.dp, SubtleBorder)
+            ) {
+                Text("Pilih beberapa file")
             }
         }
     }
@@ -321,9 +400,20 @@ internal fun PreviewCard(
     onResetTrim: () -> Unit,
     pitchSemitones: Float = 0f,
     onPitchChange: (Float) -> Unit = {},
-    playbackError: String?
+    outputFileName: String = "",
+    onOutputFileNameChange: (String) -> Unit = {},
+    previewSource: PreviewSource = PreviewSource.ORIGINAL,
+    onPreviewSourceChange: (PreviewSource) -> Unit = {},
+    normalizeAudio: Boolean = false,
+    onNormalizeAudioChange: (Boolean) -> Unit = {},
+    trimSilence: Boolean = false,
+    onTrimSilenceChange: (Boolean) -> Unit = {},
+    compatibilitySummary: String? = null,
+    compatibilityWarning: String? = null,
+    playbackError: String? = null
 ) {
     var showAudioEditor by remember(fileName) { mutableStateOf(false) }
+    val previewingConverted = hasConvertedResult && previewSource == PreviewSource.CONVERTED
 
     SoftCard(containerColor = CardSurfaceWhite) {
         Row(
@@ -333,14 +423,14 @@ internal fun PreviewCard(
         ) {
             IconBubble(
                 icon = { Icon(Icons.Default.Mic, contentDescription = null) },
-                backgroundColor = if (hasConvertedResult) PastelPeriwinkleCardBg else PastelPeachCardBg,
-                iconColor = if (hasConvertedResult) AccentRoyalBlue else AccentCoral
+                backgroundColor = if (previewingConverted) PastelPeriwinkleCardBg else PastelPeachCardBg,
+                iconColor = if (previewingConverted) AccentRoyalBlue else AccentCoral
             )
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = if (hasConvertedResult) "Hasil voice note" else "Preview audio asli",
+                    text = if (previewingConverted) "Hasil voice note" else "Preview audio asli",
                     style = MaterialTheme.typography.labelLarge,
-                    color = if (hasConvertedResult) PastelMintText else AccentCoral
+                    color = if (previewingConverted) PastelMintText else AccentCoral
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
@@ -352,12 +442,52 @@ internal fun PreviewCard(
                 )
             }
         }
+        if (hasConvertedResult) {
+            Spacer(Modifier.height(12.dp))
+            PreviewSourceToggle(
+                previewSource = previewSource,
+                onPreviewSourceChange = onPreviewSourceChange
+            )
+            compatibilitySummary?.let {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SubtitleSlate
+                )
+            }
+            compatibilityWarning?.let {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+        if (!hasConvertedResult &&
+            processStatus != ProcessStatus.ANALYZING &&
+            processStatus != ProcessStatus.CONVERTING &&
+            processStatus != ProcessStatus.SENDING
+        ) {
+            Spacer(Modifier.height(12.dp))
+            OutlinedTextField(
+                value = outputFileName,
+                onValueChange = onOutputFileNameChange,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("output_file_name"),
+                label = { Text("Nama file hasil") },
+                supportingText = { Text("Akhiran .ogg akan ditambahkan otomatis bila perlu.") },
+                singleLine = true
+            )
+        }
         Spacer(Modifier.height(18.dp))
         WaveformVisualizer(
             modifier = Modifier.fillMaxWidth().testTag("preview_waveform"),
             waveform = waveform,
             progress = progress,
-            activeColor = if (hasConvertedResult) AccentRoyalBlue else AccentCoral,
+            activeColor = if (previewingConverted) AccentRoyalBlue else AccentCoral,
             inactiveColor = SubtleBorder,
             playheadColor = AccentCoral,
             height = 58.dp,
@@ -438,7 +568,112 @@ internal fun PreviewCard(
                     onPitchChange = onPitchChange,
                     enabled = true
                 )
+                Spacer(Modifier.height(12.dp))
+                AudioEffectsControls(
+                    normalizeAudio = normalizeAudio,
+                    onNormalizeAudioChange = onNormalizeAudioChange,
+                    trimSilence = trimSilence,
+                    onTrimSilenceChange = onTrimSilenceChange
+                )
             }
+        }
+    }
+}
+
+@Composable
+private fun PreviewSourceToggle(
+    previewSource: PreviewSource,
+    onPreviewSourceChange: (PreviewSource) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (previewSource == PreviewSource.ORIGINAL) {
+            Button(
+                onClick = { onPreviewSourceChange(PreviewSource.ORIGINAL) },
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = AccentCoral)
+            ) {
+                Text("Asli")
+            }
+        } else {
+            OutlinedButton(
+                onClick = { onPreviewSourceChange(PreviewSource.ORIGINAL) },
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Text("Asli")
+            }
+        }
+        if (previewSource == PreviewSource.CONVERTED) {
+            Button(
+                onClick = { onPreviewSourceChange(PreviewSource.CONVERTED) },
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = AccentRoyalBlue)
+            ) {
+                Text("Hasil")
+            }
+        } else {
+            OutlinedButton(
+                onClick = { onPreviewSourceChange(PreviewSource.CONVERTED) },
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Text("Hasil")
+            }
+        }
+    }
+}
+
+@Composable
+private fun AudioEffectsControls(
+    normalizeAudio: Boolean,
+    onNormalizeAudioChange: (Boolean) -> Unit,
+    trimSilence: Boolean,
+    onTrimSilenceChange: (Boolean) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = "Pemrosesan hasil",
+            style = MaterialTheme.typography.labelLarge,
+            color = DeepNavyDisplay
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Normalisasi volume", color = DeepNavyDisplay)
+                Text(
+                    "Naikkan level tanpa melewati peak aman.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SubtitleSlate
+                )
+            }
+            Switch(
+                checked = normalizeAudio,
+                onCheckedChange = onNormalizeAudioChange
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Potong hening tepi", color = DeepNavyDisplay)
+                Text(
+                    "Hapus hening di awal dan akhir hasil.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SubtitleSlate
+                )
+            }
+            Switch(
+                checked = trimSilence,
+                onCheckedChange = onTrimSilenceChange
+            )
         }
     }
 }
@@ -600,7 +835,7 @@ private fun PrimaryActionButton(
 }
 
 @Composable
-private fun SoftCard(
+internal fun SoftCard(
     containerColor: Color,
     modifier: Modifier = Modifier,
     content: @Composable () -> Unit

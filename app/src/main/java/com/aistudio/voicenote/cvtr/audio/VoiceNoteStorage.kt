@@ -12,15 +12,46 @@ import androidx.core.net.toUri
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.UUID
 
 object VoiceNoteStorage {
-    fun generateFileName(): String =
-        "VN_${SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())}_" +
-            "${UUID.randomUUID().toString().take(8)}.ogg"
+    fun suggestedOutputFileName(originalName: String?): String {
+        val sourceName = originalName
+            ?.substringAfterLast('/')
+            ?.substringAfterLast('\\')
+            .orEmpty()
+        val baseName = sourceName
+            .substringBeforeLast('.', missingDelimiterValue = sourceName)
+            .ifBlank { "voice_note" }
+        return sanitizeOutputFileName("$baseName.ogg")
+    }
+
+    fun sanitizeOutputFileName(requestedName: String?, fallback: String = "voice_note.ogg"): String {
+        val source = requestedName?.trim().orEmpty().ifBlank { fallback }
+        val safe = source
+            .replace('/', '_')
+            .replace('\\', '_')
+            .replace(':', '_')
+            .filterNot { it.isISOControl() }
+            .trim('.', ' ')
+        val stem = safe
+            .substringBeforeLast('.', missingDelimiterValue = safe)
+            .ifBlank { fallback.substringBeforeLast('.') }
+        return "${stem.take(76).trimEnd('.', ' ')}.ogg"
+    }
+
+    fun resolveOutputFileName(context: Context, requestedName: String?): String {
+        val candidate = sanitizeOutputFileName(requestedName)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return candidate
+
+        val directory = getStorageFolder()
+        if (!File(directory, candidate).exists()) return candidate
+        val stem = candidate.removeSuffix(".ogg")
+        return (1..999).asSequence()
+            .map { "${stem.take(71)}_$it.ogg" }
+            .firstOrNull { !File(directory, it).exists() }
+            ?: "${stem.take(65)}_${UUID.randomUUID().toString().take(8)}.ogg"
+    }
 
     fun saveToPublicStorage(context: Context, cacheFile: File, fileName: String): Uri {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

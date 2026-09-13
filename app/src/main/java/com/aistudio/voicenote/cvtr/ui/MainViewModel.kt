@@ -7,29 +7,35 @@ import android.util.Log
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import com.aistudio.voicenote.cvtr.audio.AudioProcessingOptions
+import com.aistudio.voicenote.cvtr.audio.MediaInputCache
 import com.aistudio.voicenote.cvtr.audio.AudioPreviewPlayer
 import com.aistudio.voicenote.cvtr.audio.PlaybackState
 import com.aistudio.voicenote.cvtr.audio.VoiceNoteConverter
 import com.aistudio.voicenote.cvtr.audio.VoiceNoteStorage
 import com.aistudio.voicenote.cvtr.audio.WaveformCodec
 import com.aistudio.voicenote.cvtr.data.local.AppDatabase
-import com.aistudio.voicenote.cvtr.data.local.ConversionHistory
+import com.aistudio.voicenote.cvtr.work.ConversionWork
 import com.aistudio.voicenote.cvtr.data.repository.ConversionHistoryRepository
 import com.aistudio.voicenote.cvtr.telegram.SendResult
 import com.aistudio.voicenote.cvtr.telegram.TelegramSender
 import com.aistudio.voicenote.cvtr.ui.components.TrimState
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.UUID
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.pow
 
@@ -44,10 +50,18 @@ enum class ProcessStatus {
     FAILED
 }
 
+enum class PreviewSource {
+    ORIGINAL,
+    CONVERTED
+}
+
 data class MainUiState(
     val selectedFileUri: Uri? = null,
     val fileName: String? = null,
+    val outputFileName: String = "",
     val fileDurationSec: Int = 0,
+    val originalDurationMs: Long = 0L,
+    val convertedDurationMs: Long = 0L,
     val processStatus: ProcessStatus = ProcessStatus.IDLE,
     val progress: Float = 0f,
     val statusMessage: String = "",
@@ -55,16 +69,39 @@ data class MainUiState(
     val canRetry: Boolean = false,
     val trimState: TrimState = TrimState(),
     val waveform: List<Int> = emptyList(),
+    val originalWaveform: List<Int> = emptyList(),
+    val convertedWaveform: List<Int> = emptyList(),
+    val previewSource: PreviewSource = PreviewSource.CONVERTED,
+    val normalizeAudio: Boolean = false,
+    val trimSilence: Boolean = false,
+    val compatibilitySummary: String? = null,
+    val compatibilityWarning: String? = null,
     val convertedUri: Uri? = null,
     val lastConversionId: Long? = null,
     val pitchSemitones: Float = 0f
 ) {
-    fun previewUri(): Uri? = convertedUri ?: selectedFileUri
+    fun previewUri(): Uri? = if (
+        previewSource == PreviewSource.CONVERTED && convertedUri != null
+    ) {
+        convertedUri
+    } else {
+        selectedFileUri
+    }
+
+    fun previewWaveform(): List<Int> = if (previewSource == PreviewSource.CONVERTED) {
+        convertedWaveform.ifEmpty { waveform }
+    } else {
+        originalWaveform.ifEmpty { waveform }
+    }
 }
 
 
 private const val STATE_INPUT_URI = "main.inputUri"
 private const val STATE_FILE_NAME = "main.fileName"
+private const val STATE_OUTPUT_FILE_NAME = "main.outputFileName"
+private const val STATE_NORMALIZE_AUDIO = "main.normalizeAudio"
+private const val STATE_TRIM_SILENCE = "main.trimSilence"
+private const val STATE_CONVERSION_WORK_ID = "main.conversionWorkId"
 private const val STATE_PITCH_SEMITONES = "main.pitchSemitones"
 private const val TAG = "MainViewModel"
 private class StaleConversionException : Exception()
@@ -89,21 +126,42 @@ class MainViewModel(
         .get<String>(STATE_INPUT_URI)
         ?.let { Uri.parse(it) }
     private val restoredFileName = savedStateHandle.get<String>(STATE_FILE_NAME)
+    private val restoredOutputFileName = savedStateHandle.get<String>(STATE_OUTPUT_FILE_NAME)
+    private val restoredNormalizeAudio =
+        savedStateHandle.get<Boolean>(STATE_NORMALIZE_AUDIO) ?: false
+    private val restoredTrimSilence =
+        savedStateHandle.get<Boolean>(STATE_TRIM_SILENCE) ?: false
     private val restoredPitchSemitones =
         savedStateHandle.get<Float>(STATE_PITCH_SEMITONES) ?: 0f
+    private val restoredConversionWorkId = savedStateHandle
+        .get<String>(STATE_CONVERSION_WORK_ID)
+        ?.let { value -> runCatching { UUID.fromString(value) }.getOrNull() }
     private val _uiState = MutableStateFlow(
         MainUiState(
             selectedFileUri = restoredInputUri,
             fileName = restoredFileName,
-            processStatus = if (restoredInputUri != null) {
-                ProcessStatus.ANALYZING
-            } else {
-                ProcessStatus.IDLE
+            outputFileName = restoredOutputFileName.orEmpty(),
+            processStatus = when {
+                restoredConversionWorkId != null -> ProcessStatus.CONVERTING
+                restoredInputUri != null -> ProcessStatus.ANALYZING
+                else -> ProcessStatus.IDLE
             },
+            normalizeAudio = restoredNormalizeAudio,
+            trimSilence = restoredTrimSilence,
             pitchSemitones = restoredPitchSemitones
         )
     )
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
+    private val batchStore: BatchQueueStore by lazy { BatchQueueStore(context) }
+    private val workManager: WorkManager? by lazy {
+        runCatching { WorkManager.getInstance(context) }.getOrNull()
+    }
+    private val _batchItems = MutableStateFlow<List<BatchQueueItem>>(emptyList())
+    val batchItems: StateFlow<List<BatchQueueItem>> = _batchItems.asStateFlow()
+    private val _batchMessage = MutableStateFlow<String?>(null)
+    val batchMessage: StateFlow<String?> = _batchMessage.asStateFlow()
+    private var conversionWorkId: UUID? = null
+    private var batchMonitorJob: Job? = null
     private val inputGeneration = AtomicLong(0L)
     private var loadedPlaybackUri: Uri? = null
     private var analysisJob: Job? = null
@@ -115,10 +173,28 @@ class MainViewModel(
             uiState.collect { state ->
                 savedStateHandle[STATE_INPUT_URI] = state.selectedFileUri?.toString()
                 savedStateHandle[STATE_FILE_NAME] = state.fileName
+                savedStateHandle[STATE_OUTPUT_FILE_NAME] = state.outputFileName
+                savedStateHandle[STATE_NORMALIZE_AUDIO] = state.normalizeAudio
+                savedStateHandle[STATE_TRIM_SILENCE] = state.trimSilence
                 savedStateHandle[STATE_PITCH_SEMITONES] = state.pitchSemitones
             }
         }
-        restoredInputUri?.let(::handleIncomingUri)
+        workManager?.let { manager ->
+            batchMonitorJob = viewModelScope.launch(Dispatchers.IO) {
+                monitorBatchQueue(manager)
+            }
+        }
+        restoredInputUri?.let { uri ->
+            handleIncomingUri(uri)
+            restoredConversionWorkId?.let { workId ->
+                conversionWorkId = workId
+                savedStateHandle[STATE_CONVERSION_WORK_ID] = workId.toString()
+                _uiState.update { it.copy(processStatus = ProcessStatus.CONVERTING) }
+                conversionJob = viewModelScope.launch(Dispatchers.IO) {
+                    observeConversionWork(workId, inputGeneration.get(), uri)
+                }
+            }
+        }
     }
 
     fun handleIncomingUri(uri: Uri) {
@@ -126,11 +202,16 @@ class MainViewModel(
         analysisJob?.cancel()
         waveformJob?.cancel()
         conversionJob?.cancel()
+        cancelConversionWork()
         audioPlayer.stop()
         loadedPlaybackUri = null
         _uiState.value = MainUiState(
             selectedFileUri = uri,
+            outputFileName = if (uri == restoredInputUri) restoredOutputFileName.orEmpty() else "",
             processStatus = ProcessStatus.ANALYZING,
+            previewSource = PreviewSource.ORIGINAL,
+            normalizeAudio = if (uri == restoredInputUri) restoredNormalizeAudio else false,
+            trimSilence = if (uri == restoredInputUri) restoredTrimSilence else false,
             pitchSemitones = if (uri == restoredInputUri) restoredPitchSemitones else 0f
         )
         audioPlayer.setPitchPreview(pitchFactorForPreview(_uiState.value))
@@ -141,7 +222,11 @@ class MainViewModel(
                 _uiState.update {
                     it.copy(
                         fileName = name,
+                        outputFileName = it.outputFileName.ifBlank {
+                            VoiceNoteStorage.suggestedOutputFileName(name)
+                        },
                         fileDurationSec = ((durationMs + 999L) / 1_000L).toInt(),
+                        originalDurationMs = durationMs,
                         processStatus = ProcessStatus.IDLE,
                         trimState = TrimState(endMs = durationMs, totalDurationMs = durationMs),
                         statusMessage = "File siap dikonversi"
@@ -164,7 +249,7 @@ class MainViewModel(
 
     private fun ensureWaveformLoaded(uri: Uri) {
         if (_uiState.value.selectedFileUri != uri ||
-            _uiState.value.waveform.isNotEmpty() ||
+            _uiState.value.originalWaveform.isNotEmpty() ||
             waveformJob?.isActive == true
         ) {
             return
@@ -174,7 +259,12 @@ class MainViewModel(
             try {
                 val waveform = VoiceNoteConverter.extractWaveform(context, uri)
                 ensureCurrentInput(generation, uri)
-                _uiState.update { it.copy(waveform = waveform) }
+                _uiState.update {
+                    it.copy(
+                        waveform = if (it.previewSource == PreviewSource.ORIGINAL) waveform else it.waveform,
+                        originalWaveform = waveform
+                    )
+                }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: StaleConversionException) {
@@ -243,6 +333,63 @@ class MainViewModel(
         audioPlayer.setPitchPreview(pitchFactorForPreview(_uiState.value))
     }
 
+    fun updateOutputFileName(value: String) {
+        if (_uiState.value.convertedUri != null) return
+        _uiState.update { it.copy(outputFileName = value.take(120)) }
+    }
+
+    fun setNormalizeAudio(enabled: Boolean) {
+        _uiState.update { it.copy(normalizeAudio = enabled) }
+    }
+
+    fun setTrimSilence(enabled: Boolean) {
+        _uiState.update { it.copy(trimSilence = enabled) }
+    }
+
+    fun setPreviewSource(source: PreviewSource) {
+        val state = _uiState.value
+        val outputUri = state.convertedUri
+        if (source == state.previewSource || outputUri == null) return
+        val currentPlayback = playbackState.value
+        val fraction = if (currentPlayback.totalDurationMs > 0L) {
+            currentPlayback.currentPositionMs.toFloat() / currentPlayback.totalDurationMs
+        } else {
+            0f
+        }
+        val targetUri = if (source == PreviewSource.CONVERTED) {
+            outputUri
+        } else {
+            state.selectedFileUri ?: return
+        }
+        val targetDuration = if (source == PreviewSource.CONVERTED) {
+            state.convertedDurationMs
+        } else {
+            state.originalDurationMs
+        }
+        _uiState.update {
+            it.copy(
+                previewSource = source,
+                waveform = if (source == PreviewSource.CONVERTED) {
+                    it.convertedWaveform
+                } else {
+                    it.originalWaveform
+                }
+            )
+        }
+        if (source == PreviewSource.ORIGINAL) ensureWaveformLoaded(targetUri)
+        audioPlayer.clearClipping()
+        audioPlayer.play(
+            targetUri,
+            pitchFactor = if (source == PreviewSource.ORIGINAL) {
+                pitchFactorForPreview(state.copy(previewSource = PreviewSource.ORIGINAL))
+            } else {
+                1f
+            },
+            startPositionMs = (fraction * targetDuration).toLong()
+        )
+        loadedPlaybackUri = targetUri
+    }
+
     fun previewTrim() {
         val state = _uiState.value
         val uri = state.selectedFileUri ?: return
@@ -284,107 +431,331 @@ class MainViewModel(
         ) {
             return
         }
+        val manager = workManager ?: run {
+            fail("WorkManager tidak tersedia.", canRetry = true)
+            return
+        }
         val trim = state.trimState
         val generation = inputGeneration.get()
-        _uiState.update {
-            it.copy(processStatus = ProcessStatus.CONVERTING, progress = 0f, errorMessage = null)
-        }
         conversionJob?.cancel()
+        cancelConversionWork()
+        _uiState.update {
+            it.copy(
+                processStatus = ProcessStatus.CONVERTING,
+                progress = 0f,
+                errorMessage = null,
+                canRetry = false,
+                statusMessage = "Menyiapkan konversi di latar belakang…"
+            )
+        }
         conversionJob = viewModelScope.launch(Dispatchers.IO) {
-            var savedUri: Uri? = null
-            var historyId: Long? = null
-            var cacheFile: java.io.File? = null
+            var cachedUri: Uri? = null
+            var enqueued = false
             try {
-                val result = VoiceNoteConverter.convertToTelegramVoiceNote(
-                    context = context,
-                    inputUri = uri,
+                cachedUri = MediaInputCache.copyToPersistent(context, uri)
+                ensureCurrentInput(generation, uri)
+                val request = ConversionWork.request(
+                    inputUri = cachedUri,
+                    requestedOutputName = state.outputFileName,
                     trimStartMs = if (trim.isActive) trim.startMs else 0L,
                     trimEndMs = if (trim.isActive) trim.endMs else Long.MAX_VALUE,
                     pitchSemitones = state.pitchSemitones,
-                    onProgress = { progress ->
-                        if (isCurrentInput(generation, uri)) {
-                            _uiState.update { current -> current.copy(progress = progress) }
-                        }
-                    }
+                    options = AudioProcessingOptions(
+                        normalizeAudio = state.normalizeAudio,
+                        trimSilence = state.trimSilence
+                    ),
+                    sourceFileName = state.fileName
                 )
-                cacheFile = result.outputFile
-                ensureCurrentInput(generation, uri)
-
-                val outputName = VoiceNoteStorage.generateFileName()
-                ensureCurrentInput(generation, uri)
-                savedUri = VoiceNoteStorage.saveToPublicStorage(
-                    context,
-                    result.outputFile,
-                    outputName
+                conversionWorkId = request.id
+                savedStateHandle[STATE_CONVERSION_WORK_ID] = request.id.toString()
+                manager.enqueueUniqueWork(
+                    ConversionWork.SINGLE_WORK_NAME,
+                    androidx.work.ExistingWorkPolicy.REPLACE,
+                    request
                 )
-                ensureCurrentInput(generation, uri)
-
-                val historyItem = ConversionHistory(
-                    originalFileName = result.originalFileName,
-                    outputFileName = outputName,
-                    outputFilePath = savedUri.toString(),
-                    durationSeconds = result.durationSeconds,
-                    fileSizeBytes = result.outputFile.length(),
-                    waveform = WaveformCodec.encode(result.waveform),
-                    bitrateKbps = result.bitrateKbps,
-                    trimStartMs = trim.startMs.takeIf { trim.isActive },
-                    trimEndMs = trim.endMs.takeIf { trim.isActive },
-                    createdAt = System.currentTimeMillis(),
-                    pitchSemitones = state.pitchSemitones.takeIf { it != 0f }
-                )
-                ensureCurrentInput(generation, uri)
-                historyId = history.insert(historyItem)
-                ensureCurrentInput(generation, uri)
-
-                _uiState.update {
-                    check(isCurrentInput(generation, uri)) { throw StaleConversionException() }
-                    it.copy(
-                        processStatus = ProcessStatus.CONVERTED,
-                        waveform = result.waveform,
-                        fileDurationSec = result.durationSeconds,
-                        convertedUri = savedUri,
-                        lastConversionId = historyId,
-                        progress = 1f,
-                        statusMessage = "Voice note siap dipreview dan dikirim"
-                    )
-                }
+                enqueued = true
+                observeConversionWork(request.id, generation, uri)
             } catch (error: CancellationException) {
-                rollbackConversion(historyId, savedUri)
+                if (!enqueued) cachedUri?.let { MediaInputCache.delete(context, it) }
                 throw error
             } catch (error: StaleConversionException) {
-                rollbackConversion(historyId, savedUri)
-                return@launch
+                if (!enqueued) cachedUri?.let { MediaInputCache.delete(context, it) }
+                manager.cancelUniqueWork(ConversionWork.SINGLE_WORK_NAME)
             } catch (error: Throwable) {
-                rollbackConversion(historyId, savedUri)
-                if (isCurrentInput(generation, uri) && error is Exception) {
+                if (!enqueued) cachedUri?.let { MediaInputCache.delete(context, it) }
+                if (isCurrentInput(generation, uri)) {
                     fail(
-                        "Gagal mengonversi audio: ${technicalMessage(error, "konversi gagal")}",
+                        "Gagal memulai konversi: ${technicalMessage(error, "konversi gagal")}",
                         canRetry = true
                     )
-                } else if (error !is Exception) {
-                    throw error
                 }
-            } finally {
-                cacheFile?.delete()
             }
         }
     }
-    private suspend fun rollbackConversion(historyId: Long?, savedUri: Uri?) {
-        withContext(NonCancellable) {
-            historyId?.let { id ->
-                runCatching { history.delete(id) }
-                    .onFailure { Log.e(TAG, "Gagal menghapus row rollback $id", it) }
-            }
-            savedUri?.let { uri ->
-                runCatching {
-                    val deleted = VoiceNoteStorage.deleteFromStorage(context, uri.toString())
-                    if (!deleted && VoiceNoteStorage.fileExists(context, uri.toString())) {
-                        error("File hasil rollback masih ada")
+
+    private suspend fun observeConversionWork(
+        workId: UUID,
+        generation: Long,
+        sourceUri: Uri
+    ) {
+        val manager = workManager ?: return
+        while (true) {
+            ensureCurrentInput(generation, sourceUri)
+            val info = manager.getWorkInfoById(workId).get(2, TimeUnit.SECONDS)
+                ?: error("Pekerjaan konversi tidak ditemukan.")
+            when (info.state) {
+                WorkInfo.State.ENQUEUED,
+                WorkInfo.State.BLOCKED,
+                WorkInfo.State.RUNNING -> {
+                    val progress = info.progress
+                        .getFloat(ConversionWork.PROGRESS, 0f)
+                        .coerceIn(0f, 1f)
+                    _uiState.update {
+                        if (isCurrentInput(generation, sourceUri)) {
+                            it.copy(
+                                processStatus = ProcessStatus.CONVERTING,
+                                progress = progress,
+                                statusMessage = if (info.state == WorkInfo.State.BLOCKED) {
+                                    "Menunggu ruang penyimpanan…"
+                                } else {
+                                    "Mengonversi di latar belakang…"
+                                }
+                            )
+                        } else {
+                            it
+                        }
                     }
-                }.onFailure {
-                    Log.e(TAG, "Gagal menghapus file rollback $uri", it)
+                    delay(150L)
+                }
+                WorkInfo.State.SUCCEEDED -> {
+                    publishConversionResult(info, generation, sourceUri)
+                    return
+                }
+                WorkInfo.State.FAILED -> {
+                    val message = info.outputData
+                        .getString(ConversionWork.ERROR_MESSAGE)
+                        ?: "Konversi gagal."
+                    conversionWorkId = null
+                    savedStateHandle[STATE_CONVERSION_WORK_ID] = null
+                    if (isCurrentInput(generation, sourceUri)) {
+                        fail(message, canRetry = true)
+                    }
+                    return
+                }
+                WorkInfo.State.CANCELLED -> {
+                    conversionWorkId = null
+                    savedStateHandle[STATE_CONVERSION_WORK_ID] = null
+                    if (isCurrentInput(generation, sourceUri)) {
+                        fail("Konversi dibatalkan.", canRetry = true)
+                    }
+                    return
                 }
             }
+        }
+    }
+
+    private suspend fun publishConversionResult(
+        info: WorkInfo,
+        generation: Long,
+        sourceUri: Uri
+    ) {
+        ensureCurrentInput(generation, sourceUri)
+        val outputUri = info.outputData.getString(ConversionWork.RESULT_URI)
+            ?.let(Uri::parse)
+            ?: error("Worker tidak mengembalikan URI hasil.")
+        val historyId = info.outputData.getLong(ConversionWork.RESULT_HISTORY_ID, -1L)
+            .takeIf { it >= 0L }
+        val outputName = info.outputData
+            .getString(ConversionWork.RESULT_OUTPUT_FILE_NAME)
+            .orEmpty()
+        val summary = info.outputData
+            .getString(ConversionWork.RESULT_COMPATIBILITY_SUMMARY)
+        val waveform = info.outputData
+            .getString(ConversionWork.RESULT_WAVEFORM)
+            ?.let(WaveformCodec::decode)
+            .orEmpty()
+        val durationSeconds = info.outputData.getInt(
+            ConversionWork.RESULT_DURATION_SECONDS,
+            _uiState.value.fileDurationSec
+        )
+        val warning = info.outputData
+            .getString(ConversionWork.RESULT_COMPATIBILITY_WARNING)
+        _uiState.update {
+            check(isCurrentInput(generation, sourceUri)) {
+                throw StaleConversionException()
+            }
+            it.copy(
+                processStatus = ProcessStatus.CONVERTED,
+                outputFileName = outputName.ifBlank { it.outputFileName },
+                waveform = waveform,
+                convertedWaveform = waveform,
+                previewSource = PreviewSource.CONVERTED,
+                fileDurationSec = durationSeconds,
+                convertedDurationMs = durationSeconds * 1_000L,
+                convertedUri = outputUri,
+                lastConversionId = historyId,
+                compatibilitySummary = summary,
+                compatibilityWarning = warning,
+                progress = 1f,
+                canRetry = false,
+                statusMessage = "Voice note siap dipreview dan dikirim"
+            )
+        }
+        conversionWorkId = null
+        savedStateHandle[STATE_CONVERSION_WORK_ID] = null
+    }
+
+    private fun cancelConversionWork(cleanupCompleted: Boolean = true) {
+        val workId = conversionWorkId
+        val manager = workManager
+        if (workId != null && manager != null) {
+            manager.cancelWorkById(workId)
+            if (cleanupCompleted) {
+                cleanupCancelledWork(manager, workId)
+            }
+        }
+        conversionWorkId = null
+        savedStateHandle[STATE_CONVERSION_WORK_ID] = null
+    }
+
+    private fun cleanupCancelledWork(manager: WorkManager, workId: UUID) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repeat(10) {
+                val info = runCatching {
+                    manager.getWorkInfoById(workId).get(1, TimeUnit.SECONDS)
+                }.getOrNull() ?: return@launch
+                when (info.state) {
+                    WorkInfo.State.SUCCEEDED -> {
+                        val historyId = info.outputData
+                            .getLong(ConversionWork.RESULT_HISTORY_ID, -1L)
+                            .takeIf { it >= 0L }
+                        historyId?.let { history.delete(it) }
+                        info.outputData
+                            .getString(ConversionWork.RESULT_URI)
+                            ?.let { VoiceNoteStorage.deleteFromStorage(context, it) }
+                        return@launch
+                    }
+                    WorkInfo.State.FAILED,
+                    WorkInfo.State.CANCELLED -> return@launch
+                    else -> delay(100L)
+                }
+            }
+        }
+    }
+
+    fun enqueueBatch(uris: List<Uri>) {
+        val manager = workManager ?: run {
+            _batchMessage.value = "WorkManager tidak tersedia."
+            return
+        }
+        val distinctUris = uris.distinct()
+        if (distinctUris.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            var enqueuedCount = 0
+            var failedCount = 0
+            distinctUris.forEach { uri ->
+                var cachedUri: Uri? = null
+                var batchItemId: String? = null
+                try {
+                    val sourceName = MediaInputCache.displayName(context, uri)
+                        .orEmpty()
+                        .ifBlank { "voice_note" }
+                    cachedUri = MediaInputCache.copyToPersistent(context, uri)
+                    batchItemId = UUID.randomUUID().toString()
+                    val outputName = VoiceNoteStorage.suggestedOutputFileName(sourceName)
+                    val request = ConversionWork.request(
+                        inputUri = cachedUri,
+                        requestedOutputName = outputName,
+                        trimStartMs = 0L,
+                        trimEndMs = Long.MAX_VALUE,
+                        pitchSemitones = 0f,
+                        options = AudioProcessingOptions(),
+                        batchItemId = batchItemId,
+                        sourceFileName = sourceName
+                    )
+                    batchStore.put(
+                        BatchQueueMetadata(
+                            id = batchItemId,
+                            workId = request.id,
+                            sourceFileName = sourceName,
+                            outputFileName = outputName,
+                            inputUri = cachedUri.toString()
+                        )
+                    )
+                    manager.enqueueUniqueWork(
+                        ConversionWork.batchTag(batchItemId),
+                        androidx.work.ExistingWorkPolicy.REPLACE,
+                        request
+                    )
+                    enqueuedCount += 1
+                } catch (error: Throwable) {
+                    failedCount += 1
+                    cachedUri?.let { MediaInputCache.delete(context, it) }
+                    Log.e(TAG, "Gagal memasukkan item batch $uri", error)
+                    batchItemId?.let(batchStore::remove)
+                }
+            }
+            _batchMessage.value = when {
+                failedCount == 0 -> "$enqueuedCount file masuk antrean."
+                enqueuedCount == 0 -> "Tidak ada file yang masuk antrean."
+                else -> "$enqueuedCount file masuk antrean; $failedCount gagal."
+            }
+        }
+    }
+
+    fun retryBatch(item: BatchQueueItem) {
+        val manager = workManager ?: run {
+            _batchMessage.value = "WorkManager tidak tersedia."
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val request = ConversionWork.request(
+                    inputUri = Uri.parse(item.inputUri),
+                    requestedOutputName = item.outputFileName,
+                    trimStartMs = item.trimStartMs,
+                    trimEndMs = item.trimEndMs,
+                    pitchSemitones = item.pitchSemitones,
+                    options = AudioProcessingOptions(
+                        normalizeAudio = item.normalizeAudio,
+                        trimSilence = item.trimSilence
+                    ),
+                    batchItemId = item.id,
+                    sourceFileName = item.sourceFileName
+                )
+                manager.enqueueUniqueWork(
+                    ConversionWork.batchTag(item.id),
+                    androidx.work.ExistingWorkPolicy.REPLACE,
+                    request
+                )
+                batchStore.updateWorkId(item.id, request.id)
+            }.onFailure { error ->
+                _batchMessage.value = "Gagal mengulang ${item.sourceFileName}: " +
+                    technicalMessage(error, "enqueue gagal")
+            }
+        }
+    }
+
+    fun cancelBatch(item: BatchQueueItem) {
+        workManager?.cancelUniqueWork(ConversionWork.batchTag(item.id))
+    }
+
+    fun clearBatchMessage() {
+        _batchMessage.value = null
+    }
+
+    private suspend fun monitorBatchQueue(manager: WorkManager) {
+        while (true) {
+            val items = batchStore.all().mapNotNull { metadata ->
+                runCatching {
+                    manager.getWorkInfoById(metadata.workId).get()
+                }.getOrNull()?.toBatchQueueItem(metadata)
+            }.sortedWith(
+                compareBy<BatchQueueItem> { it.isTerminal }
+                    .thenBy { it.sourceFileName.lowercase() }
+            )
+            _batchItems.value = items
+            delay(500L)
         }
     }
 
@@ -433,6 +804,7 @@ class MainViewModel(
         analysisJob?.cancel()
         waveformJob?.cancel()
         conversionJob?.cancel()
+        cancelConversionWork()
         audioPlayer.stop()
         loadedPlaybackUri = null
         _uiState.value = MainUiState()
@@ -462,15 +834,17 @@ class MainViewModel(
     }
 
     private fun pitchFactorForPreview(state: MainUiState): Float {
-        if (state.convertedUri != null) return 1f
+        if (state.previewSource == PreviewSource.CONVERTED && state.convertedUri != null) {
+            return 1f
+        }
         return 2.0.pow((state.pitchSemitones / 12f).toDouble()).toFloat()
     }
 
     override fun onCleared() {
+        cancelConversionWork(cleanupCompleted = false)
         audioPlayer.release()
         super.onCleared()
     }
-
     companion object {
         fun formatDuration(seconds: Int): String = "%d:%02d".format(seconds / 60, seconds % 60)
     }

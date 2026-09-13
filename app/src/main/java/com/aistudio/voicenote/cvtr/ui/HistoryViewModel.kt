@@ -181,6 +181,25 @@ class HistoryViewModel(
             }
         }
     }
+    fun cleanupOlderThan(days: Int = 30) {
+        val safeDays = days.coerceIn(1, 3_650)
+        viewModelScope.launch(Dispatchers.IO) {
+            val cutoff = System.currentTimeMillis() - safeDays * 24L * 60L * 60L * 1_000L
+            val candidates = repository.getCreatedBefore(cutoff)
+            var deletedCount = 0
+            var failedCount = 0
+            candidates.forEach { item ->
+                if (deleteItemInternal(item)) deletedCount++ else failedCount++
+            }
+            _message.value = when {
+                candidates.isEmpty() -> "Tidak ada hasil lebih lama dari $safeDays hari."
+                failedCount == 0 -> "$deletedCount hasil lama dihapus."
+                deletedCount == 0 -> "Hasil lama tidak dapat dihapus."
+                else -> "$deletedCount hasil lama dihapus; $failedCount gagal."
+            }
+        }
+    }
+
 
     private suspend fun deleteItemInternal(item: ConversionHistory): Boolean {
         val fileAlreadyRemoved = item.id in pendingDatabaseDeletion

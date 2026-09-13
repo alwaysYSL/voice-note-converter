@@ -107,6 +107,7 @@ dependencies {
   implementation(libs.androidx.room.paging)
   implementation(libs.androidx.paging.runtime)
   implementation(libs.androidx.paging.compose)
+  implementation(libs.androidx.work.runtime)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   testImplementation(libs.androidx.compose.ui.test.junit4)

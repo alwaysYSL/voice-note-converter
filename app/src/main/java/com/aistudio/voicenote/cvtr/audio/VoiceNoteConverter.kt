@@ -16,6 +16,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.util.UUID
 import java.nio.ByteOrder
 import kotlin.math.floor
 import kotlin.math.max
@@ -530,6 +531,7 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
         trimStartMs: Long = 0L,
         trimEndMs: Long = Long.MAX_VALUE,
         pitchSemitones: Float = 0f,
+        processingOptions: AudioProcessingOptions = AudioProcessingOptions(),
         onProgress: (Float) -> Unit = {}
     ): AudioConversionResult = withContext(Dispatchers.IO) {
         require(trimStartMs >= 0L) { "Batas awal trim tidak valid." }
@@ -626,7 +628,10 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
                     "Perangkat ini tidak memiliki encoder Opus. Konversi tidak dapat dilakukan."
                 )
             }
-        val cacheFile = File(context.cacheDir, "voice_note_${System.currentTimeMillis()}.ogg")
+        val cacheFile = File(
+            context.cacheDir,
+            "voice_note_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}.ogg"
+        )
         var oggWriter: OggOpusWriter? = null
         var opusEncoder: StreamingOpusEncoder? = null
         var pitchShifter: StreamingPitchShifter? = null
@@ -640,11 +645,16 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
             expectedSamples = expectedOutputSamples
         )
         var encodedSampleCount = 0L
-        val boundaryFader = if (trimStartMs > 0L || trimEndMs != Long.MAX_VALUE) {
+        val boundaryFader = if (
+            trimStartMs > 0L ||
+            trimEndMs != Long.MAX_VALUE ||
+            processingOptions.trimSilence
+        ) {
             PcmBoundaryFader()
         } else {
             null
         }
+        val audioEffects = StreamingAudioEffects(processingOptions)
         try {
             val writer = OggOpusWriter(FileOutputStream(cacheFile))
             oggWriter = writer
@@ -759,7 +769,8 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
                                 ?.process(resampledChunk)
                                 ?: resampledChunk
                             if (finalChunk.isNotEmpty()) {
-                                val outputChunk = boundaryFader?.process(finalChunk) ?: finalChunk
+                                val effectedChunk = audioEffects.process(finalChunk)
+                                val outputChunk = boundaryFader?.process(effectedChunk) ?: effectedChunk
                                 writeOutputChunk(outputChunk)
                             }
                         }
@@ -792,11 +803,17 @@ suspend fun extractWaveform(context: Context, inputUri: Uri): List<Int> =
             pitchShifter?.let { shifter ->
                 val tail = shifter.flush()
                 if (tail.isNotEmpty()) {
-                    val outputChunk = boundaryFader?.process(tail) ?: tail
+                    val effectedTail = audioEffects.process(tail)
+                    val outputChunk = boundaryFader?.process(effectedTail) ?: effectedTail
                     writeOutputChunk(outputChunk)
                 }
             }
 
+            val effectTail = audioEffects.finish()
+            if (effectTail.isNotEmpty()) {
+                val outputChunk = boundaryFader?.process(effectTail) ?: effectTail
+                writeOutputChunk(outputChunk)
+            }
             boundaryFader?.finish()?.let(::writeOutputChunk)
 
             decoder.stop()

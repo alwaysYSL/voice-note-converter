@@ -96,7 +96,7 @@ class AudioPreviewPlayer(
         })
     }
 
-    fun play(uri: Uri, pitchFactor: Float = 1f) {
+    fun play(uri: Uri, pitchFactor: Float = 1f, startPositionMs: Long? = null) {
         stopPlayback(resetPlaybackParameters = false)
         player.playbackParameters = PlaybackParameters(
             player.playbackParameters.speed,
@@ -107,6 +107,7 @@ class AudioPreviewPlayer(
         player.setMediaItem(MediaItem.fromUri(uri))
         player.prepare()
         playbackWindow?.let { player.seekTo(it.startMs) }
+            ?: startPositionMs?.let { player.seekTo(it.coerceAtLeast(0L)) }
         player.playWhenReady = true
     }
 

@@ -36,4 +36,6 @@ class ConversionHistoryRepository(
     suspend fun deleteAll() = dao.deleteAll()
 
     suspend fun getById(id: Long) = dao.getById(id)
+    suspend fun getCreatedBefore(cutoff: Long): List<ConversionHistory> =
+        dao.getCreatedBefore(cutoff)
 }

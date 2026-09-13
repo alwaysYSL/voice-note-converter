@@ -98,4 +98,8 @@ interface ConversionHistoryDao {
 
     @Query("SELECT * FROM conversion_history WHERE id = :id")
     suspend fun getById(id: Long): ConversionHistory?
+    @Query(
+        "SELECT * FROM conversion_history WHERE createdAt < :cutoff ORDER BY createdAt ASC"
+    )
+    suspend fun getCreatedBefore(cutoff: Long): List<ConversionHistory>
 }

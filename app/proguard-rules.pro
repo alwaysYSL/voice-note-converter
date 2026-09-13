@@ -28,3 +28,6 @@
 -keepclasseswithmembers,allowoptimization,includedescriptorclasses class * {
     native <methods>;
 }
+
+# WorkManager instantiates workers by class name after process recreation.
+-keep class com.aistudio.voicenote.cvtr.work.** { *; }

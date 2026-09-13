@@ -127,6 +127,7 @@ fun HistoryScreen(
     var pendingDeleteItems by remember { mutableStateOf<List<ConversionHistory>>(emptyList()) }
     var selectedIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
     var isSelectionMode by remember { mutableStateOf(false) }
+    var showCleanupDialog by remember { mutableStateOf(false) }
     var collapsedSections by remember { mutableStateOf<Set<String>>(emptySet()) }
     val selectedItems = historyItems.itemSnapshotList.items.filter { it.id in selectedIds }
 
@@ -157,6 +158,15 @@ fun HistoryScreen(
                 pendingDeleteItems = emptyList()
                 selectedIds = emptySet()
                 isSelectionMode = false
+            }
+        )
+    }
+    if (showCleanupDialog) {
+        CleanupConfirmationDialog(
+            onDismiss = { showCleanupDialog = false },
+            onConfirm = { days ->
+                showCleanupDialog = false
+                viewModel.cleanupOlderThan(days)
             }
         )
     }
@@ -198,7 +208,8 @@ fun HistoryScreen(
                         HistoryHeader(
                             total = totalHistoryCount,
                             totalBytes = totalHistoryBytes,
-                            onSelectFiles = { isSelectionMode = true }
+                            onSelectFiles = { isSelectionMode = true },
+                            onCleanupOld = { showCleanupDialog = true }
                         )
                     }
                 }
@@ -450,7 +461,77 @@ private fun DeleteConfirmationDialog(
 }
 
 @Composable
-private fun HistoryHeader(total: Int, totalBytes: Long, onSelectFiles: () -> Unit) {
+private fun CleanupConfirmationDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (Int) -> Unit
+) {
+    var selectedDays by remember { mutableStateOf(30) }
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("history_cleanup_confirmation"),
+            shape = RoundedCornerShape(24.dp),
+            color = CardSurfaceWhite,
+            shadowElevation = 12.dp
+        ) {
+            Column(modifier = Modifier.padding(22.dp)) {
+                Text(
+                    "Hapus hasil lama?",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = DeepNavyDisplay,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "Hasil yang lebih lama dari $selectedDays hari akan dihapus dari penyimpanan dan riwayat.",
+                    modifier = Modifier.padding(top = 12.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = SubtitleSlate
+                )
+                Text(
+                    "Batas usia hasil",
+                    modifier = Modifier.padding(top = 16.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = DeepNavyDisplay
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(7, 30, 90).forEach { days ->
+                        FilterChip(
+                            selected = selectedDays == days,
+                            onClick = { selectedDays = days },
+                            label = { Text("$days hari") }
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 22.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End)
+                ) {
+                    TextButton(onClick = onDismiss) { Text("Batal") }
+                    Button(
+                        onClick = { onConfirm(selectedDays) },
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentCoral)
+                    ) { Text("Hapus hasil lama") }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HistoryHeader(
+    total: Int,
+    totalBytes: Long,
+    onSelectFiles: () -> Unit,
+    onCleanupOld: () -> Unit
+) {
     Column(modifier = Modifier.padding(bottom = 2.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -477,6 +558,9 @@ private fun HistoryHeader(total: Int, totalBytes: Long, onSelectFiles: () -> Uni
                     style = MaterialTheme.typography.labelMedium,
                     color = AccentRoyalBlue
                 )
+            }
+            IconButton(onClick = onCleanupOld, modifier = Modifier.size(42.dp)) {
+                Icon(Icons.Default.MoreVert, contentDescription = "Hapus hasil lama", tint = SubtitleSlate)
             }
             IconButton(onClick = onSelectFiles, modifier = Modifier.size(42.dp)) {
                 Icon(Icons.Default.CheckCircle, contentDescription = "Pilih file", tint = AccentRoyalBlue)

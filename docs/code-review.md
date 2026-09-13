@@ -24,13 +24,17 @@ Temuan correctness dan performa utama sudah diterapkan:
 - Migrasi destruktif dihapus, migrasi v4 memetakan schema lama, dan schema Room diekspor.
 - Flush pitch shifter, batas JNI, fade trim, progress relatif trim, intent MIME, URI cache, dan `SavedStateHandle` diperbaiki.
 - Gradle Wrapper, CI, toolchain Android, release shrinking, namespace, dependency injection, dan pembersihan `RecentContact` diterapkan.
+- Batch memakai WorkManager queue dengan retry per item; konversi tunggal berjalan sebagai foreground worker.
+- Output memiliki nama editable yang disanitasi, cache input tahan process death, dan cleanup berkala.
+- Normalization, silence trim, A/B preview, serta validasi header OGG Opus dan parameter Telegram tersedia sebagai state UI.
 
 Verifikasi lokal terakhir menjalankan `:app:testDebugUnitTest lintDebug assembleDebug assembleRelease`
 dengan Gradle Wrapper `9.3.1` dan JDK `21`; seluruh task berhasil.
 
 Validasi yang masih memerlukan perangkat atau fixture media nyata belum diklaim selesai:
 matriks codec AAC/MP3/Opus/WAV/M4A/MP4, `ffprobe`, instrumentation lintas API/ABI,
-uji cancellation pada perangkat, serta profiling file panjang.
+uji cancellation dan foreground notification/WorkManager pada perangkat, serta
+profiling file panjang.
 
 ## Ringkasan eksekutif
 
@@ -264,22 +268,28 @@ val fraction = ((ptsUs - effectiveStartUs).toDouble() /
 
 ## Rekomendasi fitur
 
+Scope implementasi ini mencakup batch conversion, background conversion,
+rename sebelum simpan, pembersihan cache/hasil lama, audio normalization dan
+silence trim, A/B preview, serta validasi kompatibilitas Telegram. Preset,
+share ke aplikasi lain, dan export/import sengaja dikecualikan sesuai permintaan.
+
 ### Bernilai tinggi untuk penggunaan personal
 
-1. **Batch conversion** — pilih beberapa audio/video, antrekan konversi, serta retry per item.
-2. **Preset** — simpan kombinasi trim/pitch/bitrate; misalnya “Voice note cepat” dan “Suara lebih rendah”.
-3. **Konversi di background** — gunakan WorkManager + foreground notification untuk file panjang; hanya setelah rollback/cancellation benar.
-4. **Share ke aplikasi lain** — sediakan system share sheet sebagai fallback, tidak hanya Telegram.
-5. **Rename sebelum simpan** — nama hasil lebih mudah dicari daripada timestamp saja.
-6. **Pembersihan otomatis** — hapus cache yatim dan tawarkan hapus hasil lebih lama dari N hari.
-7. **Export/import riwayat** — backup JSON/ZIP lokal untuk migrasi perangkat.
-8. **Audio normalization dan silence trim** — opsional, dengan preview sebelum commit.
-9. **A/B preview** — dengarkan original vs hasil pitch/trim dari posisi yang sama.
-10. **Validasi kompatibilitas Telegram** — tampilkan codec/container/durasi hasil dan peringatan bila encoder perangkat bermasalah.
+1. **Batch conversion** — `[x]` pilih beberapa audio/video, antrekan konversi, serta retry per item.
+2. **Preset** — `[—]` dikecualikan dari scope implementasi ini.
+3. **Konversi di background** — `[x]` WorkManager + foreground notification untuk file panjang.
+4. **Share ke aplikasi lain** — `[—]` dikecualikan dari scope implementasi ini.
+5. **Rename sebelum simpan** — `[x]` nama hasil dapat diedit dan disanitasi sebelum commit.
+6. **Pembersihan otomatis** — `[x]` cache yatim dibersihkan berkala; hasil lama dapat dihapus dari History.
+7. **Export/import riwayat** — `[—]` dikecualikan dari scope implementasi ini.
+8. **Audio normalization dan silence trim** — `[x]` opsional dan diterapkan sebelum hasil disimpan.
+9. **A/B preview** — `[x]` original dan hasil dapat diputar dari posisi relatif yang sama.
+10. **Validasi kompatibilitas Telegram** — `[x]` ringkasan OGG Opus, channel, sample rate, bitrate, durasi, dan warning.
 
 ### Urutan implementasi fitur
 
-Jangan mulai batch/background conversion sebelum Fase 1 selesai karena keduanya memperbesar risiko race dan resource yatim. Setelah stabilitas selesai, prioritas fitur terbaik adalah rename → generic share → preset → batch → background processing.
+Fondasi rollback/cancellation selesai sebelum batch dan background conversion.
+Fitur yang dikecualikan tidak menambah shim atau jalur parsial.
 
 ## Strategi pengujian minimum
 
