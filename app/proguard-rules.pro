@@ -19,3 +19,12 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# Room persists these fields and generated adapters refer to their names.
+-keep class com.aistudio.voicenote.cvtr.data.local.** { *; }
+
+# JNI method names are part of the native ABI.
+-keep class com.aistudio.voicenote.cvtr.audio.PitchShifterJni { *; }
+-keepclasseswithmembers,allowoptimization,includedescriptorclasses class * {
+    native <methods>;
+}
