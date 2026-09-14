@@ -8,11 +8,13 @@ import java.util.ArrayDeque
 /** Bounded snapshot history for rendered-audio edits and explicit selection changes. */
 internal class CommandHistory(
     initial: EditorSession,
-    private val capacity: Int = DEFAULT_CAPACITY,
+    capacity: Int = DEFAULT_CAPACITY,
 ) {
     init {
         require(capacity > 0) { "capacity must be greater than zero" }
     }
+
+    private val maxUndoDepth: Int = capacity.coerceAtMost(MAX_CAPACITY)
 
     var session: EditorSession = initial
         private set
@@ -48,7 +50,7 @@ internal class CommandHistory(
     fun undo(): EditorSession {
         if (undo.isEmpty()) return session
         redo.addLast(session)
-        session = undo.removeLast()
+        session = undo.removeLast().copy(playheadMs = session.playheadMs)
         return session
     }
 
@@ -57,15 +59,16 @@ internal class CommandHistory(
         if (redo.isEmpty()) return session
         undo.addLast(session)
         trimToCapacity(undo)
-        session = redo.removeLast()
+        session = redo.removeLast().copy(playheadMs = session.playheadMs)
         return session
     }
 
     private fun trimToCapacity(stack: ArrayDeque<EditorSession>) {
-        while (stack.size > capacity) stack.removeFirst()
+        while (stack.size > maxUndoDepth) stack.removeFirst()
     }
 
     private companion object {
         const val DEFAULT_CAPACITY = 50
+        const val MAX_CAPACITY = 50
     }
 }

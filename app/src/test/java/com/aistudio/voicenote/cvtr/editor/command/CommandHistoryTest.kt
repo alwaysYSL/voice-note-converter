@@ -4,6 +4,9 @@ import com.aistudio.voicenote.cvtr.editor.model.AudioClip
 import com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
 import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
+import com.aistudio.voicenote.cvtr.editor.model.TimelineOperations
+import com.aistudio.voicenote.cvtr.editor.model.TimelineResult
+import com.aistudio.voicenote.cvtr.editor.model.value
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -15,7 +18,9 @@ class CommandHistoryTest {
         val history = CommandHistory(initialSession())
         val before = history.session
 
-        history.execute(DeleteClipCommand("track-1", "clip-b", ripple = true))
+        val result = history.execute(DeleteClipCommand("track-1", "clip-b", ripple = true))
+        assertTrue(result is TimelineResult.Accepted)
+        assertTrue(history.canUndo)
         history.undo()
 
         assertEquals(before, history.session)
@@ -31,6 +36,27 @@ class CommandHistoryTest {
 
         assertFalse(history.canRedo)
         assertEquals(50, history.undoDepth)
+    }
+
+    @Test
+    fun `capacity above fifty is capped at fifty undo snapshots`() {
+        val history = CommandHistory(initialSession(), capacity = 51)
+
+        repeat(51) { history.execute(SetTrackVolumeCommand("track-1", 0.5f + it / 200f)) }
+
+        assertEquals(50, history.undoDepth)
+    }
+
+    @Test
+    fun `undo and redo preserve the current transient playhead`() {
+        val history = CommandHistory(initialSession().copy(playheadMs = 1_000L))
+
+        history.execute(AudioAndPlayheadCommand(0.75f, 9_000L))
+        history.undo()
+        assertEquals(9_000L, history.session.playheadMs)
+
+        history.redo()
+        assertEquals(9_000L, history.session.playheadMs)
     }
 
     @Test
@@ -94,5 +120,17 @@ class CommandHistoryTest {
             "session",
             listOf(EditorTrack("track-1", "Track 1", clips = listOf(first, deleted, later))),
         )
+    }
+
+    private data class AudioAndPlayheadCommand(
+        val volume: Float,
+        val playheadMs: Long,
+    ) : EditorCommand {
+        override fun applyTo(session: EditorSession): TimelineResult = when (
+            val result = TimelineOperations.setTrackVolume(session, "track-1", volume)
+        ) {
+            is TimelineResult.Accepted -> TimelineResult.Accepted(result.value.copy(playheadMs = playheadMs))
+            is TimelineResult.Rejected -> result
+        }
     }
 }
