@@ -8,6 +8,7 @@ import com.aistudio.voicenote.cvtr.editor.model.TimelineOperations
 import com.aistudio.voicenote.cvtr.editor.model.TimelineResult
 import com.aistudio.voicenote.cvtr.editor.model.value
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -82,6 +83,46 @@ class CommandHistoryTest {
         assertEquals(before, history.session)
         assertEquals(0, history.undoDepth)
         assertTrue(result is com.aistudio.voicenote.cvtr.editor.model.TimelineResult.Rejected)
+    }
+
+    @Test
+    fun `selection update is transient and does not consume history or clear redo`() {
+        val history = CommandHistory(initialSession())
+
+        history.execute(SetTrackMutedCommand("track-1", true))
+        history.undo()
+        assertTrue(history.canRedo)
+        val depthBeforeSelection = history.undoDepth
+
+        val result = history.execute(SelectClipCommand("clip-b"))
+
+        assertTrue(result is TimelineResult.Accepted)
+        assertEquals("clip-b", history.session.selectedClipId)
+        assertEquals(depthBeforeSelection, history.undoDepth)
+        assertTrue(history.canRedo)
+    }
+
+    @Test
+    fun `caller-owned lists cannot mutate active session or history snapshots`() {
+        val clips = mutableListOf(
+            AudioClip("clip-a", AudioSourceRef("content://source", 60_000), 0, 1_000, 0),
+        )
+        val tracks = mutableListOf(EditorTrack("track-1", "Track 1", clips = clips))
+        val history = CommandHistory(EditorSession("session", tracks))
+        val initial = history.session
+
+        clips.clear()
+        tracks.clear()
+        assertEquals(initial, history.session)
+
+        history.execute(SetTrackMutedCommand("track-1", true))
+        history.undo()
+        assertEquals(initial, history.session)
+        @Suppress("UNCHECKED_CAST")
+        assertThrows(UnsupportedOperationException::class.java) {
+            (history.session.tracks as MutableList<EditorTrack>).clear()
+        }
+        assertEquals(initial, history.session)
     }
 
     @Test

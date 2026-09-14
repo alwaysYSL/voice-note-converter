@@ -17,6 +17,7 @@ import androidx.compose.ui.unit.dp
 import org.junit.Rule
 import org.junit.Test
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
@@ -27,6 +28,13 @@ class UiPolishTest {
 
     @get:Rule
     val composeRule = createComposeRule()
+
+    @Test
+    fun `editor route hides global navigation so bottom actions remain reachable`() {
+        assertFalse(shouldShowFloatingBottomNavigation("editor?historyId={historyId}"))
+        assertFalse(shouldShowFloatingBottomNavigation("editor"))
+        assertTrue(shouldShowFloatingBottomNavigation("converter"))
+    }
 
     @Test
     fun `bottom navigation is a compact icon only floating island`() {

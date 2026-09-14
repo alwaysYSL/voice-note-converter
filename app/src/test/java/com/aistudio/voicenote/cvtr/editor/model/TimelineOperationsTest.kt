@@ -1,6 +1,7 @@
 package com.aistudio.voicenote.cvtr.editor.model
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -133,6 +134,44 @@ class TimelineOperationsTest {
         assertEquals(500L, normalized.effects.fadeInMs)
         assertEquals(500L, normalized.effects.fadeOutMs)
         assertEquals(1_000L, normalized.timelineDurationMs)
+    }
+
+    @Test
+    fun `non finite pitch is normalized to a finite neutral value`() {
+        val clip = clip(sourceStartMs = 0, sourceEndMs = 1_000, effects = ClipEffects(pitchSemitones = Float.NaN))
+
+        val normalized = TimelineOperations.validate(sessionWith(clip)).value
+            .tracks.single().clips.single().effects.pitchSemitones
+
+        assertEquals(0f, normalized)
+        assertTrue(normalized.isFinite())
+    }
+
+    @Test
+    fun `caller-owned nested lists cannot mutate a constructed session`() {
+        val clips = mutableListOf(clip(id = "clip-a", sourceStartMs = 0, sourceEndMs = 1_000))
+        val tracks = mutableListOf(EditorTrack("track", "Track", clips = clips))
+        val session = EditorSession("session", tracks)
+
+        clips.clear()
+        tracks.clear()
+
+        assertEquals(1, session.tracks.size)
+        assertEquals(1, session.tracks.single().clips.size)
+        @Suppress("UNCHECKED_CAST")
+        assertThrows(UnsupportedOperationException::class.java) {
+            (session.tracks as MutableList<EditorTrack>).clear()
+        }
+        assertEquals(1, session.tracks.size)
+    }
+
+    @Test
+    fun `speed changes source delta required for timeline trim`() {
+        val halfSpeed = clip(effects = ClipEffects(speed = .5f), sourceStartMs = 0, sourceEndMs = 10_000)
+        val doubleSpeed = clip(id = "double", effects = ClipEffects(speed = 2f), sourceStartMs = 0, sourceEndMs = 10_000)
+
+        assertEquals(20_000L, halfSpeed.timelineDurationMs)
+        assertEquals(5_000L, doubleSpeed.timelineDurationMs)
     }
 
     @Test

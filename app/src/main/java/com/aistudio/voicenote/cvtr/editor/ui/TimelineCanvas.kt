@@ -44,6 +44,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -56,6 +57,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -168,6 +170,7 @@ internal fun TimelineCanvas(
                         detectTapGestures { offset ->
                             val x = offset.x + horizontalScroll.value
                             val position = (x / (dpPerMs * density)).roundToLong()
+                            onIntent(EditorIntent.SelectClip(null))
                             onIntent(EditorIntent.Seek(position))
                         }
                     }
@@ -182,21 +185,6 @@ internal fun TimelineCanvas(
                         }
                     },
             ) {
-                Canvas(
-                    modifier = Modifier
-                        .width(timelineWidth)
-                        .height((state.session.tracks.size * (TrackRowHeight.value + 1f)).dp)
-                        .align(Alignment.TopStart),
-                ) {
-                    val playheadX = state.session.playheadMs * dpPerMs * density
-                    drawLine(
-                        color = AccentCoral,
-                        start = Offset(playheadX, 0f),
-                        end = Offset(playheadX, size.height),
-                        strokeWidth = 2.dp.toPx(),
-                    )
-                }
-
                 Column(
                     modifier = Modifier
                         .width(timelineWidth),
@@ -214,6 +202,24 @@ internal fun TimelineCanvas(
                     if (state.session.tracks.isEmpty()) {
                         Spacer(Modifier.height(TrackRowHeight))
                     }
+                }
+
+                // Draw after the rows so the playhead remains visible over waveform content.
+                Canvas(
+                    modifier = Modifier
+                        .width(timelineWidth)
+                        .height((state.session.tracks.size * (TrackRowHeight.value + 1f)).dp)
+                        .align(Alignment.TopStart)
+                        .zIndex(1f)
+                        .testTag("editor_playhead"),
+                ) {
+                    val playheadX = state.session.playheadMs * dpPerMs * density
+                    drawLine(
+                        color = AccentCoral,
+                        start = Offset(playheadX, 0f),
+                        end = Offset(playheadX, size.height),
+                        strokeWidth = 2.dp.toPx(),
+                    )
                 }
             }
         }
@@ -358,6 +364,11 @@ private fun TimelineClip(
     var originalSourceStartMs by remember(clip.id) { mutableLongStateOf(clip.sourceStartMs) }
     var originalSourceEndMs by remember(clip.id) { mutableLongStateOf(clip.sourceEndMs) }
     val density = LocalDensity.current.density
+    val currentClip by rememberUpdatedState(clip)
+    val currentSelected by rememberUpdatedState(selected)
+    val currentOnMove by rememberUpdatedState(onMove)
+    val currentOnTrim by rememberUpdatedState(onTrim)
+    val trimGesturesEnabled = width >= 96.dp
     val interactionWidth = if (width < 48.dp) 48.dp else width
     val interactionPadding = (interactionWidth - width) / 2f
     val interactionOffset = if (offset < interactionPadding) 0.dp else offset - interactionPadding
@@ -368,7 +379,15 @@ private fun TimelineClip(
             .width(interactionWidth)
             .height(88.dp)
             .testTag(clipSemanticsTag(clip.id))
-            .pointerInput(clip.id, dpPerMs) {
+            .semantics {
+                this.selected = selected
+                contentDescription = buildString {
+                    append("Clip ${clip.id}")
+                    if (selected) append(", selected")
+                    if (!trimGesturesEnabled) append("; drag to move")
+                }
+            }
+            .pointerInput(clip.id, dpPerMs, selected) {
                 var dragMode = 0
                 var totalTrimDragPx = 0f
                 detectHorizontalDragGestures(
@@ -376,39 +395,40 @@ private fun TimelineClip(
                         dragOffsetPx = 0f
                         totalTrimDragPx = 0f
                         dragMode = when {
-                            !selected -> 0
+                            !currentSelected || !trimGesturesEnabled -> 0
                             startOffset.x <= 48f * density -> 1
                             startOffset.x >= size.width - (48f * density) -> 2
                             else -> 0
                         }
                         if (dragMode != 0) {
-                            originalSourceStartMs = clip.sourceStartMs
-                            originalSourceEndMs = clip.sourceEndMs
+                            originalSourceStartMs = currentClip.sourceStartMs
+                            originalSourceEndMs = currentClip.sourceEndMs
                         }
                     },
                     onHorizontalDrag = { change, dragAmount ->
                         change.consume()
                         if (dragMode == 0) {
                             dragOffsetPx += dragAmount
-                            onMove(
-                                (clip.timelineStartMs + dragOffsetPx / (dpPerMs * density))
+                            currentOnMove(
+                                (currentClip.timelineStartMs + dragOffsetPx / (dpPerMs * density))
                                     .roundToLong()
                                     .coerceAtLeast(0L)
                             )
                         } else {
                             totalTrimDragPx += dragAmount
-                            val deltaMs = (totalTrimDragPx / (dpPerMs * density)).roundToLong()
+                            val timelineDeltaMs = (totalTrimDragPx / (dpPerMs * density)).roundToLong()
+                            val deltaMs = (timelineDeltaMs * currentClip.effects.normalizedSpeed).roundToLong()
                             if (dragMode == 1) {
-                                onTrim(
+                                currentOnTrim(
                                     (originalSourceStartMs + deltaMs)
                                         .coerceIn(0L, originalSourceEndMs - 1L),
                                     originalSourceEndMs,
                                 )
                             } else {
-                                onTrim(
+                                currentOnTrim(
                                     originalSourceStartMs,
                                     (originalSourceEndMs + deltaMs)
-                                        .coerceIn(originalSourceStartMs + 1L, clip.source.sourceDurationOrEnd()),
+                                        .coerceIn(originalSourceStartMs + 1L, currentClip.source.sourceDurationOrEnd()),
                                 )
                             }
                         }
@@ -425,10 +445,7 @@ private fun TimelineClip(
                     },
                 )
             }
-            .clickable(role = Role.Button, onClick = onSelect)
-            .semantics {
-                this.selected = selected
-            },
+            .clickable(role = Role.Button, onClick = onSelect),
         contentAlignment = Alignment.Center,
     ) {
         Box(
@@ -455,7 +472,7 @@ private fun TimelineClip(
                 color = if (selected) PastelMintText else DeepNavyDisplay,
                 maxLines = 1,
             )
-            if (selected) {
+            if (selected && trimGesturesEnabled) {
                 Canvas(Modifier.matchParentSize()) {
                     drawRoundRect(
                         color = AccentRoyalBlue,
@@ -471,7 +488,8 @@ private fun TimelineClip(
                         originalSourceEndMs = clip.sourceEndMs
                     },
                     onDrag = { deltaPx ->
-                        val deltaMs = (deltaPx / (dpPerMs * density)).roundToLong()
+                        val timelineDeltaMs = (deltaPx / (dpPerMs * density)).roundToLong()
+                        val deltaMs = (timelineDeltaMs * clip.effects.normalizedSpeed).roundToLong()
                         onTrim(
                             (originalSourceStartMs + deltaMs)
                                 .coerceIn(0L, originalSourceEndMs - 1L),
@@ -487,7 +505,8 @@ private fun TimelineClip(
                         originalSourceEndMs = clip.sourceEndMs
                     },
                     onDrag = { deltaPx ->
-                        val deltaMs = (deltaPx / (dpPerMs * density)).roundToLong()
+                        val timelineDeltaMs = (deltaPx / (dpPerMs * density)).roundToLong()
+                        val deltaMs = (timelineDeltaMs * clip.effects.normalizedSpeed).roundToLong()
                         onTrim(
                             originalSourceStartMs,
                             (originalSourceEndMs + deltaMs)
@@ -513,7 +532,10 @@ private fun TrimHandle(
         modifier = modifier
             .size(width = 48.dp, height = 72.dp)
             .background(AccentRoyalBlue.copy(alpha = .9f), RoundedCornerShape(8.dp))
-            .semantics { this.contentDescription = contentDescription }
+            .semantics {
+                this.contentDescription = contentDescription
+                this.stateDescription = "Drag horizontally to adjust"
+            }
             .pointerInput(contentDescription) {
                 var totalDragPx = 0f
                 detectHorizontalDragGestures(

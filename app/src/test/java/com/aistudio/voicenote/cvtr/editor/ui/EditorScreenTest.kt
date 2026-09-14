@@ -12,6 +12,7 @@ import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.click
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -125,6 +126,25 @@ class EditorScreenTest {
     }
 
     @Test
+    fun `playhead overlay spans clip rows so it stays visible over waveform content`() {
+        compose.setContent {
+            MyApplicationTheme {
+                EditorScreen(
+                    state = stateWithTwoClips().copy(
+                        session = stateWithTwoClips().session.copy(playheadMs = 2_000L),
+                    ),
+                    onIntent = {},
+                )
+            }
+        }
+
+        val playhead = compose.onNodeWithTag("editor_playhead").fetchSemanticsNode().boundsInRoot
+        val clip = compose.onNodeWithTag("clip-a").fetchSemanticsNode().boundsInRoot
+        assertTrue("playhead should cover the clip row: $playhead vs $clip", playhead.top <= clip.top)
+        assertTrue("playhead should cover the clip row: $playhead vs $clip", playhead.bottom >= clip.bottom)
+    }
+
+    @Test
     fun `short clip keeps a minimum interactive hit target`() {
         compose.setContent {
             MyApplicationTheme {
@@ -160,6 +180,98 @@ class EditorScreenTest {
         val trim = intents.filterIsInstance<EditorIntent.Trim>().lastOrNull()
             ?: error("expected trim intent, intents=$intents")
         assertTrue("trim includes both drag events trim=$trim", trim.sourceStartMs >= 2_500L)
+    }
+
+    @Test
+    fun `trim gesture maps timeline delta through clip speed`() {
+        var speed by mutableStateOf(.5f)
+        val intents = mutableListOf<EditorIntent>()
+        compose.setContent {
+            MyApplicationTheme { EditorScreen(stateWithSpeedClip(speed), intents::add) }
+        }
+        compose.onNodeWithContentDescription("Trim start of speed", useUnmergedTree = true)
+            .performTouchInput {
+                down(center)
+                moveBy(Offset(18f, 0f))
+                up()
+            }
+        val halfSourceDelta = intents.filterIsInstance<EditorIntent.Trim>().last().sourceStartMs
+        assertTrue("intents=$intents", halfSourceDelta > 0L)
+
+        speed = 2f
+        compose.waitForIdle()
+        compose.onNodeWithContentDescription("Trim start of speed", useUnmergedTree = true)
+            .performTouchInput {
+                down(center)
+                moveBy(Offset(18f, 0f))
+                up()
+            }
+        val doubleSourceDelta = intents.filterIsInstance<EditorIntent.Trim>().last().sourceStartMs
+        assertTrue(
+            "half=$halfSourceDelta double=$doubleSourceDelta intents=$intents",
+            doubleSourceDelta in (halfSourceDelta * 3L)..(halfSourceDelta * 5L),
+        )
+    }
+
+    @Test
+    fun `empty timeline tap seeks and clears selection`() {
+        val intents = mutableListOf<EditorIntent>()
+        compose.setContent {
+            MyApplicationTheme {
+                EditorScreen(stateWithTwoClips().copy(session = stateWithTwoClips().session.copy(playheadMs = 0L)), intents::add)
+            }
+        }
+
+        compose.onNodeWithTag("editor_timeline").performTouchInput {
+            click(Offset(315f, 100f))
+        }
+
+        assertTrue("intents=$intents", intents.any { it == EditorIntent.SelectClip(null) })
+        assertTrue("intents=$intents", intents.any { it is EditorIntent.Seek && it.positionMs > 0L })
+    }
+
+    @Test
+    fun `short selected clip uses its hit target for move instead of overlapping trim zones`() {
+        val intents = mutableListOf<EditorIntent>()
+        compose.setContent {
+            MyApplicationTheme { EditorScreen(stateWithShortClip(), intents::add) }
+        }
+
+        compose.onNodeWithTag("clip-short").performTouchInput {
+            down(center)
+            moveBy(Offset(50f, 0f))
+            up()
+        }
+
+        assertTrue(intents.any { it is EditorIntent.Move && it.timelineStartMs > 0L })
+    }
+
+    @Test
+    fun `changing selection refreshes clip gesture behavior`() {
+        var editorState by mutableStateOf(stateWithTwoClips())
+        val intents = mutableListOf<EditorIntent>()
+        compose.setContent {
+            MyApplicationTheme {
+                EditorScreen(
+                    state = editorState,
+                    onIntent = { intent ->
+                        intents += intent
+                    if (intent is EditorIntent.SelectClip) {
+                        editorState = editorState.copy(session = editorState.session.copy(selectedClipId = intent.clipId))
+                    }
+                    },
+                )
+            }
+        }
+
+        compose.onNodeWithTag("clip-b").performClick()
+        compose.onNodeWithTag("clip-b").performTouchInput {
+            down(center)
+            moveBy(Offset(36f, 0f))
+            up()
+        }
+
+        assertTrue(intents.last { it is EditorIntent.Move } is EditorIntent.Move)
     }
 
     private fun stateWithTwoClips(): EditorUiState = EditorUiState(
@@ -217,6 +329,25 @@ class EditorScreenTest {
                 )
             ),
             selectedClipId = "trim",
+        ),
+    )
+
+    private fun stateWithSpeedClip(speed: Float): EditorUiState = EditorUiState(
+        loading = false,
+        session = EditorSession(
+            id = "session-speed-$speed",
+            tracks = listOf(
+                EditorTrack(
+                    id = "track-speed",
+                    name = "Speed",
+                    clips = listOf(
+                        clip("speed", 0L, 20_000L).copy(
+                            effects = ClipEffects(speed = speed),
+                        ),
+                    ),
+                ),
+            ),
+            selectedClipId = "speed",
         ),
     )
 

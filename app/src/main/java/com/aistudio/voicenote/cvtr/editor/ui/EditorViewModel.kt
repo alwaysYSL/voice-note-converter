@@ -15,7 +15,6 @@ import com.aistudio.voicenote.cvtr.editor.command.DeleteClipCommand
 import com.aistudio.voicenote.cvtr.editor.command.EditorCommand
 import com.aistudio.voicenote.cvtr.editor.command.MoveClipCommand
 import com.aistudio.voicenote.cvtr.editor.command.RemoveTrackCommand
-import com.aistudio.voicenote.cvtr.editor.command.SelectClipCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetClipFadeCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetClipPitchCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetClipSpeedCommand
@@ -40,8 +39,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Metadata extracted before a source is added to the timeline. */
 internal data class AudioSourceInfo(
@@ -104,6 +106,7 @@ internal data class EditorUiState(
     val activeSheet: EditorSheet? = null,
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
+    val importInFlight: Boolean = false,
 )
 
 /**
@@ -128,6 +131,8 @@ internal class EditorViewModel(
     val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
 
     private val ready = CompletableDeferred<Unit>()
+    private val mutationMutex = Mutex()
+    private val importsInFlight = AtomicInteger(0)
     private var commandHistory: CommandHistory? = null
     private var launchJob: Job
 
@@ -147,38 +152,57 @@ internal class EditorViewModel(
     fun dispatch(intent: EditorIntent) {
         when (intent) {
             is EditorIntent.Seek -> seek(intent.positionMs)
-            is EditorIntent.SelectClip -> execute(SelectClipCommand(intent.clipId))
-            is EditorIntent.Split -> selectedClip()?.let { execute(SplitClipCommand(it, intent.splitTimelineMs)) }
-            is EditorIntent.Trim -> selectedClip()?.let {
-                execute(TrimClipCommand(it, intent.sourceStartMs, intent.sourceEndMs))
+            is EditorIntent.SelectClip -> runSerializedMutation {
+                commandHistory?.let { history ->
+                    when (val result = history.updateSelection(intent.clipId)) {
+                        is TimelineResult.Accepted -> publishSession(result.value)
+                        is TimelineResult.Rejected -> showMessage(result.reason.toEditorMessage())
+                    }
+                }
             }
-            is EditorIntent.Move -> selectedClip()?.let { execute(MoveClipCommand(it, intent.timelineStartMs)) }
-            is EditorIntent.Delete -> selectedLocation()?.let { (trackId, clipId) ->
-                execute(DeleteClipCommand(trackId, clipId, intent.ripple))
+            is EditorIntent.Split -> runSerializedMutation {
+                selectedClip()?.let { execute(SplitClipCommand(it, intent.splitTimelineMs)) }
             }
-            is EditorIntent.SetFade -> selectedClip()?.let {
-                execute(SetClipFadeCommand(it, intent.fadeInMs, intent.fadeOutMs))
+            is EditorIntent.Trim -> runSerializedMutation {
+                selectedClip()?.let { execute(TrimClipCommand(it, intent.sourceStartMs, intent.sourceEndMs)) }
             }
-            is EditorIntent.SetPitch -> selectedClip()?.let {
-                execute(SetClipPitchCommand(it, intent.pitchSemitones))
+            is EditorIntent.Move -> runSerializedMutation {
+                selectedClip()?.let { execute(MoveClipCommand(it, intent.timelineStartMs)) }
             }
-            is EditorIntent.SetSpeed -> selectedClip()?.let {
-                execute(SetClipSpeedCommand(it, intent.speed))
+            is EditorIntent.Delete -> runSerializedMutation {
+                selectedLocation()?.let { (trackId, clipId) ->
+                    execute(DeleteClipCommand(trackId, clipId, intent.ripple))
+                }
             }
-            is EditorIntent.SetTrackVolume -> execute(
-                SetTrackVolumeCommand(intent.trackId, intent.volume)
-            )
-            is EditorIntent.SetTrackMuted -> execute(
-                SetTrackMutedCommand(intent.trackId, intent.muted)
-            )
-            is EditorIntent.RemoveTrack -> execute(RemoveTrackCommand(intent.trackId))
-            EditorIntent.Undo -> commandHistory?.let { history ->
-                history.undo()
-                publishSession(history.session)
+            is EditorIntent.SetFade -> runSerializedMutation {
+                selectedClip()?.let { execute(SetClipFadeCommand(it, intent.fadeInMs, intent.fadeOutMs)) }
             }
-            EditorIntent.Redo -> commandHistory?.let { history ->
-                history.redo()
-                publishSession(history.session)
+            is EditorIntent.SetPitch -> runSerializedMutation {
+                selectedClip()?.let { execute(SetClipPitchCommand(it, intent.pitchSemitones)) }
+            }
+            is EditorIntent.SetSpeed -> runSerializedMutation {
+                selectedClip()?.let { execute(SetClipSpeedCommand(it, intent.speed)) }
+            }
+            is EditorIntent.SetTrackVolume -> runSerializedMutation {
+                execute(SetTrackVolumeCommand(intent.trackId, intent.volume))
+            }
+            is EditorIntent.SetTrackMuted -> runSerializedMutation {
+                execute(SetTrackMutedCommand(intent.trackId, intent.muted))
+            }
+            is EditorIntent.RemoveTrack -> runSerializedMutation {
+                execute(RemoveTrackCommand(intent.trackId))
+            }
+            EditorIntent.Undo -> runSerializedMutation {
+                commandHistory?.let { history ->
+                    history.undo()
+                    publishSession(history.session)
+                }
+            }
+            EditorIntent.Redo -> runSerializedMutation {
+                commandHistory?.let { history ->
+                    history.redo()
+                    publishSession(history.session)
+                }
             }
             EditorIntent.ClearMessage -> _uiState.update { it.copy(message = null) }
             is EditorIntent.ShowSheet -> _uiState.update { it.copy(activeSheet = intent.sheet) }
@@ -187,51 +211,59 @@ internal class EditorViewModel(
 
     /** Imports a source as a new track at the current playhead after metadata validation. */
     fun importTrack(uri: Uri) {
+        importsInFlight.incrementAndGet()
+        _uiState.update { it.copy(importInFlight = true) }
         viewModelScope.launch(Dispatchers.IO) {
-            retainReadPermission(uri)
+            var waveformUri: Uri? = null
             try {
-                val metadata = sourceAnalyzer(uri)
-                val state = _uiState.value
-                val startMs = state.session.playheadMs.coerceIn(0L, MAX_TIMELINE_MS)
-                val durationMs = metadata.durationMs
-                if (durationMs <= 0L || startMs > MAX_TIMELINE_MS - durationMs) {
-                    showMessage(EditorMessage.TIMELINE_LIMIT)
-                    return@launch
-                }
-                if (state.session.tracks.size >= com.aistudio.voicenote.cvtr.editor.model.MAX_TRACKS) {
-                    showMessage(EditorMessage.TRACK_LIMIT)
-                    return@launch
-                }
-                val clipId = "clip-${UUID.randomUUID()}"
-                val trackId = nextTrackId(state.session.tracks)
-                val track = EditorTrack(
-                    id = trackId,
-                    name = metadata.displayName.ifBlank { trackId.replace("track-", "Track ") },
-                    clips = listOf(
-                        AudioClip(
-                            id = clipId,
-                            source = AudioSourceRef(uri.toString(), durationMs),
-                            sourceStartMs = 0L,
-                            sourceEndMs = durationMs,
-                            timelineStartMs = startMs,
+                mutationMutex.withLock {
+                    retainReadPermission(uri)
+                    val metadata = sourceAnalyzer(uri)
+                    val state = _uiState.value
+                    val startMs = state.session.playheadMs.coerceIn(0L, MAX_TIMELINE_MS)
+                    val durationMs = metadata.durationMs
+                    if (durationMs <= 0L || startMs > MAX_TIMELINE_MS - durationMs) {
+                        showMessage(EditorMessage.TIMELINE_LIMIT)
+                        return@withLock
+                    }
+                    if (state.session.tracks.size >= com.aistudio.voicenote.cvtr.editor.model.MAX_TRACKS) {
+                        showMessage(EditorMessage.TRACK_LIMIT)
+                        return@withLock
+                    }
+                    val clipId = "clip-${UUID.randomUUID()}"
+                    val trackId = nextTrackId(state.session.tracks)
+                    val track = EditorTrack(
+                        id = trackId,
+                        name = metadata.displayName.ifBlank { trackId.replace("track-", "Track ") },
+                        clips = listOf(
+                            AudioClip(
+                                id = clipId,
+                                source = AudioSourceRef(uri.toString(), durationMs),
+                                sourceStartMs = 0L,
+                                sourceEndMs = durationMs,
+                                timelineStartMs = startMs,
+                            )
                         )
                     )
-                )
-                val result = commandHistory?.execute(AddTrackCommand(track))
-                    ?: TimelineResult.Rejected(TimelineError.MISSING_ID)
-                if (result is TimelineResult.Accepted) {
-                    val selected = commandHistory?.execute(SelectClipCommand(clipId))
-                    publishSession(
-                        if (selected is TimelineResult.Accepted) selected.value else result.value
-                    )
-                    loadWaveform(uri)
-                } else {
-                    showMessage((result as TimelineResult.Rejected).reason.toEditorMessage())
+                    val result = commandHistory?.execute(AddTrackCommand(track))
+                        ?: TimelineResult.Rejected(TimelineError.MISSING_ID)
+                    if (result is TimelineResult.Accepted) {
+                        commandHistory?.updateSelection(clipId)
+                        publishSession(commandHistory?.session ?: result.value)
+                        waveformUri = uri
+                    } else {
+                        showMessage((result as TimelineResult.Rejected).reason.toEditorMessage())
+                    }
                 }
+                waveformUri?.let { loadWaveform(it) }
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
                 showMessage(EditorMessage.IMPORT_FAILED)
+            } finally {
+                if (importsInFlight.decrementAndGet() == 0) {
+                    _uiState.update { it.copy(importInFlight = false) }
+                }
             }
         }
     }
@@ -354,6 +386,21 @@ internal class EditorViewModel(
         }
     }
 
+    /** Queues UI mutations behind an in-flight import without blocking the main thread. */
+    private fun runSerializedMutation(block: () -> Unit) {
+        if (mutationMutex.tryLock()) {
+            try {
+                block()
+            } finally {
+                mutationMutex.unlock()
+            }
+        } else {
+            viewModelScope.launch {
+                mutationMutex.withLock { block() }
+            }
+        }
+    }
+
     private fun publishSession(session: EditorSession) {
         val history = commandHistory
         _uiState.update {
@@ -383,7 +430,13 @@ internal class EditorViewModel(
     }
 
     private suspend fun loadWaveform(uri: Uri) {
-        val waveform = runCatching { waveformLoader(uri) }.getOrDefault(emptyList())
+        val waveform = try {
+            waveformLoader(uri)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            emptyList()
+        }
         _uiState.update { it.copy(waveformBySource = it.waveformBySource + (uri.toString() to waveform)) }
     }
 

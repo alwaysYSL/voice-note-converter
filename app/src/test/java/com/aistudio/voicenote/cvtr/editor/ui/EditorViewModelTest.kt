@@ -7,6 +7,7 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -135,6 +136,59 @@ class EditorViewModelTest {
         vm.dispatch(EditorIntent.Redo)
         assertFalse(vm.uiState.value.canRedo)
         assertEquals(1_000L, vm.uiState.value.session.tracks.single().clips.single().timelineStartMs)
+    }
+
+    @Test
+    fun `import selects the new clip without adding a second undo step`() = runTest {
+        val vm = editorViewModel(
+            EditorLaunchSource.Converted(Uri.parse("content://media/result.ogg"), null, "voice.ogg")
+        )
+        vm.awaitReady()
+
+        vm.importTrack(Uri.parse("content://media/import.wav"))
+        awaitTrackCount(vm, 2)
+        assertEquals(1, vm.uiState.value.canUndo.let { if (it) 1 else 0 })
+
+        vm.dispatch(EditorIntent.Undo)
+
+        assertEquals(1, vm.uiState.value.session.tracks.size)
+    }
+
+    @Test
+    fun `concurrent imports are serialized and expose an in flight gate`() = runTest {
+        val firstAnalyzerStarted = CompletableDeferred<Unit>()
+        val releaseFirstAnalyzer = CompletableDeferred<Unit>()
+        val vm = EditorViewModel(
+            application = app,
+            launchSource = EditorLaunchSource.Converted(
+                Uri.parse("content://media/result.ogg"), null, "voice.ogg"
+            ),
+            sourceAnalyzer = { uri ->
+                if (uri.toString().endsWith("first.wav")) {
+                    firstAnalyzerStarted.complete(Unit)
+                    releaseFirstAnalyzer.await()
+                }
+                AudioSourceInfo(uri.lastPathSegment.orEmpty(), 1_000L)
+            },
+            waveformLoader = { emptyList() },
+        )
+        vm.awaitReady()
+
+        vm.importTrack(Uri.parse("content://media/first.wav"))
+        firstAnalyzerStarted.await()
+        vm.importTrack(Uri.parse("content://media/second.wav"))
+        assertTrue(vm.uiState.value.importInFlight)
+        releaseFirstAnalyzer.complete(Unit)
+        withTimeout(5_000L) {
+            while (vm.uiState.value.session.tracks.size < 3) delay(10L)
+            while (vm.uiState.value.importInFlight) delay(10L)
+        }
+
+        assertFalse(vm.uiState.value.importInFlight)
+        assertEquals(
+            setOf("content://media/first.wav", "content://media/second.wav"),
+            vm.uiState.value.session.tracks.drop(1).map { it.clips.single().source.uri }.toSet(),
+        )
     }
 
     private suspend fun awaitTrackCount(vm: EditorViewModel, count: Int) {

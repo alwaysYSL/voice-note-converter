@@ -133,10 +133,19 @@ fun AppNavigation(
                     historyId?.let(EditorLaunchSource::History) ?: pendingEditorLaunch
                 }
                 if (launchSource == null) {
-                    EditorEntryScreen(
-                        state = EditorUiState(loading = false),
-                        onBack = { navController.popBackStack() }
-                    )
+                    LaunchedEffect(Unit) {
+                        if (!navController.popBackStack()) {
+                            navController.navigate(Screen.Converter.route) {
+                                popUpTo(navController.graph.startDestinationId) { inclusive = true }
+                            }
+                        }
+                    }
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        androidx.compose.material3.Text("Returning to converter…")
+                    }
                 } else {
                     val editorFactory = remember(application, launchSource) {
                         AppViewModelFactory(
@@ -162,20 +171,25 @@ fun AppNavigation(
                 }
             }
         }
-        FloatingBottomNavigation(
-            screens = screens,
-            currentDestination = currentDestination,
-            onNavigate = { screen ->
-                navController.navigate(screen.route) {
-                    popUpTo(navController.graph.startDestinationId) { saveState = true }
-                    launchSingleTop = true
-                    restoreState = true
-                }
-            },
-            modifier = Modifier.align(Alignment.BottomCenter)
-        )
+        if (shouldShowFloatingBottomNavigation(currentDestination?.route)) {
+            FloatingBottomNavigation(
+                screens = screens,
+                currentDestination = currentDestination,
+                onNavigate = { screen ->
+                    navController.navigate(screen.route) {
+                        popUpTo(navController.graph.startDestinationId) { saveState = true }
+                        launchSingleTop = true
+                        restoreState = true
+                    }
+                },
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
+        }
     }
 }
+
+internal fun shouldShowFloatingBottomNavigation(route: String?): Boolean =
+    route?.startsWith("editor") != true
 
 @Composable
 private fun EditorEntryScreen(

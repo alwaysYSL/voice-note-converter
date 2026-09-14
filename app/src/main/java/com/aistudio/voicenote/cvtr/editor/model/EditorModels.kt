@@ -1,5 +1,7 @@
 package com.aistudio.voicenote.cvtr.editor.model
 
+import java.util.Collections
+
 internal const val MAX_TRACKS = 5
 internal const val MAX_TIMELINE_MS = 300_000L
 
@@ -23,8 +25,14 @@ internal class ClipEffects(
 
     val fadeInMs: Long = fadeInMs.coerceIn(0L, MAX_FADE_MS)
     val fadeOutMs: Long = fadeOutMs.coerceIn(0L, MAX_FADE_MS)
-    val pitchSemitones: Float = pitchSemitones.coerceIn(-4f, 4f)
-    val speed: Float = speed.coerceIn(0.5f, 2f)
+    val pitchSemitones: Float = pitchSemitones
+        .takeIf { it.isFinite() }
+        ?.coerceIn(-4f, 4f)
+        ?: 0f
+    val speed: Float = speed
+        .takeIf { it.isFinite() }
+        ?.coerceIn(0.5f, 2f)
+        ?: 1f
 
     val pitch: Float
         get() = pitchSemitones
@@ -98,26 +106,102 @@ internal data class AudioClip(
         get() = timelineStartMs + timelineDurationMs
 }
 
-internal data class EditorTrack(
+/**
+ * Immutable-at-the-boundary track value. The explicit copy implementation is intentional:
+ * Kotlin data-class generated copies would otherwise retain a caller-owned mutable list.
+ */
+internal class EditorTrack(
     val id: String,
     val name: String,
     val volume: Float = 1f,
     val muted: Boolean = false,
-    val clips: List<AudioClip> = emptyList(),
-)
+    clips: List<AudioClip> = emptyList(),
+) {
+    val clips: List<AudioClip> = immutableList(clips)
 
-internal data class EditorSession(
+    operator fun component1(): String = id
+    operator fun component2(): String = name
+    operator fun component3(): Float = volume
+    operator fun component4(): Boolean = muted
+    operator fun component5(): List<AudioClip> = clips
+
+    fun copy(
+        id: String = this.id,
+        name: String = this.name,
+        volume: Float = this.volume,
+        muted: Boolean = this.muted,
+        clips: List<AudioClip> = this.clips,
+    ): EditorTrack = EditorTrack(id, name, volume, muted, clips)
+
+    override fun equals(other: Any?): Boolean = other is EditorTrack &&
+        id == other.id && name == other.name && volume == other.volume &&
+        muted == other.muted && clips == other.clips
+
+    override fun hashCode(): Int {
+        var result = id.hashCode()
+        result = 31 * result + name.hashCode()
+        result = 31 * result + volume.hashCode()
+        result = 31 * result + muted.hashCode()
+        result = 31 * result + clips.hashCode()
+        return result
+    }
+
+    override fun toString(): String =
+        "EditorTrack(id=$id, name=$name, volume=$volume, muted=$muted, clips=$clips)"
+}
+
+/** Immutable session value with defensive copies at every list boundary. */
+internal class EditorSession(
     val id: String,
-    val tracks: List<EditorTrack>,
+    tracks: List<EditorTrack>,
     val selectedClipId: String? = null,
     val playheadMs: Long = 0L,
     val exportPreset: ExportPreset = ExportPreset.VOICE_NOTE_32,
     val dirty: Boolean = false,
 ) {
+    val tracks: List<EditorTrack> = immutableList(tracks)
+
+    operator fun component1(): String = id
+    operator fun component2(): List<EditorTrack> = tracks
+    operator fun component3(): String? = selectedClipId
+    operator fun component4(): Long = playheadMs
+    operator fun component5(): ExportPreset = exportPreset
+    operator fun component6(): Boolean = dirty
+
+    fun copy(
+        id: String = this.id,
+        tracks: List<EditorTrack> = this.tracks,
+        selectedClipId: String? = this.selectedClipId,
+        playheadMs: Long = this.playheadMs,
+        exportPreset: ExportPreset = this.exportPreset,
+        dirty: Boolean = this.dirty,
+    ): EditorSession = EditorSession(id, tracks, selectedClipId, playheadMs, exportPreset, dirty)
+
+    override fun equals(other: Any?): Boolean = other is EditorSession &&
+        id == other.id && tracks == other.tracks && selectedClipId == other.selectedClipId &&
+        playheadMs == other.playheadMs && exportPreset == other.exportPreset && dirty == other.dirty
+
+    override fun hashCode(): Int {
+        var result = id.hashCode()
+        result = 31 * result + tracks.hashCode()
+        result = 31 * result + (selectedClipId?.hashCode() ?: 0)
+        result = 31 * result + playheadMs.hashCode()
+        result = 31 * result + exportPreset.hashCode()
+        result = 31 * result + dirty.hashCode()
+        return result
+    }
+
+    override fun toString(): String =
+        "EditorSession(id=$id, tracks=$tracks, selectedClipId=$selectedClipId, " +
+            "playheadMs=$playheadMs, exportPreset=$exportPreset, dirty=$dirty)"
+
     companion object {
         internal fun empty(id: String = "session"): EditorSession = EditorSession(id = id, tracks = emptyList())
     }
 }
+
+private fun <T> immutableList(values: List<T>): List<T> =
+    Collections.unmodifiableList(values.toList())
 
 internal enum class ExportPreset {
     VOICE_NOTE_32,
