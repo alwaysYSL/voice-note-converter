@@ -201,10 +201,10 @@ internal class EditorViewModel(
                     return@launch
                 }
                 val clipId = "clip-${UUID.randomUUID()}"
-                val trackId = "track-${state.session.tracks.size + 1}"
+                val trackId = nextTrackId(state.session.tracks)
                 val track = EditorTrack(
                     id = trackId,
-                    name = metadata.displayName.ifBlank { "Track ${state.session.tracks.size + 1}" },
+                    name = metadata.displayName.ifBlank { trackId.replace("track-", "Track ") },
                     clips = listOf(
                         AudioClip(
                             id = clipId,
@@ -235,9 +235,16 @@ internal class EditorViewModel(
     }
 
     private suspend fun resolveLaunch() {
-        when (val source = launchSource) {
-            is EditorLaunchSource.Converted -> resolveConverted(source)
-            is EditorLaunchSource.History -> resolveHistory(source.historyId)
+        try {
+            when (val source = launchSource) {
+                is EditorLaunchSource.Converted -> resolveConverted(source)
+                is EditorLaunchSource.History -> resolveHistory(source.historyId)
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            showMessage(EditorMessage.IMPORT_FAILED)
+            finishLoading(EditorSession.empty())
         }
     }
 
@@ -246,8 +253,13 @@ internal class EditorViewModel(
         val resolved = if (preferred == null) {
             source.resultUri to sourceAnalyzer(source.resultUri)
         } else {
-            runCatching { preferred to sourceAnalyzer(preferred) }
-                .getOrElse { source.resultUri to sourceAnalyzer(source.resultUri) }
+            try {
+                preferred to sourceAnalyzer(preferred)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                source.resultUri to sourceAnalyzer(source.resultUri)
+            }
         }
         val (uri, metadata) = resolved
         if (metadata.durationMs <= 0L || metadata.durationMs > MAX_TIMELINE_MS) {
@@ -272,7 +284,11 @@ internal class EditorViewModel(
             return
         }
         val uri = history.outputFilePath.toUriForEditor()
-        val metadata = runCatching { sourceAnalyzer(uri) }.getOrElse {
+        val metadata = try {
+            sourceAnalyzer(uri)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
             AudioSourceInfo(history.outputFileName, history.durationSeconds * 1_000L)
         }
         if (metadata.durationMs <= 0L || metadata.durationMs > MAX_TIMELINE_MS) {
@@ -340,6 +356,13 @@ internal class EditorViewModel(
         return _uiState.value.session.tracks.firstNotNullOfOrNull { track ->
             id.takeIf { clipId -> track.clips.any { it.id == clipId } }?.let { track.id to it }
         }
+    }
+
+    private fun nextTrackId(tracks: List<EditorTrack>): String {
+        val existingIds = tracks.map { it.id }.toSet()
+        var suffix = 1
+        while ("track-$suffix" in existingIds) suffix++
+        return "track-$suffix"
     }
 
     private suspend fun loadWaveform(uri: Uri) {

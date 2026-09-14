@@ -9,6 +9,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -59,6 +60,62 @@ class EditorViewModelTest {
         }
 
         assertEquals(EditorMessage.TIMELINE_LIMIT, vm.uiState.value.message)
+    }
+
+    @Test
+    fun `import after removing a non-last track gets a unique accepted track id`() = runTest {
+        val vm = editorViewModel(
+            EditorLaunchSource.Converted(
+                Uri.parse("content://media/result.ogg"),
+                null,
+                "voice.ogg"
+            )
+        )
+        vm.awaitReady()
+
+        vm.importTrack(Uri.parse("content://media/first.wav"))
+        awaitTrackCount(vm, 2)
+        vm.importTrack(Uri.parse("content://media/second.wav"))
+        awaitTrackCount(vm, 3)
+
+        vm.dispatch(EditorIntent.RemoveTrack("track-1"))
+        assertEquals(2, vm.uiState.value.session.tracks.size)
+
+        vm.importTrack(Uri.parse("content://media/third.wav"))
+        awaitTrackCount(vm, 3)
+
+        val tracks = vm.uiState.value.session.tracks
+        assertEquals(3, tracks.map { it.id }.toSet().size)
+        assertEquals(
+            "content://media/third.wav",
+            tracks.single { track -> track.clips.single().source.uri.endsWith("third.wav") }
+                .clips.single().source.uri
+        )
+    }
+
+    @Test
+    fun `converted launch metadata failure clears loading and publishes an error`() = runTest {
+        val vm = EditorViewModel(
+            application = app,
+            launchSource = EditorLaunchSource.Converted(
+                resultUri = Uri.parse("content://media/result.ogg"),
+                originalUri = Uri.parse("content://media/original.m4a"),
+                displayName = "voice.ogg"
+            ),
+            sourceAnalyzer = { throw IllegalStateException("metadata unavailable") },
+            waveformLoader = { emptyList() }
+        )
+
+        vm.awaitReady()
+
+        assertFalse(vm.uiState.value.loading)
+        assertNotNull(vm.uiState.value.message)
+    }
+
+    private suspend fun awaitTrackCount(vm: EditorViewModel, count: Int) {
+        withTimeout(5_000L) {
+            while (vm.uiState.value.session.tracks.size < count) delay(10L)
+        }
     }
 
     private fun editorViewModel(
