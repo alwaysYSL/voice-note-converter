@@ -109,6 +109,7 @@ fun HistoryScreen(
     viewModel: HistoryViewModel,
     modifier: Modifier = Modifier,
     onStartConversion: () -> Unit = {},
+    onEditHistory: (Long) -> Unit = {},
     bottomOverlayClearance: Dp = 0.dp,
     statusBarInset: Dp? = null
 ) {
@@ -278,6 +279,7 @@ fun HistoryScreen(
                                     onPlayPause = { viewModel.playPause(item) },
                                     onShare = { viewModel.shareItem(item) },
                                     onConfirmSent = { viewModel.confirmSent(item) },
+                                    onEdit = { onEditHistory(item.id) },
                                     onDelete = { pendingDeleteItems = listOf(item) },
                                     onToggleSelection = {
                                         isSelectionMode = true
@@ -654,6 +656,7 @@ private fun HistoryItemCard(
     onPlayPause: () -> Unit,
     onShare: () -> Unit,
     onConfirmSent: () -> Unit,
+    onEdit: () -> Unit,
     onDelete: () -> Unit,
     onToggleSelection: () -> Unit
 ) {
@@ -849,6 +852,17 @@ private fun HistoryItemCard(
                                         contentColor = AccentRoyalBlue
                                     )
                                 ) { Text("Kirim ulang") }
+                                Button(
+                                    onClick = {
+                                        showActions = false
+                                        onEdit()
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = CardSurfaceWhite,
+                                        contentColor = AccentRoyalBlue
+                                    )
+                                ) { Text("Edit") }
                                 if (item.deliveryStatus == DeliveryStatus.SHARE_OPENED) {
                                     Button(
                                         onClick = {

@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.outlined.History
@@ -20,10 +21,12 @@ import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
@@ -33,6 +36,7 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -43,11 +47,20 @@ import com.aistudio.voicenote.cvtr.ui.theme.CardSurfaceWhite
 import com.aistudio.voicenote.cvtr.ui.theme.DeepNavyDisplay
 import com.aistudio.voicenote.cvtr.ui.theme.LightSlateCaption
 import com.aistudio.voicenote.cvtr.ui.theme.PastelMintCardBg
+import com.aistudio.voicenote.cvtr.editor.ui.EditorLaunchSource
+import com.aistudio.voicenote.cvtr.editor.ui.EditorViewModel
+import com.aistudio.voicenote.cvtr.editor.ui.EditorUiState
+import androidx.compose.foundation.layout.Column
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.ExperimentalMaterial3Api
 
 private sealed class Screen(val route: String, val label: String) {
     data object Converter : Screen("converter", "Converter")
     data object History : Screen("history", "Riwayat")
 }
+
+private const val EditorRoute = "editor?historyId={historyId}"
+private const val EditorRouteBase = "editor"
 
 private val BottomOverlayClearance = 128.dp
 
@@ -60,6 +73,7 @@ fun AppNavigation(
     val application = LocalContext.current.applicationContext as Application
     val viewModelFactory = remember(application) { AppViewModelFactory(application) }
     val navController = rememberNavController()
+    var pendingEditorLaunch by remember { androidx.compose.runtime.mutableStateOf<EditorLaunchSource?>(null) }
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = backStackEntry?.destination
     val screens = listOf(Screen.Converter, Screen.History)
@@ -84,7 +98,19 @@ fun AppNavigation(
                 }
                 MainScreen(
                     viewModel = converterViewModel,
-                    bottomOverlayClearance = BottomOverlayClearance
+                    bottomOverlayClearance = BottomOverlayClearance,
+                    onEditConverted = {
+                        val state = converterViewModel.uiState.value
+                        val resultUri = state.convertedUri
+                        if (resultUri != null) {
+                            pendingEditorLaunch = EditorLaunchSource.Converted(
+                                resultUri = resultUri,
+                                originalUri = state.selectedFileUri,
+                                displayName = state.outputFileName.ifBlank { state.fileName.orEmpty() }
+                            )
+                            navController.navigate(EditorRouteBase)
+                        }
+                    }
                 )
             }
             composable(Screen.History.route) {
@@ -97,8 +123,37 @@ fun AppNavigation(
                             restoreState = true
                         }
                     },
+                    onEditHistory = { historyId ->
+                        pendingEditorLaunch = null
+                        navController.navigate("editor?historyId=$historyId")
+                    },
                     bottomOverlayClearance = BottomOverlayClearance
                 )
+            }
+            composable(EditorRoute) { entry ->
+                val historyId = entry.arguments?.getString("historyId")?.toLongOrNull()
+                val launchSource = remember(historyId, pendingEditorLaunch) {
+                    historyId?.let(EditorLaunchSource::History) ?: pendingEditorLaunch
+                }
+                if (launchSource == null) {
+                    EditorEntryScreen(
+                        state = EditorUiState(loading = false),
+                        onBack = { navController.popBackStack() }
+                    )
+                } else {
+                    val editorFactory = remember(application, launchSource) {
+                        AppViewModelFactory(
+                            application = application,
+                            editorLaunchSource = launchSource
+                        )
+                    }
+                    val editorViewModel: EditorViewModel = viewModel(factory = editorFactory)
+                    val editorState by editorViewModel.uiState.collectAsStateWithLifecycle()
+                    EditorEntryScreen(
+                        state = editorState,
+                        onBack = { navController.popBackStack() }
+                    )
+                }
             }
         }
         FloatingBottomNavigation(
@@ -113,6 +168,30 @@ fun AppNavigation(
             },
             modifier = Modifier.align(Alignment.BottomCenter)
         )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun EditorEntryScreen(
+    state: EditorUiState,
+    onBack: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        TopAppBar(
+            title = { Text("Editor audio") },
+            navigationIcon = {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Kembali")
+                }
+            }
+        )
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(if (state.loading) "Menyiapkan editor…" else "Timeline audio siap")
+        }
     }
 }
 

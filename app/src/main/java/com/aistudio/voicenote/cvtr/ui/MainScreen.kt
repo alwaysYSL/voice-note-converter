@@ -92,7 +92,8 @@ fun MainScreen(
     viewModel: MainViewModel,
     modifier: Modifier = Modifier,
     bottomOverlayClearance: Dp = 0.dp,
-    statusBarInset: Dp? = null
+    statusBarInset: Dp? = null,
+    onEditConverted: () -> Unit = {}
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val playback by viewModel.playbackState.collectAsStateWithLifecycle()
@@ -228,7 +229,8 @@ fun MainScreen(
                     onTrimSilenceChange = viewModel::setTrimSilence,
                     compatibilitySummary = state.compatibilitySummary,
                     compatibilityWarning = state.compatibilityWarning,
-                    playbackError = playback.errorMessage
+                    playbackError = playback.errorMessage,
+                    onEditConverted = onEditConverted
                 )
             }
 
@@ -412,7 +414,8 @@ internal fun PreviewCard(
     onTrimSilenceChange: (Boolean) -> Unit = {},
     compatibilitySummary: String? = null,
     compatibilityWarning: String? = null,
-    playbackError: String? = null
+    playbackError: String? = null,
+    onEditConverted: () -> Unit = {}
 ) {
     var showAudioEditor by remember(fileName) { mutableStateOf(false) }
     val previewingConverted = hasConvertedResult && previewSource == PreviewSource.CONVERTED
@@ -465,6 +468,15 @@ internal fun PreviewCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error
                 )
+            }
+            Spacer(Modifier.height(8.dp))
+            TextButton(
+                onClick = onEditConverted,
+                modifier = Modifier.testTag("edit_converted")
+            ) {
+                Icon(Icons.Default.Tune, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Edit lebih lanjut")
             }
         }
         if (!hasConvertedResult &&

@@ -8,6 +8,8 @@ import androidx.lifecycle.ViewModelProvider
 import com.aistudio.voicenote.cvtr.audio.AudioPreviewPlayer
 import com.aistudio.voicenote.cvtr.data.local.AppDatabase
 import com.aistudio.voicenote.cvtr.data.repository.ConversionHistoryRepository
+import com.aistudio.voicenote.cvtr.editor.ui.EditorLaunchSource
+import com.aistudio.voicenote.cvtr.editor.ui.EditorViewModel
 import com.aistudio.voicenote.cvtr.telegram.TelegramSender
 import kotlinx.coroutines.CoroutineScope
 
@@ -18,7 +20,8 @@ class AppViewModelFactory(
     ),
     private val telegramSender: TelegramSender = TelegramSender(),
     private val audioPlayerFactory: (android.content.Context, CoroutineScope) -> AudioPreviewPlayer =
-        ::AudioPreviewPlayer
+        ::AudioPreviewPlayer,
+    private val editorLaunchSource: EditorLaunchSource? = null
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(
@@ -38,6 +41,14 @@ class AppViewModelFactory(
             repository = historyRepository,
             telegramSender = telegramSender,
             audioPlayerFactory = audioPlayerFactory
+        ) as T
+
+        modelClass.isAssignableFrom(EditorViewModel::class.java) -> EditorViewModel(
+            application = application,
+            launchSource = requireNotNull(editorLaunchSource) {
+                "EditorViewModel requires an editor launch source"
+            },
+            repository = historyRepository
         ) as T
 
         else -> throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")

@@ -35,7 +35,10 @@ class ConversionHistoryRepository(
 
     suspend fun deleteAll() = dao.deleteAll()
 
-    suspend fun getById(id: Long) = dao.getById(id)
+    /** Durable lookup used by editor history routes; callers pass only the persisted id. */
+    suspend fun getEditorSourceById(id: Long): ConversionHistory? = dao.getById(id)
+
+    suspend fun getById(id: Long): ConversionHistory? = getEditorSourceById(id)
     suspend fun getCreatedBefore(cutoff: Long): List<ConversionHistory> =
         dao.getCreatedBefore(cutoff)
 }
