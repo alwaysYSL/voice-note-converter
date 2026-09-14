@@ -2,6 +2,8 @@ package com.aistudio.voicenote.cvtr.ui
 import android.app.Application
 
 import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -13,7 +15,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.outlined.History
@@ -21,7 +22,6 @@ import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.LaunchedEffect
@@ -50,9 +50,6 @@ import com.aistudio.voicenote.cvtr.ui.theme.PastelMintCardBg
 import com.aistudio.voicenote.cvtr.editor.ui.EditorLaunchSource
 import com.aistudio.voicenote.cvtr.editor.ui.EditorViewModel
 import com.aistudio.voicenote.cvtr.editor.ui.EditorUiState
-import androidx.compose.foundation.layout.Column
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.ExperimentalMaterial3Api
 
 private sealed class Screen(val route: String, val label: String) {
     data object Converter : Screen("converter", "Converter")
@@ -149,8 +146,17 @@ fun AppNavigation(
                     }
                     val editorViewModel: EditorViewModel = viewModel(factory = editorFactory)
                     val editorState by editorViewModel.uiState.collectAsStateWithLifecycle()
+                    val audioPicker = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.OpenDocument(),
+                    ) { uri ->
+                        uri?.let(editorViewModel::importTrack)
+                    }
                     EditorEntryScreen(
                         state = editorState,
+                        onIntent = editorViewModel::dispatch,
+                        onPickTrack = {
+                            audioPicker.launch(arrayOf("audio/*"))
+                        },
                         onBack = { navController.popBackStack() }
                     )
                 }
@@ -171,28 +177,19 @@ fun AppNavigation(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun EditorEntryScreen(
     state: EditorUiState,
     onBack: () -> Unit,
+    onIntent: (com.aistudio.voicenote.cvtr.editor.ui.EditorIntent) -> Unit = {},
+    onPickTrack: () -> Unit = {},
 ) {
-    Column(modifier = Modifier.fillMaxSize()) {
-        TopAppBar(
-            title = { Text("Editor audio") },
-            navigationIcon = {
-                IconButton(onClick = onBack) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Kembali")
-                }
-            }
-        )
-        Box(
-            modifier = Modifier.fillMaxSize(),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(if (state.loading) "Menyiapkan editor…" else "Timeline audio siap")
-        }
-    }
+    com.aistudio.voicenote.cvtr.editor.ui.EditorScreen(
+        state = state,
+        onIntent = onIntent,
+        onPickTrack = onPickTrack,
+        onBack = onBack,
+    )
 }
 
 @Composable
