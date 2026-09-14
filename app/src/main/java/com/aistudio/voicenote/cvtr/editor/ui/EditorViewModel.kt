@@ -102,6 +102,8 @@ internal data class EditorUiState(
     val waveformBySource: Map<String, List<Int>> = emptyMap(),
     val message: EditorMessage? = null,
     val activeSheet: EditorSheet? = null,
+    val canUndo: Boolean = false,
+    val canRedo: Boolean = false,
 )
 
 /**
@@ -328,7 +330,14 @@ internal class EditorViewModel(
 
     private fun finishLoading(session: EditorSession) {
         commandHistory = CommandHistory(session)
-        _uiState.update { it.copy(loading = false, session = session) }
+        _uiState.update {
+            it.copy(
+                loading = false,
+                session = session,
+                canUndo = false,
+                canRedo = false,
+            )
+        }
     }
 
     private fun seek(positionMs: Long) {
@@ -346,7 +355,15 @@ internal class EditorViewModel(
     }
 
     private fun publishSession(session: EditorSession) {
-        _uiState.update { it.copy(session = session, message = null) }
+        val history = commandHistory
+        _uiState.update {
+            it.copy(
+                session = session,
+                message = null,
+                canUndo = history?.canUndo == true,
+                canRedo = history?.canRedo == true,
+            )
+        }
     }
 
     private fun selectedClip(): String? = _uiState.value.session.selectedClipId

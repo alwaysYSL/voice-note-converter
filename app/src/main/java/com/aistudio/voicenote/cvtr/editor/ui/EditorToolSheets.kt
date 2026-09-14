@@ -281,6 +281,8 @@ internal fun EditorTransport(
 @Composable
 internal fun EditorBottomActions(
     session: EditorSession,
+    canUndo: Boolean,
+    canRedo: Boolean,
     onIntent: (EditorIntent) -> Unit,
     onPickTrack: () -> Unit,
 ) {
@@ -294,7 +296,7 @@ internal fun EditorBottomActions(
     ) {
         IconButton(
             onClick = { onIntent(EditorIntent.Undo) },
-            enabled = session.dirty,
+            enabled = canUndo,
             modifier = Modifier
                 .size(48.dp)
                 .testTag("undo"),
@@ -303,7 +305,7 @@ internal fun EditorBottomActions(
         }
         IconButton(
             onClick = { onIntent(EditorIntent.Redo) },
-            enabled = false,
+            enabled = canRedo,
             modifier = Modifier
                 .size(48.dp)
                 .testTag("redo"),

@@ -11,6 +11,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -110,6 +111,30 @@ class EditorViewModelTest {
 
         assertFalse(vm.uiState.value.loading)
         assertNotNull(vm.uiState.value.message)
+    }
+
+    @Test
+    fun `undo exposes redo and redo reapplies the rendered edit`() = runTest {
+        val vm = editorViewModel(
+            EditorLaunchSource.Converted(
+                Uri.parse("content://media/result.ogg"),
+                null,
+                "voice.ogg",
+            )
+        )
+        vm.awaitReady()
+
+        vm.dispatch(EditorIntent.Move(1_000L))
+        assertTrue(vm.uiState.value.canUndo)
+        assertFalse(vm.uiState.value.canRedo)
+
+        vm.dispatch(EditorIntent.Undo)
+        assertTrue(vm.uiState.value.canRedo)
+        assertEquals(0L, vm.uiState.value.session.tracks.single().clips.single().timelineStartMs)
+
+        vm.dispatch(EditorIntent.Redo)
+        assertFalse(vm.uiState.value.canRedo)
+        assertEquals(1_000L, vm.uiState.value.session.tracks.single().clips.single().timelineStartMs)
     }
 
     private suspend fun awaitTrackCount(vm: EditorViewModel, count: Int) {

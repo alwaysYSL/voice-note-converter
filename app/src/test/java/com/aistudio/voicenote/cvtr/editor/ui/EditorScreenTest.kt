@@ -1,13 +1,18 @@
 package com.aistudio.voicenote.cvtr.editor.ui
 
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsNotSelected
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -22,6 +27,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.junit.Assert.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -74,6 +80,88 @@ class EditorScreenTest {
         compose.onNodeWithTag("editor_export_disabled").assertIsNotEnabled()
     }
 
+    @Test
+    fun `redo becomes enabled after undo and dispatches redo`() {
+        val intents = mutableListOf<EditorIntent>()
+        compose.setContent {
+            MyApplicationTheme {
+                EditorScreen(
+                    state = stateWithTwoClips().copy(canUndo = true, canRedo = true),
+                    onIntent = intents::add,
+                )
+            }
+        }
+
+        compose.onNodeWithTag("undo").assertIsEnabled()
+        compose.onNodeWithTag("redo").assertIsEnabled().performClick()
+
+        assertTrue(intents.last() is EditorIntent.Redo)
+    }
+
+    @Test
+    fun `required timeline and track tags exist at compact viewport`() {
+        compose.setContent {
+            MyApplicationTheme {
+                EditorScreen(stateWithTwoClips(), {})
+            }
+        }
+
+        compose.onNodeWithTag("editor_timeline").assertIsDisplayed()
+        compose.onNodeWithTag("track-a").assertIsDisplayed()
+        compose.onNodeWithTag("undo").assertIsDisplayed()
+        compose.onNodeWithTag("redo").assertIsDisplayed()
+
+        val rootBounds = compose.onRoot().fetchSemanticsNode().boundsInRoot
+        listOf("editor_timeline", "track-a", "undo", "redo").forEach { tag ->
+            val bounds = compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot
+            assertTrue(
+                "$tag must remain within the compact viewport bounds=$bounds root=$rootBounds",
+                bounds.left >= rootBounds.left &&
+                    bounds.top >= rootBounds.top &&
+                    bounds.right <= rootBounds.right &&
+                    bounds.bottom <= rootBounds.bottom,
+            )
+        }
+    }
+
+    @Test
+    fun `short clip keeps a minimum interactive hit target`() {
+        compose.setContent {
+            MyApplicationTheme {
+                EditorScreen(
+                    state = stateWithShortClip(),
+                    onIntent = {},
+                )
+            }
+        }
+
+        val bounds = compose.onNodeWithTag("clip-short").fetchSemanticsNode().boundsInRoot
+        assertTrue("short clip hit target width bounds=$bounds", bounds.width >= 48f)
+        assertTrue("short clip hit target height bounds=$bounds", bounds.height >= 48f)
+    }
+
+    @Test
+    fun `trim drag accumulates multiple pointer events from original boundary`() {
+        val intents = mutableListOf<EditorIntent>()
+        compose.setContent {
+            MyApplicationTheme {
+                EditorScreen(stateWithTrimClip(), intents::add)
+            }
+        }
+
+        compose.onNodeWithContentDescription("Trim start of trim", useUnmergedTree = true)
+            .performTouchInput {
+                down(center)
+                moveBy(Offset(36f, 0f))
+                moveBy(Offset(36f, 0f))
+                up()
+        }
+
+        val trim = intents.filterIsInstance<EditorIntent.Trim>().lastOrNull()
+            ?: error("expected trim intent, intents=$intents")
+        assertTrue("trim includes both drag events trim=$trim", trim.sourceStartMs >= 2_500L)
+    }
+
     private fun stateWithTwoClips(): EditorUiState = EditorUiState(
         loading = false,
         session = EditorSession(
@@ -100,6 +188,36 @@ class EditorScreenTest {
                 EditorTrack(id = "track-$index", name = "Track ${index + 1}")
             }
         )
+    )
+
+    private fun stateWithShortClip(): EditorUiState = EditorUiState(
+        loading = false,
+        session = EditorSession(
+            id = "session-short",
+            tracks = listOf(
+                EditorTrack(
+                    id = "track-short",
+                    name = "Short",
+                    clips = listOf(clip("short", 0L, 400L)),
+                )
+            ),
+            selectedClipId = "short",
+        ),
+    )
+
+    private fun stateWithTrimClip(): EditorUiState = EditorUiState(
+        loading = false,
+        session = EditorSession(
+            id = "session-trim",
+            tracks = listOf(
+                EditorTrack(
+                    id = "track-trim",
+                    name = "Trim",
+                    clips = listOf(clip("trim", 0L, 10_000L)),
+                )
+            ),
+            selectedClipId = "trim",
+        ),
     )
 
     private fun clip(id: String, startMs: Long, endMs: Long): AudioClip = AudioClip(

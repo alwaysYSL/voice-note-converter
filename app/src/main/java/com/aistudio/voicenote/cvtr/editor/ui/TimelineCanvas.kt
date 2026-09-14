@@ -36,8 +36,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -353,83 +355,147 @@ private fun TimelineClip(
     onTrim: (Long, Long) -> Unit,
 ) {
     var dragOffsetPx by remember(clip.id) { mutableFloatStateOf(0f) }
+    var originalSourceStartMs by remember(clip.id) { mutableLongStateOf(clip.sourceStartMs) }
+    var originalSourceEndMs by remember(clip.id) { mutableLongStateOf(clip.sourceEndMs) }
     val density = LocalDensity.current.density
+    val interactionWidth = if (width < 48.dp) 48.dp else width
+    val interactionPadding = (interactionWidth - width) / 2f
+    val interactionOffset = if (offset < interactionPadding) 0.dp else offset - interactionPadding
+    val visualOffset = offset - interactionOffset
     Box(
         modifier = Modifier
-            .offset(x = offset)
-            .width(width)
+            .offset(x = interactionOffset)
+            .width(interactionWidth)
             .height(88.dp)
-            .clip(RoundedCornerShape(12.dp))
-            .background(if (selected) PastelMintCardBg else PastelAquaCardBg)
-            .clickable(role = Role.Button, onClick = onSelect)
-            // Keep the stable tag after clickable's merged semantics so UI tests and
-            // accessibility services can address every clip in the stacked timeline.
             .testTag(clipSemanticsTag(clip.id))
-            .semantics {
-                this.selected = selected
-            }
             .pointerInput(clip.id, dpPerMs) {
+                var dragMode = 0
+                var totalTrimDragPx = 0f
                 detectHorizontalDragGestures(
-                    onDragStart = { dragOffsetPx = 0f },
+                    onDragStart = { startOffset ->
+                        dragOffsetPx = 0f
+                        totalTrimDragPx = 0f
+                        dragMode = when {
+                            !selected -> 0
+                            startOffset.x <= 48f * density -> 1
+                            startOffset.x >= size.width - (48f * density) -> 2
+                            else -> 0
+                        }
+                        if (dragMode != 0) {
+                            originalSourceStartMs = clip.sourceStartMs
+                            originalSourceEndMs = clip.sourceEndMs
+                        }
+                    },
                     onHorizontalDrag = { change, dragAmount ->
                         change.consume()
-                        dragOffsetPx += dragAmount
-                        onMove(
-                            (clip.timelineStartMs + dragOffsetPx / (dpPerMs * density))
-                                .roundToLong()
-                                .coerceAtLeast(0L)
-                        )
+                        if (dragMode == 0) {
+                            dragOffsetPx += dragAmount
+                            onMove(
+                                (clip.timelineStartMs + dragOffsetPx / (dpPerMs * density))
+                                    .roundToLong()
+                                    .coerceAtLeast(0L)
+                            )
+                        } else {
+                            totalTrimDragPx += dragAmount
+                            val deltaMs = (totalTrimDragPx / (dpPerMs * density)).roundToLong()
+                            if (dragMode == 1) {
+                                onTrim(
+                                    (originalSourceStartMs + deltaMs)
+                                        .coerceIn(0L, originalSourceEndMs - 1L),
+                                    originalSourceEndMs,
+                                )
+                            } else {
+                                onTrim(
+                                    originalSourceStartMs,
+                                    (originalSourceEndMs + deltaMs)
+                                        .coerceIn(originalSourceStartMs + 1L, clip.source.sourceDurationOrEnd()),
+                                )
+                            }
+                        }
                     },
-                    onDragEnd = { dragOffsetPx = 0f },
-                    onDragCancel = { dragOffsetPx = 0f },
+                    onDragEnd = {
+                        dragOffsetPx = 0f
+                        totalTrimDragPx = 0f
+                        dragMode = 0
+                    },
+                    onDragCancel = {
+                        dragOffsetPx = 0f
+                        totalTrimDragPx = 0f
+                        dragMode = 0
+                    },
                 )
+            }
+            .clickable(role = Role.Button, onClick = onSelect)
+            .semantics {
+                this.selected = selected
             },
         contentAlignment = Alignment.Center,
     ) {
-        WaveformBars(
-            waveform = waveform,
+        Box(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 10.dp, vertical = 12.dp),
-            active = selected,
-        )
-        Text(
-            text = clip.id,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(start = 10.dp, top = 7.dp),
-            style = MaterialTheme.typography.labelSmall,
-            color = if (selected) PastelMintText else DeepNavyDisplay,
-            maxLines = 1,
-        )
-        if (selected) {
-            Canvas(Modifier.matchParentSize()) {
-                drawRoundRect(
-                    color = AccentRoyalBlue,
-                    style = Stroke(width = 3.dp.toPx()),
-                    cornerRadius = CornerRadius(12.dp.toPx()),
+                .offset(x = visualOffset)
+                .width(width)
+                .height(88.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(if (selected) PastelMintCardBg else PastelAquaCardBg),
+        ) {
+            WaveformBars(
+                waveform = waveform,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 10.dp, vertical = 12.dp),
+                active = selected,
+            )
+            Text(
+                text = clip.id,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 10.dp, top = 7.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = if (selected) PastelMintText else DeepNavyDisplay,
+                maxLines = 1,
+            )
+            if (selected) {
+                Canvas(Modifier.matchParentSize()) {
+                    drawRoundRect(
+                        color = AccentRoyalBlue,
+                        style = Stroke(width = 3.dp.toPx()),
+                        cornerRadius = CornerRadius(12.dp.toPx()),
+                    )
+                }
+                TrimHandle(
+                    modifier = Modifier.align(Alignment.CenterStart),
+                    contentDescription = "Trim start of ${clip.id}",
+                    onDragStart = {
+                        originalSourceStartMs = clip.sourceStartMs
+                        originalSourceEndMs = clip.sourceEndMs
+                    },
+                    onDrag = { deltaPx ->
+                        val deltaMs = (deltaPx / (dpPerMs * density)).roundToLong()
+                        onTrim(
+                            (originalSourceStartMs + deltaMs)
+                                .coerceIn(0L, originalSourceEndMs - 1L),
+                            originalSourceEndMs,
+                        )
+                    },
+                )
+                TrimHandle(
+                    modifier = Modifier.align(Alignment.CenterEnd),
+                    contentDescription = "Trim end of ${clip.id}",
+                    onDragStart = {
+                        originalSourceStartMs = clip.sourceStartMs
+                        originalSourceEndMs = clip.sourceEndMs
+                    },
+                    onDrag = { deltaPx ->
+                        val deltaMs = (deltaPx / (dpPerMs * density)).roundToLong()
+                        onTrim(
+                            originalSourceStartMs,
+                            (originalSourceEndMs + deltaMs)
+                                .coerceIn(originalSourceStartMs + 1L, clip.source.sourceDurationOrEnd()),
+                        )
+                    },
                 )
             }
-            TrimHandle(
-                modifier = Modifier.align(Alignment.CenterStart),
-                contentDescription = "Trim start of ${clip.id}",
-                onDrag = { deltaPx ->
-                    val deltaMs = (deltaPx / (dpPerMs * density)).roundToLong()
-                    val sourceStart = (clip.sourceStartMs + deltaMs)
-                        .coerceIn(0L, clip.sourceEndMs - 1L)
-                    onTrim(sourceStart, clip.sourceEndMs)
-                },
-            )
-            TrimHandle(
-                modifier = Modifier.align(Alignment.CenterEnd),
-                contentDescription = "Trim end of ${clip.id}",
-                onDrag = { deltaPx ->
-                    val deltaMs = (deltaPx / (dpPerMs * density)).roundToLong()
-                    val sourceEnd = (clip.sourceEndMs + deltaMs)
-                        .coerceIn(clip.sourceStartMs + 1L, clip.source.sourceDurationOrEnd())
-                    onTrim(clip.sourceStartMs, sourceEnd)
-                },
-            )
         }
     }
 }
@@ -438,25 +504,30 @@ private fun TimelineClip(
 private fun TrimHandle(
     modifier: Modifier,
     contentDescription: String,
+    onDragStart: () -> Unit,
     onDrag: (Float) -> Unit,
 ) {
-    var delta by remember { mutableFloatStateOf(0f) }
+    val currentOnDragStart by rememberUpdatedState(onDragStart)
+    val currentOnDrag by rememberUpdatedState(onDrag)
     Box(
         modifier = modifier
             .size(width = 48.dp, height = 72.dp)
             .background(AccentRoyalBlue.copy(alpha = .9f), RoundedCornerShape(8.dp))
             .semantics { this.contentDescription = contentDescription }
             .pointerInput(contentDescription) {
+                var totalDragPx = 0f
                 detectHorizontalDragGestures(
-                    onDragStart = { delta = 0f },
+                    onDragStart = {
+                        totalDragPx = 0f
+                        currentOnDragStart()
+                    },
                     onHorizontalDrag = { change, amount ->
                         change.consume()
-                        delta += amount
-                        onDrag(delta)
-                        delta = 0f
+                        totalDragPx += amount
+                        currentOnDrag(totalDragPx)
                     },
-                    onDragEnd = { delta = 0f },
-                    onDragCancel = { delta = 0f },
+                    onDragEnd = { totalDragPx = 0f },
+                    onDragCancel = { totalDragPx = 0f },
                 )
             },
     )

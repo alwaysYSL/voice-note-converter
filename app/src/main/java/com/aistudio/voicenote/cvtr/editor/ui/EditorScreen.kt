@@ -100,6 +100,8 @@ internal fun EditorScreen(
             }
             EditorBottomActions(
                 session = state.session,
+                canUndo = state.canUndo,
+                canRedo = state.canRedo,
                 onIntent = onIntent,
                 onPickTrack = onPickTrack,
             )
