@@ -26,6 +26,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -170,7 +171,7 @@ class EditorFinalReviewStateTest {
             )
             val cacheFile = File(app.cacheDir, "processed_audio/${key.toFilename()}.pcm")
             cacheFile.parentFile?.mkdirs()
-            writeCanonicalWav(cacheFile, 48)
+            writeCanonicalWav(cacheFile, 48_000)
             scheduler.emitSuccess(
                 request.id,
                 Data.Builder()
@@ -410,10 +411,10 @@ class EditorFinalReviewStateTest {
         data class Request(val id: UUID, val workRequest: OneTimeWorkRequest)
 
         private val requests = MutableSharedFlow<Request>(replay = 8)
-        private val observations = mutableMapOf<UUID, MutableSharedFlow<WorkInfo?>>()
+        private val observations = java.util.concurrent.ConcurrentHashMap<UUID, MutableStateFlow<WorkInfo?>>()
 
         override fun enqueueUnique(uniqueName: String, request: OneTimeWorkRequest, replaceExisting: Boolean): UUID {
-            observations[request.id] = MutableSharedFlow(replay = 1)
+            observations[request.id] = MutableStateFlow(null)
             requests.tryEmit(Request(request.id, request))
             return request.id
         }
@@ -425,7 +426,7 @@ class EditorFinalReviewStateTest {
         suspend fun awaitRequest(): Request = withTimeout(5_000L) { requests.replayCache.lastOrNull() ?: requests.first() }
 
         suspend fun emitSuccess(id: UUID, output: Data) {
-            observations[id]?.emit(WorkInfo(id, WorkInfo.State.SUCCEEDED, emptySet(), output))
+            observations[id]?.value = WorkInfo(id, WorkInfo.State.SUCCEEDED, emptySet(), output)
         }
     }
 }

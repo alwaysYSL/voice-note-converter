@@ -37,6 +37,7 @@ import com.aistudio.voicenote.cvtr.editor.audio.EditorPreviewEngine
 import com.aistudio.voicenote.cvtr.editor.audio.MediaCodecPcmSourceReaderFactory
 import com.aistudio.voicenote.cvtr.editor.audio.EditorRenderManifest
 import com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength
+import com.aistudio.voicenote.cvtr.editor.audio.EDITOR_SAMPLE_RATE
 import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioKey
 import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioCache
 import com.aistudio.voicenote.cvtr.editor.cache.readValidatedCachedWav
@@ -849,6 +850,20 @@ internal class EditorViewModel(
         val availability = try {
             inspectDraftSources(loaded)
         } catch (error: CancellationException) {
+            // Cancellation must not leave the synchronous gate latched. Any persisted cleanup
+            // result remains explicitly recoverable until a later draft load can validate it.
+            val recoveryIds = loaded.session.cleanupCacheClipIds()
+            _uiState.update {
+                it.copy(
+                    cleanupInspectionPending = false,
+                    effectRecoveryClipIds = recoveryIds,
+                    sourceError = if (recoveryIds.isEmpty()) {
+                        "Draft cleanup validation cancelled"
+                    } else {
+                        "Draft cleanup cache validation cancelled"
+                    },
+                )
+            }
             throw error
         } catch (_: Throwable) {
             // Keep the draft open, but make every persisted cleanup result recoverable instead
@@ -938,7 +953,8 @@ internal class EditorViewModel(
             algorithmVersion = algorithm,
         ).toFilename()
         if (key != expectedKey) return true
-        val expectedFrames = (clip.sourceEndMs - clip.sourceStartMs).coerceAtLeast(0L) * 48L / 1_000L
+        val expectedFrames = (clip.sourceEndMs - clip.sourceStartMs).coerceAtLeast(0L) *
+            EDITOR_SAMPLE_RATE.toLong() / 1_000L
         return runCatching {
             readValidatedCachedWav(File(processedCacheDir(), "$key.pcm"), expectedFrames)
         }.isFailure
@@ -1183,7 +1199,8 @@ internal class EditorViewModel(
             var ownedBatch = batch
             try {
                 val requiredBytes = batch.clips.sumOf { target ->
-                    val frames = (target.sourceEndMs - target.sourceStartMs).coerceAtLeast(0L) * 48L / 1_000L
+                    val frames = (target.sourceEndMs - target.sourceStartMs).coerceAtLeast(0L) *
+                        EDITOR_SAMPLE_RATE.toLong() / 1_000L
                     estimateRequiredBytes(frames, normalize)
                 }
                 if (processedCacheDir().usableSpace < requiredBytes) {
@@ -1321,7 +1338,8 @@ internal class EditorViewModel(
                     clip.sourceStartMs == target.sourceStartMs && clip.sourceEndMs == target.sourceEndMs &&
                     StableSourceFingerprint.compute(getApplication(), target.sourceUri, target.fingerprint) == target.fingerprint &&
                     completed[target.clipId]?.let { key ->
-                        val expected = (target.sourceEndMs - target.sourceStartMs).coerceAtLeast(0L) * 48L / 1_000L
+                        val expected = (target.sourceEndMs - target.sourceStartMs).coerceAtLeast(0L) *
+                            EDITOR_SAMPLE_RATE.toLong() / 1_000L
                         runCatching {
                             readValidatedCachedWav(File(processedCacheDir(), "$key.pcm"), expected)
                         }.isSuccess
@@ -1573,7 +1591,7 @@ internal class EditorViewModel(
             .flatMap { it.clips.asSequence() }
             .map { it.timelineEndMs.coerceAtLeast(0L) }
             .maxOrNull() ?: return false
-        return durationMs * 48L / 1_000L > 0L
+        return durationMs * EDITOR_SAMPLE_RATE.toLong() / 1_000L > 0L
     }
 
     private fun Throwable.rethrowIfFatal() {

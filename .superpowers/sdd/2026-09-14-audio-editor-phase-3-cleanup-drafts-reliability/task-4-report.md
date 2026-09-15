@@ -78,3 +78,25 @@ Verification:
   environment.
 
 Residual risk: final Gradle test/build evidence still requires the configured SDK/NDK toolchain.
+
+## Final cleanup-inspection completion pass
+
+- Corrected ViewModel cache sample-count validation and storage estimation to use the editor's
+  48 kHz sample rate. The cleanup-before-save regression now accepts the canonical one-second
+  output instead of silently transitioning to `FAILED` and timing out while waiting for success.
+- Draft cleanup inspection now clears its synchronous pending gate on cancellation as well as
+  success/failure, retaining persisted cleanup clip IDs and a recovery error for the next load.
+- Made the final-review scheduler fake replay terminal work state deterministically and aligned its
+  recovery fixture with the canonical 48 kHz output so the test is independent of suite order.
+
+Verification:
+
+- `git diff --check` — passed.
+- Isolated `EditorFinalReviewStateTest.cleanup before save keeps cache key across private promotion and reopen` —
+  blocked before test execution by the host's missing Android NDK (`NdkLocatorKt.getNdkVersionedFolders`).
+- Full `EditorFinalReviewStateTest` and focused ViewModel/cache/worker filters — same NDK configuration
+  blocker; no test task was started.
+- `:app:assembleDebug` — same NDK configuration blocker; production changes require rerun in a
+  provisioned Android environment.
+
+Residual risk: Gradle test and assemble evidence remains pending the configured SDK/NDK toolchain.
