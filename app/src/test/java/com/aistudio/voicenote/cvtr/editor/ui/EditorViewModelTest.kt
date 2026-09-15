@@ -3,8 +3,15 @@ package com.aistudio.voicenote.cvtr.editor.ui
 import android.app.Application
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
+import androidx.work.OneTimeWorkRequest
+import androidx.work.WorkInfo
+import com.aistudio.voicenote.cvtr.editor.work.EditorExportWork
+import java.util.UUID
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.CompletableDeferred
@@ -191,6 +198,27 @@ class EditorViewModelTest {
         )
     }
 
+    @Test
+    fun `rapid double export start enqueues one stable unique attempt`() = runBlocking {
+        val scheduler = RecordingExportScheduler()
+        val vm = editorViewModel(
+            EditorLaunchSource.Converted(Uri.parse("content://media/result.ogg"), null, "voice.ogg"),
+            exportScheduler = scheduler,
+        )
+        vm.awaitReady()
+
+        vm.dispatch(EditorIntent.StartExport)
+        vm.dispatch(EditorIntent.StartExport)
+        scheduler.awaitFirst()
+
+        assertEquals(1, scheduler.uniqueRequests.size)
+        assertTrue(scheduler.uniqueNames.single().startsWith("editor.export."))
+        assertEquals(
+            scheduler.uniqueNames.single(),
+            EditorExportWork.uniqueWorkName(scheduler.uniqueRequests.single().workSpec.input.getString(EditorExportWork.EXPORT_ATTEMPT_ID)!!),
+        )
+    }
+
     private suspend fun awaitTrackCount(vm: EditorViewModel, count: Int) {
         withTimeout(5_000L) {
             while (vm.uiState.value.session.tracks.size < count) delay(10L)
@@ -199,7 +227,8 @@ class EditorViewModelTest {
 
     private fun editorViewModel(
         source: EditorLaunchSource,
-        durationMs: Long = 10_000L
+        durationMs: Long = 10_000L,
+        exportScheduler: EditorExportScheduler = RecordingExportScheduler(),
     ): EditorViewModel = EditorViewModel(
         application = app,
         launchSource = source,
@@ -209,6 +238,34 @@ class EditorViewModelTest {
                 durationMs = if (uri.toString().contains("long")) 30_000L else durationMs
             )
         },
-        waveformLoader = { emptyList() }
+        waveformLoader = { emptyList() },
+        exportScheduler = exportScheduler,
     )
+
+    private class RecordingExportScheduler : EditorExportScheduler {
+        val uniqueNames = mutableListOf<String>()
+        val uniqueRequests = mutableListOf<OneTimeWorkRequest>()
+        private val firstEnqueue = CompletableDeferred<Unit>()
+
+        override fun enqueue(request: OneTimeWorkRequest): UUID {
+            uniqueRequests += request
+            return request.id
+        }
+
+        override fun enqueueUnique(
+            uniqueName: String,
+            request: OneTimeWorkRequest,
+            replaceExisting: Boolean,
+        ): UUID {
+            uniqueNames += uniqueName
+            uniqueRequests += request
+            firstEnqueue.complete(Unit)
+            return request.id
+        }
+
+        override fun cancel(id: UUID) = Unit
+        override fun observe(id: UUID): Flow<WorkInfo?> = emptyFlow()
+
+        suspend fun awaitFirst() = withTimeout(5_000L) { firstEnqueue.await() }
+    }
 }

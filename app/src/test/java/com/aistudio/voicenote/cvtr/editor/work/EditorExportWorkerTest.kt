@@ -19,6 +19,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.junit.Assert.assertThrows
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -41,6 +42,13 @@ class EditorExportWorkerTest {
             assertTrue(restored.renderSession.tracks.isNotEmpty())
         } finally {
             file.delete()
+        }
+    }
+
+    @Test
+    fun `manifest rejects an empty timeline before any render`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            EditorRenderManifest.fromSession(EditorSession.empty())
         }
     }
 
@@ -79,6 +87,19 @@ class EditorExportWorkerTest {
         assertTrue(failedStorage.partial.isEmpty())
         assertTrue(failedStorage.published.isEmpty())
         assertTrue(failedHistory.rows.isEmpty())
+    }
+
+    @Test
+    fun `retrying the same export attempt reuses its published output and history`() = runBlocking {
+        val storage = FakeStorage()
+        val history = FakeHistory()
+        val snapshot = manifest()
+
+        assertTrue(runner(storage, history).run(snapshot, "mix.ogg", snapshot.preset) is EditorExportResult.Success)
+        assertTrue(runner(storage, history).run(snapshot, "mix.ogg", snapshot.preset) is EditorExportResult.Success)
+
+        assertEquals(1, history.rows.size)
+        assertEquals(1, storage.published.size)
     }
 
     private fun runner(
@@ -153,5 +174,7 @@ class EditorExportWorkerTest {
             return rows.size.toLong()
         }
         override suspend fun delete(id: Long) { rows.removeAt(id.toInt() - 1) }
+        override suspend fun findByExportAttemptId(attemptId: String): com.aistudio.voicenote.cvtr.data.local.ConversionHistory? =
+            rows.firstOrNull { it.editorExportAttemptId == attemptId }
     }
 }

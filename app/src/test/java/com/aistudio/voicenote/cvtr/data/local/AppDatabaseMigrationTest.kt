@@ -129,6 +129,7 @@ class AppDatabaseMigrationTest {
         try {
             val row = runBlocking { migrated.conversionHistoryDao().getById(9) }
             assertNull(row?.editorSourceHistoryId)
+            assertNull(row?.editorExportAttemptId)
         } finally {
             migrated.close()
         }

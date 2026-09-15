@@ -152,6 +152,9 @@ abstract class AppDatabase : RoomDatabase() {
                     "ALTER TABLE `conversion_history` ADD COLUMN `editorSourceHistoryId` INTEGER"
                 )
                 db.execSQL(
+                    "ALTER TABLE `conversion_history` ADD COLUMN `editorExportAttemptId` TEXT"
+                )
+                db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_conversion_history_createdAt` " +
                         "ON `conversion_history` (`createdAt`)"
                 )
@@ -170,6 +173,10 @@ abstract class AppDatabase : RoomDatabase() {
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_conversion_history_outputFileName` " +
                         "ON `conversion_history` (`outputFileName`)"
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_conversion_history_editorExportAttemptId` " +
+                        "ON `conversion_history` (`editorExportAttemptId`)"
                 )
             }
         }

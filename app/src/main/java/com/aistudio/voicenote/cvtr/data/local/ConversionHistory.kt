@@ -27,7 +27,8 @@ class DeliveryStatusConverter {
         Index(value = ["shareOpenedAt"]),
         Index(value = ["deliveryStatus"]),
         Index(value = ["originalFileName"]),
-        Index(value = ["outputFileName"])
+        Index(value = ["outputFileName"]),
+        Index(value = ["editorExportAttemptId"], unique = true),
     ]
 )
 data class ConversionHistory(
@@ -48,5 +49,7 @@ data class ConversionHistory(
     val confirmedSentAt: Long? = null,
     val pitchSemitones: Float? = null,
     /** Original history row when this item was produced by the editor. */
-    val editorSourceHistoryId: Long? = null
+    val editorSourceHistoryId: Long? = null,
+    /** Stable durable idempotency key for an editor export attempt. */
+    val editorExportAttemptId: String? = null,
 )

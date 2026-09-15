@@ -37,6 +37,12 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
+private fun Throwable.rethrowIfFatal() {
+    if (this is CancellationException || this is VirtualMachineError || this is ThreadDeath || this is LinkageError) {
+        throw this
+    }
+}
+
 /** Small seam around an encoder so export tests never need to load native libopus. */
 internal interface EditorExportEncoder : AutoCloseable {
     fun write(samples: ShortArray)
@@ -63,7 +69,25 @@ internal interface EditorExportStorage {
 internal interface EditorExportHistory {
     suspend fun insert(item: ConversionHistory): Long
     suspend fun delete(id: Long)
+
+    suspend fun findByExportAttemptId(attemptId: String): ConversionHistory? = null
+
+    /** Durable idempotent insert. The unique attempt id makes a process retry converge. */
+    suspend fun commit(item: ConversionHistory): EditorExportCommit {
+        findByExportAttemptId(item.editorExportAttemptId ?: return EditorExportCommit(insert(item), true))
+            ?.let { return EditorExportCommit(it.id, inserted = false) }
+        return try {
+            EditorExportCommit(insert(item), inserted = true)
+        } catch (error: Throwable) {
+            error.rethrowIfFatal()
+            findByExportAttemptId(item.editorExportAttemptId)?.let {
+                EditorExportCommit(it.id, inserted = false)
+            } ?: throw error
+        }
+    }
 }
+
+internal data class EditorExportCommit(val id: Long, val inserted: Boolean)
 
 internal sealed interface EditorExportResult {
     data class Success(
@@ -108,11 +132,30 @@ internal class EditorExportRunner(
                 canRetry = false,
             )
         }
+        if (manifest.timelineDurationFrames <= 0L || manifest.tracks.none { it.clips.isNotEmpty() }) {
+            return EditorExportResult.Failure(
+                message = "Editor timeline contains no rendered audio",
+                canRetry = false,
+            )
+        }
+
+        val existing = try {
+            history.findByExportAttemptId(manifest.exportAttemptId)
+        } catch (error: CancellationException) {
+            return EditorExportResult.Cancelled()
+        } catch (error: Throwable) {
+            error.rethrowIfFatal()
+            return EditorExportResult.Failure(error.message ?: "Could not inspect export history")
+        }
+        if (existing != null) {
+            return existingResult(existing)
+        }
         val renderer = try {
             rendererFactory(manifest)
         } catch (_: CancellationException) {
             return EditorExportResult.Cancelled()
         } catch (error: Throwable) {
+            error.rethrowIfFatal()
             return EditorExportResult.Failure(error.message ?: "Could not prepare renderer")
         }
         var partialFile: File? = null
@@ -120,6 +163,7 @@ internal class EditorExportRunner(
         var historyId: Long? = null
         var encoder: EditorExportEncoder? = null
         var finished = false
+        var historyCreatedByRun = false
         var cleanupWarning: String? = null
         var outcome: EditorExportResult? = null
 
@@ -161,68 +205,150 @@ internal class EditorExportRunner(
             checkActive()
             val durationSeconds = ceil(manifest.timelineDurationFrames / SAMPLE_RATE.toDouble())
                 .toInt()
-            historyId = history.insert(
-                ConversionHistory(
-                    originalFileName = manifest.sourceFileName,
-                    outputFileName = outputName,
-                    outputFilePath = publishedUri.toString(),
-                    durationSeconds = durationSeconds,
-                    fileSizeBytes = storage.sizeBytes(publishedUri),
-                    waveform = WaveformCodec.encode(emptyList()),
-                    bitrateKbps = preset.bitrateKbps,
-                    createdAt = System.currentTimeMillis(),
-                    editorSourceHistoryId = manifest.sourceHistoryId,
-                )
-            )
-            outcome = EditorExportResult.Success(
-                uri = publishedUri,
-                historyId = historyId,
-                outputName = outputName,
+            val item = ConversionHistory(
+                originalFileName = manifest.sourceFileName,
+                outputFileName = outputName,
+                outputFilePath = publishedUri.toString(),
                 durationSeconds = durationSeconds,
+                fileSizeBytes = storage.sizeBytes(publishedUri),
+                waveform = WaveformCodec.encode(emptyList()),
                 bitrateKbps = preset.bitrateKbps,
+                createdAt = System.currentTimeMillis(),
+                editorSourceHistoryId = manifest.sourceHistoryId,
+                editorExportAttemptId = manifest.exportAttemptId,
+            )
+            val committed = withContext(NonCancellable) {
+                val commit = history.commit(item)
+                // For a successful insert the DAO id is the durable capture; querying again
+                // would reopen a cancellation/process window after the row is committed.
+                val row = if (commit.inserted) {
+                    item.copy(id = commit.id)
+                } else {
+                    history.findByExportAttemptId(manifest.exportAttemptId)
+                        ?: error("Committed editor export history row is missing")
+                }
+                commit to row
+            }
+            historyId = committed.first.id
+            historyCreatedByRun = committed.first.inserted
+            checkActive()
+            val committedRow = committed.second
+            val resultUri = Uri.parse(committedRow.outputFilePath)
+            if (!committed.first.inserted) {
+                // A concurrent/process retry won the durable commit. Preserve its output and
+                // history row; only this run's output is eligible for cleanup.
+                check(storage.validatePublished(resultUri)) { "Existing export output is invalid" }
+                if (publishedUri != resultUri) {
+                    publishedUri?.let { ownUri ->
+                        cleanupWarning = cleanupWarning ?: safeDeletePublished(ownUri)
+                    }
+                    publishedUri = null
+                }
+            }
+            outcome = EditorExportResult.Success(
+                uri = resultUri,
+                historyId = committedRow.id,
+                outputName = committedRow.outputFileName,
+                durationSeconds = committedRow.durationSeconds,
+                bitrateKbps = committedRow.bitrateKbps,
+                cleanupWarning = cleanupWarning,
             )
         } catch (error: CancellationException) {
-            cleanupWarning = rollback(partialFile, publishedUri, historyId)
+            cleanupWarning = rollback(partialFile, publishedUri, historyId, historyCreatedByRun)
             outcome = EditorExportResult.Cancelled(cleanupWarning)
         } catch (error: Throwable) {
-            cleanupWarning = rollback(partialFile, publishedUri, historyId)
+            error.rethrowIfFatal()
+            cleanupWarning = rollback(partialFile, publishedUri, historyId, historyCreatedByRun)
             outcome = EditorExportResult.Failure(
                 message = error.message ?: "Editor export failed",
                 canRetry = true,
                 cleanupWarning = cleanupWarning,
             )
         } finally {
-            if (encoder != null) runCatching { encoder?.close() }
-            runCatching { renderer.close() }
-            if (outcome is EditorExportResult.Success) {
-                partialFile?.let {
-                    if (!storage.deletePartial(it)) {
-                        cleanupWarning = "Export partial cleanup could not be confirmed"
+            encoder?.let { cleanupWarning = cleanupWarning ?: safeClose(it, "encoder") }
+            renderer.let { cleanupWarning = cleanupWarning ?: safeClose(it, "renderer") }
+            if (outcome != null) {
+                if (outcome is EditorExportResult.Success) {
+                    partialFile?.let {
+                        cleanupWarning = cleanupWarning ?: safeDeletePartial(it)
                     }
                 }
-                if (cleanupWarning != null) {
-                    outcome = (outcome as EditorExportResult.Success).copy(cleanupWarning = cleanupWarning)
+                outcome = when (val result = outcome) {
+                    is EditorExportResult.Success -> result.copy(cleanupWarning = cleanupWarning)
+                    is EditorExportResult.Failure -> result.copy(cleanupWarning = cleanupWarning)
+                    is EditorExportResult.Cancelled -> result.copy(cleanupWarning = cleanupWarning)
+                    null -> null
                 }
             }
         }
         return outcome ?: EditorExportResult.Failure("Editor export did not produce a result")
     }
 
-    private suspend fun rollback(partial: File?, published: Uri?, historyId: Long?): String? =
+    private suspend fun rollback(
+        partial: File?,
+        published: Uri?,
+        historyId: Long?,
+        historyCreatedByRun: Boolean,
+    ): String? =
         withContext(NonCancellable) {
             val warnings = ArrayList<String>(3)
-            historyId?.let {
-                runCatching { history.delete(it) }
-                    .onFailure { warnings += "history cleanup failed" }
+            if (historyCreatedByRun) {
+                historyId?.let {
+                    safeDeleteHistory(it)?.let(warnings::add)
+                }
             }
             published?.let {
-                if (!storage.deletePublished(it)) warnings += "published output cleanup failed"
+                cleanupWarning(storage.deletePublished(it), "published output cleanup failed")?.let(warnings::add)
             }
             partial?.let {
-                if (!storage.deletePartial(it)) warnings += "partial output cleanup failed"
+                cleanupWarning(storage.deletePartial(it), "partial output cleanup failed")?.let(warnings::add)
             }
             warnings.takeIf { it.isNotEmpty() }?.joinToString(", ")
         }
+
+    private fun existingResult(row: ConversionHistory): EditorExportResult {
+        val uri = Uri.parse(row.outputFilePath)
+        return try {
+            check(storage.validatePublished(uri)) { "Existing export output is invalid" }
+            EditorExportResult.Success(
+                uri = uri,
+                historyId = row.id,
+                outputName = row.outputFileName,
+                durationSeconds = row.durationSeconds,
+                bitrateKbps = row.bitrateKbps,
+            )
+        } catch (error: CancellationException) {
+            EditorExportResult.Cancelled()
+        } catch (error: Throwable) {
+            error.rethrowIfFatal()
+            EditorExportResult.Failure(error.message ?: "Existing export output is invalid")
+        }
+    }
+
+    private fun safeDeletePublished(uri: Uri): String? =
+        cleanupWarning(storage.deletePublished(uri), "published output cleanup failed")
+
+    private fun safeDeletePartial(file: File): String? =
+        cleanupWarning(storage.deletePartial(file), "Export partial cleanup could not be confirmed")
+
+    private fun safeClose(resource: AutoCloseable, label: String): String? = try {
+        resource.close()
+        null
+    } catch (error: Throwable) {
+        error.rethrowIfFatal()
+        "$label cleanup failed"
+    }
+
+    private fun cleanupWarning(success: Boolean, message: String): String? =
+        if (success) null else message
+
+    private suspend fun safeDeleteHistory(id: Long): String? = try {
+        history.delete(id)
+        null
+    } catch (error: Throwable) {
+        error.rethrowIfFatal()
+        "history cleanup failed"
+    }
 
     private companion object {
         const val RENDER_CHUNK_FRAMES = 1_920
@@ -242,13 +368,20 @@ internal class EditorExportWorker(
         val manifest = try {
             EditorRenderManifest.readValidated(file)
         } catch (error: Throwable) {
+            error.rethrowIfFatal()
             file.delete()
             return failure(error.message ?: "Editor manifest is invalid", canRetry = false)
+        }
+        val requestedAttemptId = inputData.getString(EditorExportWork.EXPORT_ATTEMPT_ID)
+        if (requestedAttemptId != null && requestedAttemptId != manifest.exportAttemptId) {
+            file.delete()
+            return failure("Editor export attempt does not match its manifest", canRetry = false)
         }
         val requestedPreset = EditorExportWork.preset(inputData)
         try {
             setForeground(createForegroundInfo(inputData.getString(EditorExportWork.OUTPUT_NAME).orEmpty()))
         } catch (error: Throwable) {
+            error.rethrowIfFatal()
             file.delete()
             return failure(error.message ?: "Editor export cannot start in background", canRetry = true)
         }
@@ -257,7 +390,9 @@ internal class EditorExportWorker(
             encoderFactory = dependencies.encoderFactory,
             storage = dependencies.storage,
             history = dependencies.history,
-            workId = id.toString(),
+            // The attempt id survives WorkManager process recreation, unlike a transient worker
+            // instance. This also makes any unfinished private partial path deterministic.
+            workId = manifest.exportAttemptId,
         )
         return try {
             when (val result = runner.run(
@@ -397,6 +532,8 @@ private class RoomEditorExportHistory(
 ) : EditorExportHistory {
     override suspend fun insert(item: ConversionHistory): Long = dao.insert(item)
     override suspend fun delete(id: Long) = dao.deleteById(id)
+    override suspend fun findByExportAttemptId(attemptId: String): ConversionHistory? =
+        dao.getByEditorExportAttemptId(attemptId)
 }
 
 private class AndroidEditorExportStorage(
@@ -424,12 +561,18 @@ private class AndroidEditorExportStorage(
                 }
                 hasOgg && hasOpus
             }
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
+            error.rethrowIfFatal()
             false
         }
     }
 
-    override fun sizeBytes(uri: Uri): Long = runCatching { open(uri).use { input -> input.countBytes() } }.getOrDefault(0L)
+    override fun sizeBytes(uri: Uri): Long = try {
+        open(uri).use { input -> input.countBytes() }
+    } catch (error: Throwable) {
+        error.rethrowIfFatal()
+        0L
+    }
 
     override fun deletePublished(uri: Uri): Boolean = VoiceNoteStorage.deleteFromStorage(context, uri.toString())
 

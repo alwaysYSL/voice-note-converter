@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Observer
 import androidx.lifecycle.viewModelScope
 import androidx.work.OneTimeWorkRequest
+import androidx.work.ExistingWorkPolicy
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import com.aistudio.voicenote.cvtr.audio.VoiceNoteConverter
@@ -112,10 +113,17 @@ internal data class EditorExportUiState(
     val error: String? = null,
     val canRetry: Boolean = false,
     val cleanupWarning: String? = null,
+    val exportAttemptId: String? = null,
 )
 
 internal interface EditorExportScheduler {
     fun enqueue(request: OneTimeWorkRequest): UUID
+    /** Enqueue once for a durable attempt key; test seams may use the basic enqueue fallback. */
+    fun enqueueUnique(
+        uniqueName: String,
+        request: OneTimeWorkRequest,
+        replaceExisting: Boolean = false,
+    ): UUID = enqueue(request)
     fun cancel(id: UUID)
     fun observe(id: UUID): Flow<WorkInfo?>
 }
@@ -125,6 +133,18 @@ private class WorkManagerEditorExportScheduler(
 ) : EditorExportScheduler {
     override fun enqueue(request: OneTimeWorkRequest): UUID {
         workManager.enqueue(request)
+        return request.id
+    }
+    override fun enqueueUnique(
+        uniqueName: String,
+        request: OneTimeWorkRequest,
+        replaceExisting: Boolean,
+    ): UUID {
+        workManager.beginUniqueWork(
+            uniqueName,
+            if (replaceExisting) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP,
+            request,
+        ).enqueue()
         return request.id
     }
     override fun cancel(id: UUID) {
@@ -217,6 +237,8 @@ internal class EditorViewModel(
     private var exportObservationJob: Job? = null
     private var exportWorkId: UUID? = null
     private var editorSourceHistoryId: Long? = null
+    private val exportGate = Any()
+    private var exportEnqueueInFlight = false
 
     init {
         viewModelScope.launch {
@@ -488,12 +510,32 @@ internal class EditorViewModel(
         }
     }
 
-    private fun startExport() {
-        val current = _uiState.value
-        if (current.export.status == EditorExportStatus.QUEUED ||
-            current.export.status == EditorExportStatus.RUNNING ||
-            current.session.tracks.isEmpty()
-        ) return
+    private fun startExport(
+        requestedAttemptId: String? = null,
+        replaceExisting: Boolean = false,
+    ) {
+        val current: EditorUiState
+        val exportAttemptId: String
+        synchronized(exportGate) {
+            current = _uiState.value
+            if (exportEnqueueInFlight ||
+                current.export.status == EditorExportStatus.QUEUED ||
+                current.export.status == EditorExportStatus.RUNNING
+            ) return
+            if (!hasRenderableAudio(current.session)) {
+                _uiState.update {
+                    it.copy(export = it.export.copy(
+                        status = EditorExportStatus.FAILED,
+                        error = "Editor timeline contains no rendered audio",
+                        canRetry = false,
+                        progress = 0f,
+                    ))
+                }
+                return
+            }
+            exportEnqueueInFlight = true
+            exportAttemptId = requestedAttemptId ?: UUID.randomUUID().toString()
+        }
         viewModelScope.launch(Dispatchers.IO) {
             var manifest: File? = null
             try {
@@ -503,15 +545,29 @@ internal class EditorViewModel(
                     session = current.session,
                     sourceHistoryId = editorSourceHistoryId,
                     preset = preset,
+                    exportAttemptId = exportAttemptId,
                 )
                 val request = EditorExportWork.request(
                     manifestPath = manifest.absolutePath,
                     outputName = current.export.outputName.ifBlank { defaultExportName(current.session) },
                     preset = preset,
+                    exportAttemptId = exportAttemptId,
                 )
-                val id = exportScheduler.enqueue(request)
+                val id = exportScheduler.enqueueUnique(
+                    uniqueName = EditorExportWork.uniqueWorkName(exportAttemptId),
+                    request = request,
+                    replaceExisting = replaceExisting,
+                )
                 exportWorkId = id
-                _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.QUEUED, error = null, canRetry = false, progress = 0f)) }
+                _uiState.update {
+                    it.copy(export = it.export.copy(
+                        status = EditorExportStatus.QUEUED,
+                        error = null,
+                        canRetry = false,
+                        progress = 0f,
+                        exportAttemptId = exportAttemptId,
+                    ))
+                }
                 observeExport(id)
             } catch (error: CancellationException) {
                 manifest?.delete()
@@ -521,6 +577,8 @@ internal class EditorViewModel(
                 _uiState.update {
                     it.copy(export = it.export.copy(status = EditorExportStatus.FAILED, error = error.message ?: "Export failed", canRetry = true))
                 }
+            } finally {
+                synchronized(exportGate) { exportEnqueueInFlight = false }
             }
         }
     }
@@ -574,8 +632,11 @@ internal class EditorViewModel(
 
     private fun retryExport() {
         if (_uiState.value.export.canRetry || _uiState.value.export.status == EditorExportStatus.CANCELLED) {
+            val previousAttemptId = _uiState.value.export.exportAttemptId
             _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.IDLE, error = null, progress = 0f)) }
-            startExport()
+            // Reuse a terminal attempt key with REPLACE so an uncertain process-retry that
+            // already committed history converges instead of creating a second export.
+            startExport(previousAttemptId, replaceExisting = previousAttemptId != null)
         }
     }
 
@@ -593,6 +654,15 @@ internal class EditorViewModel(
             .maxOrNull()?.times(48L) ?: 0L
         val bitrate = if (preset == com.aistudio.voicenote.cvtr.editor.model.ExportPreset.HIGH_QUALITY_64) 64_000L else 32_000L
         return frames * bitrate / 48_000L / 8L + 512L
+    }
+
+    private fun hasRenderableAudio(session: EditorSession): Boolean {
+        if (session.tracks.none { it.clips.isNotEmpty() }) return false
+        val durationMs = session.tracks.asSequence()
+            .flatMap { it.clips.asSequence() }
+            .map { it.timelineEndMs.coerceAtLeast(0L) }
+            .maxOrNull() ?: return false
+        return durationMs * 48L / 1_000L > 0L
     }
 
     private fun seek(positionMs: Long) {

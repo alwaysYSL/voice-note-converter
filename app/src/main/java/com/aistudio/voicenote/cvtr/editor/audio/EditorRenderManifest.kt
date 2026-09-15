@@ -11,9 +11,11 @@ import com.aistudio.voicenote.cvtr.editor.model.MAX_TIMELINE_MS
 import com.aistudio.voicenote.cvtr.editor.model.TimelineOperations
 import com.aistudio.voicenote.cvtr.editor.model.TimelineResult
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.util.Collections
 import java.util.UUID
 import org.json.JSONArray
@@ -30,6 +32,7 @@ internal data class EditorRenderManifest(
     val preset: ExportPreset,
     val sourceHistoryId: Long? = null,
     val sourceFileName: String = "voice_note",
+    val exportAttemptId: String = UUID.randomUUID().toString(),
 ) {
     val renderSession: EditorSession = EditorSession(
         id = sessionId,
@@ -46,8 +49,11 @@ internal data class EditorRenderManifest(
 
     init {
         require(sessionId.isNotBlank()) { "Manifest session id must not be blank" }
-        require(timelineDurationFrames >= 0L) { "Manifest duration must not be negative" }
+        require(timelineDurationFrames > 0L) { "Manifest must contain rendered audio frames" }
         require(tracks.size <= 5) { "Manifest contains too many tracks" }
+        require(tracks.any { it.clips.isNotEmpty() }) { "Manifest must contain at least one clip" }
+        require(sourceHistoryId == null || sourceHistoryId > 0L) { "Manifest source history id is invalid" }
+        require(exportAttemptId.isNotBlank()) { "Manifest export attempt id must not be blank" }
     }
 
     fun writeTo(target: File) {
@@ -55,15 +61,20 @@ internal data class EditorRenderManifest(
         target.parentFile?.let { parent -> require(parent.exists() || parent.mkdirs()) { "Cannot create manifest directory" } }
         val temporary = File(target.parentFile ?: File("."), ".${target.name}.${UUID.randomUUID()}.tmp")
         try {
-            temporary.writeText(toJson().toString(), StandardCharsets.UTF_8)
-            try {
-                Files.move(
-                    temporary.toPath(),
-                    target.toPath(),
-                    StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING,
-                )
-            } catch (_: Exception) {
+            FileOutputStream(temporary).use { output ->
+                OutputStreamWriter(output, StandardCharsets.UTF_8).use { writer ->
+                    writer.write(toJson().toString())
+                    writer.flush()
+                    output.fd.sync()
+                }
+            }
+            // Manifest targets are UUID-named private files, so renameTo is atomic on the
+            // filesystem used by Android. The delete/rename fallback only serves callers that
+            // intentionally reuse an existing target (for example, a test or recovery tool).
+            if (!temporary.renameTo(target)) {
+                if (target.exists()) {
+                    require(target.delete()) { "Cannot replace editor manifest" }
+                }
                 require(temporary.renameTo(target)) { "Cannot publish editor manifest" }
             }
         } finally {
@@ -78,6 +89,7 @@ internal data class EditorRenderManifest(
         put(KEY_DURATION_FRAMES, timelineDurationFrames)
         put(KEY_SOURCE_HISTORY_ID, sourceHistoryId ?: JSONObject.NULL)
         put(KEY_SOURCE_FILE_NAME, sourceFileName)
+        put(KEY_EXPORT_ATTEMPT_ID, exportAttemptId)
         put(KEY_TRACKS, JSONArray().also { tracksArray ->
             tracks.forEach { track ->
                 tracksArray.put(JSONObject().apply {
@@ -101,6 +113,7 @@ internal data class EditorRenderManifest(
         private const val KEY_DURATION_FRAMES = "timelineDurationFrames"
         private const val KEY_SOURCE_HISTORY_ID = "sourceHistoryId"
         private const val KEY_SOURCE_FILE_NAME = "sourceFileName"
+        private const val KEY_EXPORT_ATTEMPT_ID = "exportAttemptId"
         private const val KEY_TRACKS = "tracks"
         private const val SAMPLE_RATE = 48_000L
 
@@ -108,6 +121,7 @@ internal data class EditorRenderManifest(
             session: EditorSession,
             sourceHistoryId: Long? = null,
             preset: ExportPreset = session.exportPreset,
+            exportAttemptId: String = UUID.randomUUID().toString(),
         ): EditorRenderManifest {
             val audioSession = session.copy(
                 selectedClipId = null,
@@ -133,16 +147,22 @@ internal data class EditorRenderManifest(
                     .map { it.name.trim() }
                     .firstOrNull { it.isNotEmpty() }
                     ?: "voice_note",
+                exportAttemptId = exportAttemptId,
             )
         }
 
         fun readValidated(file: File): EditorRenderManifest {
             require(file.isFile && file.canRead()) { "Editor manifest is unavailable" }
-            val json = JSONObject(file.readText(StandardCharsets.UTF_8))
+            val json = FileInputStream(file).use { input ->
+                InputStreamReader(input, StandardCharsets.UTF_8).use { it.readText() }
+            }.let(::JSONObject)
             require(json.optInt(KEY_VERSION, -1) == FORMAT_VERSION) { "Unsupported editor manifest version" }
             val sessionId = json.requiredString(KEY_SESSION_ID)
-            val preset = runCatching { ExportPreset.valueOf(json.requiredString(KEY_PRESET)) }
-                .getOrElse { error("Unsupported editor export preset") }
+            val preset = try {
+                ExportPreset.valueOf(json.requiredString(KEY_PRESET))
+            } catch (_: IllegalArgumentException) {
+                error("Unsupported editor export preset")
+            }
             val tracksJson = json.optJSONArray(KEY_TRACKS) ?: error("Manifest tracks are missing")
             val tracks = ArrayList<EditorTrack>(tracksJson.length())
             for (index in 0 until tracksJson.length()) {
@@ -161,18 +181,18 @@ internal data class EditorRenderManifest(
                     clips = clips,
                 )
             }
-            val sourceHistoryId = if (json.isNull(KEY_SOURCE_HISTORY_ID)) {
-                null
-            } else {
-                json.optLong(KEY_SOURCE_HISTORY_ID).takeIf { it > 0L }
-            }
+            val sourceHistoryId = json.optionalPositiveLong(KEY_SOURCE_HISTORY_ID)
             val requestedDuration = json.optLong(KEY_DURATION_FRAMES, -1L)
             require(requestedDuration >= 0L) { "Manifest duration is invalid" }
             val sourceFileName = json.optString(KEY_SOURCE_FILE_NAME, "").trim()
+            // Older v1 manifests predate the durable attempt key. Session id is stable for the
+            // one-shot snapshot and keeps an interrupted upgrade retry idempotent.
+            val exportAttemptId = json.optString(KEY_EXPORT_ATTEMPT_ID, "").ifBlank { "legacy-$sessionId" }
             val manifest = fromSession(
                 EditorSession(sessionId, tracks, exportPreset = preset),
                 sourceHistoryId = sourceHistoryId,
                 preset = preset,
+                exportAttemptId = exportAttemptId,
             ).copy(sourceFileName = sourceFileName.ifBlank { "voice_note" })
             require(manifest.timelineDurationFrames == requestedDuration) {
                 "Manifest duration does not match its clips"
@@ -185,11 +205,12 @@ internal data class EditorRenderManifest(
             session: EditorSession,
             sourceHistoryId: Long? = null,
             preset: ExportPreset = session.exportPreset,
+            exportAttemptId: String = UUID.randomUUID().toString(),
         ): File {
             val directory = File(context.filesDir, "editor/manifests")
             require(directory.exists() || directory.mkdirs()) { "Cannot create editor manifest directory" }
             val target = File(directory, "${session.id}-${UUID.randomUUID()}.json")
-            fromSession(session, sourceHistoryId, preset).writeTo(target)
+            fromSession(session, sourceHistoryId, preset, exportAttemptId).writeTo(target)
             return target
         }
 
@@ -201,6 +222,13 @@ internal data class EditorRenderManifest(
 
         private fun JSONObject.requiredString(key: String): String =
             optString(key, "").takeIf { it.isNotBlank() } ?: error("Manifest field $key is missing")
+
+        private fun JSONObject.optionalPositiveLong(key: String): Long? {
+            if (isNull(key)) return null
+            val value = opt(key)
+            require(value is Number) { "Manifest field $key is invalid" }
+            return value.toLong().also { require(it > 0L) { "Manifest field $key is invalid" } }
+        }
 
         private fun AudioClip.toJson(): JSONObject = JSONObject().apply {
             put("id", id)

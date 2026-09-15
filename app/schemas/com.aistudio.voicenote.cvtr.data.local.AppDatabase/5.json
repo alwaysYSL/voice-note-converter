@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 5,
-    "identityHash": "5b65ad213cb3c793de23e0d155927459",
+    "identityHash": "4716ee954ae90f2d96284f508ff61a1d",
     "entities": [
       {
         "tableName": "conversion_history",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `originalFileName` TEXT NOT NULL, `outputFileName` TEXT NOT NULL, `outputFilePath` TEXT NOT NULL, `durationSeconds` INTEGER NOT NULL, `fileSizeBytes` INTEGER NOT NULL, `waveform` TEXT NOT NULL, `bitrateKbps` INTEGER NOT NULL, `trimStartMs` INTEGER, `trimEndMs` INTEGER, `createdAt` INTEGER NOT NULL, `deliveryStatus` TEXT NOT NULL, `deliveryTarget` TEXT, `shareOpenedAt` INTEGER, `confirmedSentAt` INTEGER, `pitchSemitones` REAL, `editorSourceHistoryId` INTEGER)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `originalFileName` TEXT NOT NULL, `outputFileName` TEXT NOT NULL, `outputFilePath` TEXT NOT NULL, `durationSeconds` INTEGER NOT NULL, `fileSizeBytes` INTEGER NOT NULL, `waveform` TEXT NOT NULL, `bitrateKbps` INTEGER NOT NULL, `trimStartMs` INTEGER, `trimEndMs` INTEGER, `createdAt` INTEGER NOT NULL, `deliveryStatus` TEXT NOT NULL, `deliveryTarget` TEXT, `shareOpenedAt` INTEGER, `confirmedSentAt` INTEGER, `pitchSemitones` REAL, `editorSourceHistoryId` INTEGER, `editorExportAttemptId` TEXT)",
         "fields": [
           {
             "fieldPath": "id",
@@ -102,6 +102,11 @@
             "fieldPath": "editorSourceHistoryId",
             "columnName": "editorSourceHistoryId",
             "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "editorExportAttemptId",
+            "columnName": "editorExportAttemptId",
+            "affinity": "TEXT"
           }
         ],
         "primaryKey": {
@@ -155,13 +160,22 @@
             ],
             "orders": [],
             "createSql": "CREATE INDEX IF NOT EXISTS `index_conversion_history_outputFileName` ON `${TABLE_NAME}` (`outputFileName`)"
+          },
+          {
+            "name": "index_conversion_history_editorExportAttemptId",
+            "unique": true,
+            "columnNames": [
+              "editorExportAttemptId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_conversion_history_editorExportAttemptId` ON `${TABLE_NAME}` (`editorExportAttemptId`)"
           }
         ]
       }
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '5b65ad213cb3c793de23e0d155927459')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '4716ee954ae90f2d96284f508ff61a1d')"
     ]
   }
 }
