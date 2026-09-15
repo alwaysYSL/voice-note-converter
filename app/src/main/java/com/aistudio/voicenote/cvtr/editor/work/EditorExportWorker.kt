@@ -4,6 +4,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.ContentValues
 import android.content.ContentResolver
+import android.content.ContentUris
 import android.content.Context
 import android.net.Uri
 import android.content.pm.ServiceInfo
@@ -133,6 +134,7 @@ internal class EditorExportRunner(
     private val encoderFactory: EditorExportEncoderFactory,
     private val storage: EditorExportStorage,
     private val history: EditorExportHistory,
+    private val reservationStore: EditorExportReservationStore? = null,
     private val workId: String = UUID.randomUUID().toString(),
 ) {
     suspend fun run(
@@ -166,36 +168,38 @@ internal class EditorExportRunner(
         if (existing != null) {
             return existingResult(existing)
         }
+        val workingManifest = try {
+            if (manifest.reservedOutputName != null && manifest.reservedOutputUri != null) {
+                manifest
+            } else {
+                reservationStore?.reserve(manifest, requestedOutputName)?.let { identity ->
+                    manifest.copy(
+                        reservedOutputName = identity.name,
+                        reservedOutputUri = identity.uri,
+                    )
+                } ?: manifest
+            }
+        } catch (error: CancellationException) {
+            return EditorExportResult.Cancelled()
+        } catch (error: Throwable) {
+            error.rethrowIfFatal()
+            return EditorExportResult.Failure(error.message ?: "Could not reserve editor output")
+        }
+        return runReserved(workingManifest, requestedOutputName, preset, onProgress, isActive)
+    }
+
+    private suspend fun runReserved(
+        manifest: EditorRenderManifest,
+        requestedOutputName: String?,
+        preset: ExportPreset,
+        onProgress: suspend (completedFrames: Long, totalFrames: Long) -> Unit,
+        isActive: () -> Boolean,
+    ): EditorExportResult {
         val reservedUri = manifest.reservedOutputUri?.let(Uri::parse)
-        val recoveredUri = reservedUri?.let { uri ->
-            try {
-                if (!storage.validatePublished(uri)) {
-                    null
-                } else {
-                    check(storage.finalizeReserved(uri)) { "Reserved editor output could not be finalized" }
-                    uri
-                }
-            } catch (error: CancellationException) {
-                return EditorExportResult.Cancelled()
-            } catch (error: Throwable) {
-                error.rethrowIfFatal()
-                return EditorExportResult.Failure(error.message ?: "Reserved editor output is invalid")
-            }
-        }
-        val renderer = if (recoveredUri == null) {
-            try {
-                rendererFactory(manifest)
-            } catch (_: CancellationException) {
-                return EditorExportResult.Cancelled()
-            } catch (error: Throwable) {
-                error.rethrowIfFatal()
-                return EditorExportResult.Failure(error.message ?: "Could not prepare renderer")
-            }
-        } else {
-            null
-        }
+        var recoveredUri: Uri? = null
+        var renderer: TimelineRenderer? = null
         var partialFile: File? = null
-        var publishedUri: Uri? = null
+        var publishedUri: Uri? = reservedUri
         var historyId: Long? = null
         var encoder: EditorExportEncoder? = null
         var finished = false
@@ -209,6 +213,15 @@ internal class EditorExportRunner(
 
         try {
             checkActive()
+            recoveredUri = reservedUri?.let { uri ->
+                if (!storage.validatePublished(uri)) {
+                    null
+                } else {
+                    check(storage.finalizeReserved(uri)) { "Reserved editor output could not be finalized" }
+                    uri
+                }
+            }
+            renderer = if (recoveredUri == null) rendererFactory(manifest) else null
             val outputName = manifest.reservedOutputName
                 ?: storage.resolveOutputName(requestedOutputName, manifest)
             if (recoveredUri != null) {
@@ -414,7 +427,7 @@ internal class EditorExportRunner(
     }
 
     private companion object {
-        const val RENDER_CHUNK_FRAMES = 1_920
+        const val RENDER_CHUNK_FRAMES = 960
         const val SAMPLE_RATE = 48_000L
     }
 }
@@ -463,6 +476,7 @@ internal class EditorExportWorker(
             encoderFactory = dependencies.encoderFactory,
             storage = dependencies.storage,
             history = dependencies.history,
+            reservationStore = dependencies.reservation,
             // The attempt id survives WorkManager process recreation, unlike a transient worker
             // instance. This also makes any unfinished private partial path deterministic.
             workId = manifest.exportAttemptId,
@@ -554,6 +568,7 @@ internal class EditorExportWorker(
         val encoderFactory: EditorExportEncoderFactory,
         val storage: EditorExportStorage,
         val history: EditorExportHistory,
+        val reservation: EditorExportReservationStore,
     ) {
         companion object {
             fun production(context: Context): Dependencies = Dependencies(
@@ -591,6 +606,7 @@ internal class EditorExportWorker(
                 },
                 storage = AndroidEditorExportStorage(context),
                 history = RoomEditorExportHistory(AppDatabase.getDatabase(context).conversionHistoryDao()),
+                reservation = AndroidEditorExportReservationStore(context),
             )
         }
     }
@@ -698,11 +714,13 @@ internal class AndroidEditorExportStorage(
     ): EditorExportOutputIdentity {
         val requested = safeExportName(requestedName, manifest)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            findMediaStoreReservation(manifest.exportAttemptId)?.let { return it }
             val values = ContentValues().apply {
                 put(MediaStore.Audio.Media.DISPLAY_NAME, requested)
                 put(MediaStore.Audio.Media.MIME_TYPE, "audio/ogg")
                 put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/VoiceNoteConverter")
                 put(MediaStore.Audio.Media.IS_PENDING, 1)
+                put(MEDIASTORE_DESCRIPTION, reservationMarker(manifest.exportAttemptId))
             }
             val uri = context.contentResolver.insert(
                 MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
@@ -714,16 +732,65 @@ internal class AndroidEditorExportStorage(
         @Suppress("DEPRECATION")
         val directory = VoiceNoteStorage.getStorageFolder()
         check(directory.exists() || directory.mkdirs()) { "Cannot create editor output directory" }
+        val marker = reservationMarkerFile(manifest.exportAttemptId)
+        if (marker.isFile) {
+            val candidate = marker.readText(Charsets.UTF_8).trim()
+            if (candidate.isNotBlank()) {
+                val file = File(directory, candidate)
+                if (file.exists() || file.createNewFile()) {
+                    return EditorExportOutputIdentity(candidate, Uri.fromFile(file).toString())
+                }
+            }
+        }
         var candidate = requested
         var suffix = 1
         while (true) {
             val file = File(directory, candidate)
             if (file.createNewFile()) {
+                check(marker.parentFile?.exists() == true || marker.parentFile?.mkdirs() == true) {
+                    "Cannot create editor reservation marker"
+                }
+                FileOutputStream(marker).use { it.write(candidate.toByteArray(Charsets.UTF_8)) }
                 return EditorExportOutputIdentity(candidate, Uri.fromFile(file).toString())
             }
             val stem = requested.removeSuffix(".ogg")
             candidate = "${stem.take(71)}_${suffix++}.ogg"
         }
+    }
+
+    private fun findMediaStoreReservation(attemptId: String): EditorExportOutputIdentity? {
+        val marker = reservationMarker(attemptId)
+        val projection = arrayOf(
+            MediaStore.MediaColumns._ID,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+        )
+        return context.contentResolver.query(
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+            projection,
+            "$MEDIASTORE_DESCRIPTION = ?",
+            arrayOf(marker),
+            null,
+        )?.use { cursor ->
+            if (!cursor.moveToFirst()) return@use null
+            val id = cursor.getLong(0)
+            val name = cursor.getString(1).orEmpty().ifBlank { "voice_note.ogg" }
+            EditorExportOutputIdentity(
+                name = name,
+                uri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id).toString(),
+            )
+        }
+    }
+
+    private fun reservationMarkerFile(attemptId: String): File {
+        val directory = File(context.filesDir, "editor/reservations")
+        return File(directory, "${attemptId.replace(Regex("[^A-Za-z0-9._-]"), "_")}.marker")
+    }
+
+    private fun reservationMarker(attemptId: String): String =
+        "VoiceNoteConverter editor export $attemptId"
+
+    private companion object {
+        const val MEDIASTORE_DESCRIPTION = "description"
     }
 
     private fun open(uri: Uri): InputStream {

@@ -6,8 +6,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.work.OneTimeWorkRequest
 import androidx.work.WorkInfo
 import com.aistudio.voicenote.cvtr.editor.work.EditorExportWork
-import com.aistudio.voicenote.cvtr.editor.work.EditorExportOutputIdentity
-import com.aistudio.voicenote.cvtr.editor.work.EditorExportReservationStore
+import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
@@ -219,6 +218,31 @@ class EditorViewModelTest {
             scheduler.uniqueNames.single(),
             EditorExportWork.uniqueWorkName(scheduler.uniqueRequests.single().workSpec.input.getString(EditorExportWork.EXPORT_ATTEMPT_ID)!!),
         )
+        assertTrue(scheduler.uniqueRequests.single().workSpec.input.getString(EditorExportWork.OUTPUT_URI).isNullOrBlank())
+    }
+
+    @Test
+    fun `queued export cancellation removes manifest without reserving public output`() = runBlocking {
+        val scheduler = RecordingExportScheduler()
+        val vm = editorViewModel(
+            EditorLaunchSource.Converted(Uri.parse("content://media/result.ogg"), null, "voice.ogg"),
+            exportScheduler = scheduler,
+        )
+        vm.awaitReady()
+
+        vm.dispatch(EditorIntent.StartExport)
+        scheduler.awaitFirst()
+        val request = scheduler.uniqueRequests.single()
+        val manifest = File(request.workSpec.input.getString(EditorExportWork.MANIFEST_PATH)!!)
+        assertTrue(manifest.exists())
+
+        vm.dispatch(EditorIntent.CancelExport)
+        withTimeout(5_000L) {
+            while (manifest.exists()) delay(10L)
+        }
+
+        assertTrue(request.workSpec.input.getString(EditorExportWork.OUTPUT_URI).isNullOrBlank())
+        assertFalse(manifest.exists())
     }
 
     private suspend fun awaitTrackCount(vm: EditorViewModel, count: Int) {
@@ -242,7 +266,6 @@ class EditorViewModelTest {
         },
         waveformLoader = { emptyList() },
         exportScheduler = exportScheduler,
-        exportReservation = TestExportReservationStore(),
     )
 
     private class RecordingExportScheduler : EditorExportScheduler {
@@ -270,14 +293,5 @@ class EditorViewModelTest {
         override fun observe(id: UUID): Flow<WorkInfo?> = emptyFlow()
 
         suspend fun awaitFirst() = withTimeout(5_000L) { firstEnqueue.await() }
-    }
-
-    private class TestExportReservationStore : EditorExportReservationStore {
-        override fun reserve(
-            manifest: com.aistudio.voicenote.cvtr.editor.audio.EditorRenderManifest,
-            requestedName: String?,
-        ): EditorExportOutputIdentity = EditorExportOutputIdentity("test.ogg", "file:///test.ogg")
-
-        override fun release(identity: EditorExportOutputIdentity): Boolean = true
     }
 }

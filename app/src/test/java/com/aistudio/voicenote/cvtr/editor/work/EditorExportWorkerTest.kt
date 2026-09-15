@@ -2,6 +2,7 @@ package com.aistudio.voicenote.cvtr.editor.work
 
 import com.aistudio.voicenote.cvtr.editor.audio.TimelineRenderer
 import com.aistudio.voicenote.cvtr.editor.audio.EditorRenderManifest
+import com.aistudio.voicenote.cvtr.editor.audio.MasterLimiter
 import com.aistudio.voicenote.cvtr.editor.model.AudioClip
 import com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef
 import com.aistudio.voicenote.cvtr.editor.model.ClipEffects
@@ -66,6 +67,38 @@ class EditorExportWorkerTest {
     }
 
     @Test
+    fun `export uses preview-equivalent 960 frame state boundaries`() = runBlocking {
+        val storage = FakeStorage()
+        val history = FakeHistory()
+        val starts = mutableListOf<Long>()
+        val counts = mutableListOf<Int>()
+        val limiter = MasterLimiter()
+        val runner = EditorExportRunner(
+            rendererFactory = { object : TimelineRenderer {
+                override fun render(session: EditorSession, startFrame: Long, frameCount: Int): ShortArray {
+                    starts += startFrame
+                    counts += frameCount
+                    limiter.process(FloatArray(frameCount) { 2f })
+                    return ShortArray(frameCount)
+                }
+
+                override fun invalidate(sourceIds: Set<String>) = Unit
+                override fun close() = Unit
+            } },
+            encoderFactory = { output, _, _ -> FakeEncoder(output) },
+            storage = storage,
+            history = history,
+            reservationStore = FakeReservationStore(storage),
+            workId = "chunk-equivalence",
+        )
+
+        assertTrue(runner.run(manifest(), "mix.ogg", ExportPreset.HIGH_QUALITY_64) is EditorExportResult.Success)
+        assertTrue(limiter.gainForTest < 1f)
+        assertEquals((0 until 50).map { it * 960L }, starts)
+        assertEquals(List(50) { 960 }, counts)
+    }
+
+    @Test
     fun `cancelled export removes partial and published output without history`() = runBlocking {
         val storage = FakeStorage()
         val history = FakeHistory()
@@ -106,10 +139,7 @@ class EditorExportWorkerTest {
     fun `retry after process death immediately after publish reuses reserved output`() = runBlocking {
         val storage = FakeStorage()
         storage.crashAfterCopyBeforeFinalize = true
-        val snapshot = manifest().copy(
-            reservedOutputName = "reserved.ogg",
-            reservedOutputUri = "file:///reserved.ogg",
-        )
+        val snapshot = manifest()
 
         assertThrows(SimulatedProcessDeath::class.java) {
             runBlocking { runner(storage, FakeHistory()).run(snapshot, "mix.ogg", snapshot.preset) }
@@ -165,6 +195,7 @@ class EditorExportWorkerTest {
         encoderFactory = { output, _, _ -> FakeEncoder(output) },
         storage = storage,
         history = history,
+        reservationStore = FakeReservationStore(storage),
         workId = "test-export",
     )
 
@@ -203,6 +234,7 @@ class EditorExportWorkerTest {
         private val directory = File(System.getProperty("java.io.tmpdir"), "editor-export-test-${java.util.UUID.randomUUID()}")
         val partial = mutableListOf<File>()
         val published = mutableListOf<java.net.URI>()
+        val reservations = mutableMapOf<String, EditorExportOutputIdentity>()
         val pending = mutableSetOf<java.net.URI>()
         val finalizedUris = mutableListOf<java.net.URI>()
         var crashAfterCopyBeforeFinalize = false
@@ -238,6 +270,20 @@ class EditorExportWorkerTest {
             validate && java.net.URI.create(uri.toString()) in published
         override fun deletePublished(uri: android.net.Uri): Boolean = published.remove(java.net.URI.create(uri.toString()))
         override fun deletePartial(file: File): Boolean = partial.remove(file) && file.delete()
+    }
+
+    private class FakeReservationStore(
+        private val storage: FakeStorage,
+    ) : EditorExportReservationStore {
+        override fun reserve(
+            manifest: EditorRenderManifest,
+            requestedName: String?,
+        ): EditorExportOutputIdentity = storage.reservations.getOrPut(manifest.exportAttemptId) {
+            EditorExportOutputIdentity("reserved.ogg", "file:///reserved.ogg")
+        }
+
+        override fun release(identity: EditorExportOutputIdentity): Boolean =
+            storage.deletePublished(android.net.Uri.parse(identity.uri))
     }
 
     private class FakeHistory(
