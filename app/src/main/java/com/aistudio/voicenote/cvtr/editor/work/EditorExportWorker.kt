@@ -151,6 +151,7 @@ internal class EditorExportRunner(
         preset: ExportPreset,
         onProgress: suspend (completedFrames: Long, totalFrames: Long) -> Unit = { _, _ -> },
         isActive: () -> Boolean = { true },
+        onReservationCleanupOwnership: () -> Unit = {},
     ): EditorExportResult {
         if (manifest.preset != preset) {
             return EditorExportResult.Failure(
@@ -196,6 +197,7 @@ internal class EditorExportRunner(
             error.rethrowIfFatal()
             return EditorExportResult.Failure(error.message ?: "Could not reserve editor output")
         }
+        onReservationCleanupOwnership()
         return runReserved(workingManifest, requestedOutputName, preset, onProgress, isActive)
     }
 
@@ -472,6 +474,16 @@ internal class EditorExportWorker(
         }
         val requestedOutputName = inputData.getString(EditorExportWork.OUTPUT_NAME)
         val requestedPreset = EditorExportWork.preset(inputData)
+        val existingHistory = try {
+            dependencies.history.findByExportAttemptId(manifest.exportAttemptId)
+        } catch (error: CancellationException) {
+            file.delete()
+            throw error
+        } catch (error: Throwable) {
+            error.rethrowIfFatal()
+            file.delete()
+            return failure(error.message ?: "Could not inspect export history", canRetry = true)
+        }
         try {
             setForeground(createForegroundInfo(inputData.getString(EditorExportWork.OUTPUT_NAME).orEmpty()))
         } catch (error: Throwable) {
@@ -485,8 +497,13 @@ internal class EditorExportWorker(
         // that platform behavior is unchanged and is keyed by the same attempt id.
         var resolvedIdentity: EditorExportOutputIdentity? = null
         var identityClaimed = false
+        var runnerAssumedCleanup = false
+        var exportResult: EditorExportResult? = null
+        var workerResult: Result? = null
         try {
-            if (manifest.reservedOutputName == null || manifest.reservedOutputUri == null) {
+            if (existingHistory == null &&
+                (manifest.reservedOutputName == null || manifest.reservedOutputUri == null)
+            ) {
                 val identity = dependencies.reservation.resolve(manifest, requestedOutputName)
                 resolvedIdentity = identity
                 manifest = manifest.copy(
@@ -521,7 +538,7 @@ internal class EditorExportWorker(
             workId = manifest.exportAttemptId,
         )
         return try {
-            when (val result = runner.run(
+            workerResult = when (val result = runner.run(
                 manifest = manifest,
                 requestedOutputName = requestedOutputName,
                 preset = requestedPreset,
@@ -535,8 +552,10 @@ internal class EditorExportWorker(
                     )
                 },
                 isActive = { !isStopped },
+                onReservationCleanupOwnership = { runnerAssumedCleanup = true },
             )) {
             is EditorExportResult.Success -> {
+                exportResult = result
                 setProgress(workDataOf(EditorExportWork.PROGRESS to 1f))
                 Result.success(
                     Data.Builder()
@@ -549,10 +568,30 @@ internal class EditorExportWorker(
                         .build()
                 )
             }
-            is EditorExportResult.Cancelled -> throw CancellationException("Editor export cancelled")
-            is EditorExportResult.Failure -> failure(result.message, result.canRetry, result.cleanupWarning)
+            is EditorExportResult.Cancelled -> {
+                exportResult = result
+                throw CancellationException("Editor export cancelled")
             }
+            is EditorExportResult.Failure -> {
+                exportResult = result
+                failure(result.message, result.canRetry, result.cleanupWarning)
+            }
+            }
+            workerResult
         } finally {
+            val identity = resolvedIdentity
+            val successOwnsIdentity = (exportResult as? EditorExportResult.Success)?.let { result ->
+                result.uri.toString() == identity?.uri || result.uri.toString() == identity?.finalUri
+            } == true
+            if (identityClaimed && identity != null && !runnerAssumedCleanup && !successOwnsIdentity) {
+                try {
+                    dependencies.reservation.release(identity)
+                } catch (error: Throwable) {
+                    error.rethrowIfFatal()
+                    // Preserve the primary worker result; cleanup failure is surfaced by the
+                    // runner for work it owns, while this handoff is best-effort before start.
+                }
+            }
             // A manifest is a one-shot private input. Retry creates a fresh snapshot from the UI.
             file.delete()
         }

@@ -9,12 +9,27 @@ import com.aistudio.voicenote.cvtr.editor.model.ClipEffects
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
 import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
 import com.aistudio.voicenote.cvtr.editor.model.ExportPreset
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
+import androidx.work.Data
+import androidx.work.ForegroundUpdater
+import androidx.work.ListenableWorker
+import androidx.work.ProgressUpdater
+import androidx.work.WorkerFactory
+import androidx.work.WorkerParameters
+import androidx.work.impl.utils.taskexecutor.SerialExecutor
+import androidx.work.impl.utils.taskexecutor.TaskExecutor
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.OutputStream
+import java.util.UUID
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
+import com.google.common.util.concurrent.Futures
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -226,6 +241,50 @@ class EditorExportWorkerTest {
         }
     }
 
+    @Test
+    fun `worker releases claimed reservation when runner history lookup fails`() = runBlocking {
+        val root = File(System.getProperty("java.io.tmpdir"), "editor-export-worker-${UUID.randomUUID()}")
+            .also { it.mkdirs() }
+        val manifestFile = File(root, "manifest.json")
+        val pending = File(root, "claimed.ogg.pending")
+        val final = File(root, "claimed.ogg")
+        val reservation = ClaimingReservationStore(pending, final)
+        val manifest = manifest().copy(exportAttemptId = "worker-leak-test")
+        manifest.writeTo(manifestFile)
+        val request = EditorExportWork.request(
+            manifestPath = manifestFile.absolutePath,
+            outputName = "mix.ogg",
+            preset = manifest.preset,
+            exportAttemptId = manifest.exportAttemptId,
+        )
+        val history = FakeHistory(failLookupOnCall = 2)
+        val dependencies = EditorExportWorker.Dependencies(
+            rendererFactory = { error("renderer must not start") },
+            encoderFactory = { _, _, _ -> error("encoder must not start") },
+            storage = FakeStorage(),
+            history = history,
+            reservation = reservation,
+        )
+
+        try {
+            val result = EditorExportWorker(
+                ApplicationProvider.getApplicationContext<Context>(),
+                workerParameters(request.workSpec.input),
+                dependencies,
+            ).doWork()
+
+            assertTrue(result is ListenableWorker.Result.Failure)
+            assertTrue(reservation.claimed)
+            assertTrue(reservation.released)
+            assertFalse(pending.exists())
+            assertFalse(final.exists())
+            assertFalse(manifestFile.exists())
+            assertTrue(history.rows.isEmpty())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     private fun runner(
         storage: EditorExportStorage,
         history: FakeHistory,
@@ -430,11 +489,47 @@ class EditorExportWorkerTest {
         override fun deletePartial(file: File): Boolean = !file.exists() || file.delete()
     }
 
+    private class ClaimingReservationStore(
+        private val pending: File,
+        private val final: File,
+    ) : EditorExportReservationStore {
+        var claimed = false
+        var released = false
+        private val identity = EditorExportOutputIdentity(
+            name = final.name,
+            uri = android.net.Uri.fromFile(pending).toString(),
+            finalUri = android.net.Uri.fromFile(final).toString(),
+        )
+
+        override fun reserve(
+            manifest: EditorRenderManifest,
+            requestedName: String?,
+        ): EditorExportOutputIdentity = identity
+
+        override fun resolve(
+            manifest: EditorRenderManifest,
+            requestedName: String?,
+        ): EditorExportOutputIdentity = identity
+
+        override fun claim(identity: EditorExportOutputIdentity): Boolean {
+            claimed = true
+            check(pending.createNewFile())
+            return true
+        }
+
+        override fun release(identity: EditorExportOutputIdentity): Boolean {
+            released = true
+            return (!pending.exists() || pending.delete()) && (!final.exists() || final.delete())
+        }
+    }
+
     private class FakeHistory(
         private var crashBeforeInsert: Boolean = false,
         private val failDelete: Boolean = false,
+        private val failLookupOnCall: Int? = null,
     ) : EditorExportHistory {
         val rows = mutableListOf<com.aistudio.voicenote.cvtr.data.local.ConversionHistory>()
+        private var lookupCount = 0
         override suspend fun insert(item: com.aistudio.voicenote.cvtr.data.local.ConversionHistory): Long {
             if (crashBeforeInsert) {
                 crashBeforeInsert = false
@@ -448,8 +543,46 @@ class EditorExportWorkerTest {
             if (failDelete) error("history delete failed")
             rows.removeIf { it.id == id }
         }
-        override suspend fun findByExportAttemptId(attemptId: String): com.aistudio.voicenote.cvtr.data.local.ConversionHistory? =
-            rows.firstOrNull { it.editorExportAttemptId == attemptId }
+        override suspend fun findByExportAttemptId(attemptId: String): com.aistudio.voicenote.cvtr.data.local.ConversionHistory? {
+            lookupCount++
+            if (lookupCount == failLookupOnCall) error("history lookup failed")
+            return rows.firstOrNull { it.editorExportAttemptId == attemptId }
+        }
+    }
+
+    private fun workerParameters(input: Data): WorkerParameters {
+        val executor = Executors.newSingleThreadExecutor()
+        val serial = object : SerialExecutor {
+            override fun execute(command: Runnable) = executor.execute(command)
+            override fun hasPendingTasks(): Boolean = false
+        }
+        val taskExecutor = object : TaskExecutor {
+            override fun getMainThreadExecutor(): Executor = executor
+            override fun getSerialTaskExecutor(): SerialExecutor = serial
+        }
+        val workerFactory = object : WorkerFactory() {
+            override fun createWorker(
+                appContext: Context,
+                workerClassName: String,
+                workerParameters: WorkerParameters,
+            ) = null
+        }
+        val progress = ProgressUpdater { _, _, _ -> Futures.immediateVoidFuture() }
+        val foreground = ForegroundUpdater { _, _, _ -> Futures.immediateVoidFuture() }
+        return WorkerParameters(
+            UUID.randomUUID(),
+            input,
+            emptyList<String>(),
+            WorkerParameters.RuntimeExtras(),
+            0,
+            0,
+            executor,
+            Dispatchers.Default,
+            taskExecutor,
+            workerFactory,
+            progress,
+            foreground,
+        )
     }
 
     private class SimulatedProcessDeath : VirtualMachineError()
