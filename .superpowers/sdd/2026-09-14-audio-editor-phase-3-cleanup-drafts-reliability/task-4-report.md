@@ -33,3 +33,14 @@ Verification:
 
 - Focused Fix Round 1 suite: **82 tests, 0 failures**.
 - `:app:assembleDebug` — BUILD SUCCESSFUL for arm64-v8a, armeabi-v7a, and x86_64.
+
+## Fix Round 1 follow-up
+
+- Replacement persistence failures now reload the complete `EditorDraftLoad`, re-derive missing/corrupt offline clips and source error from durable truth, then retain the replacement failure status/message instead of forcing success or clearing `Ganti file` state.
+- Added a pre-commit replacement-failure regression covering a durable draft that still references an offline private source.
+
+Verification:
+
+- Isolated replacement tests: **3 tests, 0 failures**.
+- Focused Task-4/ViewModel/maintenance/export suite: **40 tests, 0 failures**.
+- `git diff --check` — clean.

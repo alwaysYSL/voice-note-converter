@@ -14,6 +14,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -67,6 +68,44 @@ class EditorSourceReplacementSerializationTest {
         assertFalse("queued edit must not enter replacement save", persisted!!.tracks.single().muted)
         assertTrue(viewModel.uiState.value.session.dirty)
         assertTrue(viewModel.uiState.value.session.tracks.single().clips.single().source.uri.endsWith("replacement"))
+    }
+
+    @Test
+    fun `replacement failure restores durable offline source state and failure status`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val durable = session()
+        val viewModel = EditorViewModel(
+            application = app,
+            launchSource = EditorLaunchSource.Draft("draft-1"),
+            persistDraft = { _, _ -> throw IOException("persist failed") },
+            loadDraft = {
+                EditorDraftLoad(
+                    session = durable,
+                    missingPrivateSources = listOf("/private/draft/source.wav"),
+                )
+            },
+            sourceAnalyzer = { uri -> AudioSourceInfo(uri.toString(), 1_000L) },
+            waveformLoader = { emptyList() },
+        )
+        viewModel.awaitReady()
+
+        viewModel.replaceMissingSource("clip-1", Uri.parse("content://source/replacement"))
+        withTimeout(5_000L) {
+            while (viewModel.uiState.value.message != EditorMessage.SOURCE_REPLACEMENT_FAILED) {
+                shadowOf(Looper.getMainLooper()).idle()
+                delay(10L)
+            }
+        }
+
+        val state = viewModel.uiState.value
+        assertEquals(setOf("clip-1"), state.offlineClipIds)
+        assertTrue(state.sourceError?.contains("unavailable") == true)
+        assertEquals(EditorDraftSaveStatus.FAILED, state.draft.status)
+        assertEquals("persist failed", state.draft.error)
+        assertEquals(
+            "/private/draft/source.wav",
+            state.session.tracks.single().clips.single().source.uri,
+        )
     }
 
     private fun session(): EditorSession = EditorSession(

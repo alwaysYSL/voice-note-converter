@@ -51,6 +51,7 @@ import com.aistudio.voicenote.cvtr.editor.model.TimelineError
 import com.aistudio.voicenote.cvtr.editor.model.TimelineResult
 import com.aistudio.voicenote.cvtr.editor.model.value
 import com.aistudio.voicenote.cvtr.editor.data.DraftSourceStorage
+import com.aistudio.voicenote.cvtr.editor.data.EditorDraftLoad
 import com.aistudio.voicenote.cvtr.editor.data.EditorDraftRepository
 import com.aistudio.voicenote.cvtr.editor.work.EditorExportWork
 import kotlinx.coroutines.CompletableDeferred
@@ -302,6 +303,12 @@ private data class CleanupTarget(
         sourceEndMs = clip.sourceEndMs,
     )
 }
+
+private data class DraftSourceAvailability(
+    val sourceUris: Set<String>,
+    val unavailableSourceUris: Set<String>,
+    val unavailableClipIds: Set<String>,
+)
 
 private data class CleanupBatch(
     val id: String,
@@ -612,26 +619,35 @@ internal class EditorViewModel(
                             // A cache-lease/database error can happen after Room has committed.
                             // Reload the durable row and publish that truth instead of blindly
                             // undoing to a stale in-memory snapshot.
-                            val durable = runCatching { loadDraft(draftId)?.session }
+                            val durable = runCatching { loadDraft(draftId) }
                                 .getOrNull()
                             if (durable != null) {
-                                commandHistory = CommandHistory(durable)
+                                val availability = inspectDraftSources(durable)
+                                commandHistory = CommandHistory(durable.session)
                                 _uiState.update {
                                     it.copy(
-                                        offlineClipIds = emptySet(),
-                                        sourceError = null,
-                                        draft = it.draft.copy(
-                                            status = EditorDraftSaveStatus.SUCCEEDED,
-                                            draftId = draftId,
-                                            progress = 1f,
-                                            error = null,
-                                            canRetry = false,
-                                        ),
+                                        offlineClipIds = availability.unavailableClipIds,
+                                        sourceError = if (availability.unavailableClipIds.isEmpty()) {
+                                            null
+                                        } else {
+                                            "Draft source is unavailable or unreadable"
+                                        },
                                     )
                                 }
-                                publishSession(durable)
+                                publishSession(durable.session)
                             } else {
                                 publishSession(changed)
+                            }
+                            _uiState.update {
+                                it.copy(
+                                    draft = it.draft.copy(
+                                        status = EditorDraftSaveStatus.FAILED,
+                                        draftId = draftId,
+                                        progress = 0f,
+                                        error = error.message ?: "Source replacement failed",
+                                        canRetry = false,
+                                    ),
+                                )
                             }
                             showMessage(EditorMessage.SOURCE_REPLACEMENT_FAILED)
                             return@withLock
@@ -805,6 +821,24 @@ internal class EditorViewModel(
             return
         }
         finishLoading(loaded.session)
+        val availability = inspectDraftSources(loaded)
+        _uiState.update {
+            it.copy(
+                offlineClipIds = availability.unavailableClipIds,
+                sourceError = if (availability.unavailableClipIds.isEmpty()) {
+                    null
+                } else {
+                    "Draft source is unavailable or unreadable"
+                },
+                draft = it.draft.copy(draftId = draftId),
+            )
+        }
+        availability.sourceUris
+            .filterNot { it in availability.unavailableSourceUris }
+            .forEach { sourcePath -> loadWaveform(sourcePath.toProbeUri(), sourcePath) }
+    }
+
+    private suspend fun inspectDraftSources(loaded: EditorDraftLoad): DraftSourceAvailability {
         val missing = loaded.missingPrivateSources.toSet()
         val sourceUris = loaded.session.tracks.asSequence()
             .flatMap { it.clips.asSequence() }
@@ -820,21 +854,16 @@ internal class EditorViewModel(
             sourcePath.takeIf { !readable }
         }.toSet()
         val unavailable = missing + corrupt
-        val missingClipIds = loaded.session.tracks.asSequence()
+        val unavailableClipIds = loaded.session.tracks.asSequence()
             .flatMap { it.clips.asSequence() }
             .filter { it.source.uri in unavailable }
             .map { it.id }
             .toSet()
-        _uiState.update {
-            it.copy(
-                offlineClipIds = missingClipIds,
-                sourceError = if (missingClipIds.isEmpty()) null else "Draft source is unavailable or unreadable",
-                draft = it.draft.copy(draftId = draftId),
-            )
-        }
-        sourceUris.keys
-            .filterNot { it in unavailable }
-            .forEach { sourcePath -> loadWaveform(sourcePath.toProbeUri(), sourcePath) }
+        return DraftSourceAvailability(
+            sourceUris = sourceUris.keys,
+            unavailableSourceUris = unavailable,
+            unavailableClipIds = unavailableClipIds,
+        )
     }
 
     private fun sessionFor(uri: Uri, displayName: String, durationMs: Long): EditorSession {
