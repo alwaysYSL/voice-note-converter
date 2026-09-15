@@ -105,21 +105,24 @@ class EditorExportWorkerTest {
     @Test
     fun `retry after process death immediately after publish reuses reserved output`() = runBlocking {
         val storage = FakeStorage()
-        val history = FakeHistory(crashBeforeInsert = true)
+        storage.crashAfterCopyBeforeFinalize = true
         val snapshot = manifest().copy(
             reservedOutputName = "reserved.ogg",
             reservedOutputUri = "file:///reserved.ogg",
         )
 
         assertThrows(SimulatedProcessDeath::class.java) {
-            runBlocking { runner(storage, history).run(snapshot, "mix.ogg", snapshot.preset) }
+            runBlocking { runner(storage, FakeHistory()).run(snapshot, "mix.ogg", snapshot.preset) }
         }
         assertEquals(1, storage.published.size)
-        assertTrue(history.rows.isEmpty())
+        assertTrue(storage.pending.isNotEmpty())
 
+        val history = FakeHistory()
         val retry = runner(storage, history).run(snapshot, "mix.ogg", snapshot.preset)
         assertTrue(retry is EditorExportResult.Success)
         assertEquals(1, storage.published.size)
+        assertTrue(storage.pending.isEmpty())
+        assertEquals(1, storage.finalizedUris.size)
         assertEquals(1, history.rows.size)
         assertEquals("file:///reserved.ogg", history.rows.single().outputFilePath)
     }
@@ -200,6 +203,9 @@ class EditorExportWorkerTest {
         private val directory = File(System.getProperty("java.io.tmpdir"), "editor-export-test-${java.util.UUID.randomUUID()}")
         val partial = mutableListOf<File>()
         val published = mutableListOf<java.net.URI>()
+        val pending = mutableSetOf<java.net.URI>()
+        val finalizedUris = mutableListOf<java.net.URI>()
+        var crashAfterCopyBeforeFinalize = false
         override fun createPartialFile(workId: String): File = File(directory.apply { mkdirs() }, "$workId.partial")
             .also { if (it !in partial) partial += it }
         override fun publish(partialFile: File, outputName: String): android.net.Uri =
@@ -210,8 +216,24 @@ class EditorExportWorkerTest {
             partialFile: File,
             outputName: String,
             outputUri: String?,
-        ): android.net.Uri = outputUri?.let { android.net.Uri.parse(it).also { value -> published += java.net.URI.create(value.toString()) } }
-            ?: publish(partialFile, outputName)
+        ): android.net.Uri = outputUri?.let {
+            android.net.Uri.parse(it).also { value ->
+                val identity = java.net.URI.create(value.toString())
+                if (identity !in published) published += identity
+                pending += identity
+                if (crashAfterCopyBeforeFinalize) {
+                    crashAfterCopyBeforeFinalize = false
+                    throw SimulatedProcessDeath()
+                }
+                finalizeReserved(value)
+            }
+        } ?: publish(partialFile, outputName)
+        override fun finalizeReserved(uri: android.net.Uri): Boolean {
+            val identity = java.net.URI.create(uri.toString())
+            finalizedUris += identity
+            pending.remove(identity)
+            return true
+        }
         override fun validatePublished(uri: android.net.Uri): Boolean =
             validate && java.net.URI.create(uri.toString()) in published
         override fun deletePublished(uri: android.net.Uri): Boolean = published.remove(java.net.URI.create(uri.toString()))

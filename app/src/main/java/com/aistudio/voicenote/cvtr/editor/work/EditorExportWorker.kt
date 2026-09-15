@@ -61,6 +61,8 @@ internal interface EditorExportStorage {
     fun publish(partialFile: File, outputName: String): Uri
     fun publishReserved(partialFile: File, outputName: String, outputUri: String?): Uri =
         publish(partialFile, outputName)
+    /** Makes an app-owned reserved target visible; safe to call after it is already visible. */
+    fun finalizeReserved(uri: Uri): Boolean = true
     fun validatePublished(uri: Uri): Boolean
     fun sizeBytes(uri: Uri): Long = 0L
     fun deletePublished(uri: Uri): Boolean
@@ -165,14 +167,19 @@ internal class EditorExportRunner(
             return existingResult(existing)
         }
         val reservedUri = manifest.reservedOutputUri?.let(Uri::parse)
-        val recoveredUri = reservedUri?.takeIf {
+        val recoveredUri = reservedUri?.let { uri ->
             try {
-                storage.validatePublished(it)
+                if (!storage.validatePublished(uri)) {
+                    null
+                } else {
+                    check(storage.finalizeReserved(uri)) { "Reserved editor output could not be finalized" }
+                    uri
+                }
             } catch (error: CancellationException) {
                 return EditorExportResult.Cancelled()
             } catch (error: Throwable) {
                 error.rethrowIfFatal()
-                false
+                return EditorExportResult.Failure(error.message ?: "Reserved editor output is invalid")
             }
         }
         val renderer = if (recoveredUri == null) {
@@ -617,7 +624,10 @@ internal class AndroidEditorExportStorage(
     override fun publishReserved(partialFile: File, outputName: String, outputUri: String?): Uri {
         if (outputUri == null) return publish(partialFile, outputName)
         val uri = Uri.parse(outputUri)
-        if (validatePublished(uri)) return uri
+        if (validatePublished(uri)) {
+            check(finalizeReserved(uri)) { "Cannot finalize reserved editor output" }
+            return uri
+        }
         when (uri.scheme) {
             ContentResolver.SCHEME_CONTENT -> {
                 context.contentResolver.openOutputStream(uri)?.use { output ->
@@ -635,7 +645,16 @@ internal class AndroidEditorExportStorage(
             }
             else -> error("Reserved editor output identity is invalid")
         }
+        check(finalizeReserved(uri)) { "Cannot finalize reserved editor output" }
         return uri
+    }
+
+    override fun finalizeReserved(uri: Uri): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+            uri.scheme != ContentResolver.SCHEME_CONTENT
+        ) return true
+        val values = ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) }
+        return context.contentResolver.update(uri, values, null, null) == 1
     }
 
     override fun validatePublished(uri: Uri): Boolean {
