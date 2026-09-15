@@ -7,10 +7,16 @@ internal object PitchShifterJni {
     }
 
     external fun create(sampleRate: Int, channels: Int): Long
-
     external fun setTranspose(handle: Long, semitones: Float, tonalityLimit: Float)
 
     external fun process(handle: Long, input: ShortArray, inputFrames: Int): ShortArray
+
+    external fun processWithOutputFrames(
+        handle: Long,
+        input: ShortArray,
+        inputFrames: Int,
+        outputFrames: Int,
+    ): ShortArray
 
     external fun flush(handle: Long): ShortArray
 

@@ -22,23 +22,26 @@ struct PitchShifterContext {
         stretch.presetDefault(this->channels, sampleRate);
     }
 
-    void resizeBuffers(int frames) {
-        if (frames < 0 || frames > (std::numeric_limits<int>::max() / channels)) {
+    void resizeBuffers(int inputFrames, int outputFrames) {
+        if (inputFrames < 0 || outputFrames < 0 ||
+            inputFrames > (std::numeric_limits<int>::max() / channels) ||
+            outputFrames > (std::numeric_limits<int>::max() / channels)) {
             throw std::invalid_argument("Pitch shifter buffer size is invalid");
         }
-        inputFloat.resize(static_cast<size_t>(frames) * channels);
-        outputFloat.resize(static_cast<size_t>(frames) * channels);
+        inputFloat.resize(static_cast<size_t>(inputFrames) * channels);
+        outputFloat.resize(static_cast<size_t>(outputFrames) * channels);
         inputBuffers.resize(channels);
         outputBuffers.resize(channels);
         for (int channel = 0; channel < channels; ++channel) {
-            inputBuffers[channel] = inputFloat.data() + channel * frames;
-            outputBuffers[channel] = outputFloat.data() + channel * frames;
+            inputBuffers[channel] = inputFloat.data() + channel * inputFrames;
+            outputBuffers[channel] = outputFloat.data() + channel * outputFrames;
         }
     }
 
     Stretch stretch;
     int sampleRate;
     int channels;
+    float tempoRatio = 1.0f;
     std::vector<float> inputFloat;
     std::vector<float> outputFloat;
     std::vector<float*> inputBuffers;
@@ -93,6 +96,66 @@ jshortArray emptyArray(JNIEnv* env) {
     return env->NewShortArray(0);
 }
 
+jshortArray processInternal(
+    JNIEnv* env,
+    PitchShifterContext* context,
+    jshortArray inputArray,
+    int inputFrames,
+    int outputFrames
+) {
+    jshort* inputData = nullptr;
+    try {
+        if (context == nullptr || inputArray == nullptr || inputFrames <= 0 || outputFrames <= 0) {
+            return emptyArray(env);
+        }
+
+        const jsize inputLength = env->GetArrayLength(inputArray);
+        if (env->ExceptionCheck()) return nullptr;
+        const int maxFrames = inputLength / context->channels;
+        const int frames = std::min(inputFrames, maxFrames);
+        if (frames <= 0) return emptyArray(env);
+
+        inputData = env->GetShortArrayElements(inputArray, nullptr);
+        if (inputData == nullptr) {
+            if (!env->ExceptionCheck()) {
+                throwRuntimeException(env, "Unable to access pitch shifter input");
+            }
+            return nullptr;
+        }
+
+        context->resizeBuffers(frames, outputFrames);
+        for (int frame = 0; frame < frames; ++frame) {
+            for (int channel = 0; channel < context->channels; ++channel) {
+                context->inputFloat[channel * frames + frame] =
+                    inputData[frame * context->channels + channel] * kShortToFloat;
+            }
+        }
+        env->ReleaseShortArrayElements(inputArray, inputData, JNI_ABORT);
+        inputData = nullptr;
+
+        context->stretch.process(
+            context->inputBuffers,
+            frames,
+            context->outputBuffers,
+            outputFrames
+        );
+        context->tempoRatio = frames / static_cast<float>(outputFrames);
+        return toShortArray(env, context->outputFloat, outputFrames, context->channels);
+    } catch (const std::exception& error) {
+        if (inputData != nullptr) {
+            env->ReleaseShortArrayElements(inputArray, inputData, JNI_ABORT);
+        }
+        throwRuntimeException(env, error);
+        return nullptr;
+    } catch (...) {
+        if (inputData != nullptr) {
+            env->ReleaseShortArrayElements(inputArray, inputData, JNI_ABORT);
+        }
+        throwRuntimeException(env, "Unknown native pitch shifter error");
+        return nullptr;
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -144,57 +207,27 @@ Java_com_aistudio_voicenote_cvtr_audio_PitchShifterJni_process(
     jshortArray inputArray,
     jint inputFrames
 ) {
-    jshort* inputData = nullptr;
-    try {
-        auto* context = reinterpret_cast<PitchShifterContext*>(handle);
-        if (context == nullptr || inputArray == nullptr || inputFrames <= 0) {
-            return emptyArray(env);
-        }
-
-        const jsize inputLength = env->GetArrayLength(inputArray);
-        if (env->ExceptionCheck()) return nullptr;
-        const int maxFrames = inputLength / context->channels;
-        const int frames = std::min(inputFrames, maxFrames);
-        if (frames <= 0) return emptyArray(env);
-
-        inputData = env->GetShortArrayElements(inputArray, nullptr);
-        if (inputData == nullptr) {
-            if (!env->ExceptionCheck()) {
-                throwRuntimeException(env, "Unable to access pitch shifter input");
-            }
-            return nullptr;
-        }
-
-        context->resizeBuffers(frames);
-        for (int frame = 0; frame < frames; ++frame) {
-            for (int channel = 0; channel < context->channels; ++channel) {
-                context->inputFloat[channel * frames + frame] =
-                    inputData[frame * context->channels + channel] * kShortToFloat;
-            }
-        }
-        env->ReleaseShortArrayElements(inputArray, inputData, JNI_ABORT);
-        inputData = nullptr;
-
-        context->stretch.process(
-            context->inputBuffers,
-            frames,
-            context->outputBuffers,
-            frames
-        );
-        return toShortArray(env, context->outputFloat, frames, context->channels);
-    } catch (const std::exception& error) {
-        if (inputData != nullptr) {
-            env->ReleaseShortArrayElements(inputArray, inputData, JNI_ABORT);
-        }
-        throwRuntimeException(env, error);
-        return nullptr;
-    } catch (...) {
-        if (inputData != nullptr) {
-            env->ReleaseShortArrayElements(inputArray, inputData, JNI_ABORT);
-        }
-        throwRuntimeException(env, "Unknown native pitch shifter error");
-        return nullptr;
+    auto* context = reinterpret_cast<PitchShifterContext*>(handle);
+    if (context == nullptr || inputArray == nullptr || inputFrames <= 0) {
+        return emptyArray(env);
     }
+    const jsize inputLength = env->GetArrayLength(inputArray);
+    if (env->ExceptionCheck()) return nullptr;
+    const int frames = std::min(inputFrames, inputLength / context->channels);
+    return processInternal(env, context, inputArray, frames, frames);
+}
+
+JNIEXPORT jshortArray JNICALL
+Java_com_aistudio_voicenote_cvtr_audio_PitchShifterJni_processWithOutputFrames(
+    JNIEnv* env,
+    jobject /*thisObject*/,
+    jlong handle,
+    jshortArray inputArray,
+    jint inputFrames,
+    jint outputFrames
+) {
+    auto* context = reinterpret_cast<PitchShifterContext*>(handle);
+    return processInternal(env, context, inputArray, inputFrames, outputFrames);
 }
 
 JNIEXPORT jshortArray JNICALL
@@ -209,26 +242,34 @@ Java_com_aistudio_voicenote_cvtr_audio_PitchShifterJni_flush(
 
         const int inputLatency = std::max(context->stretch.inputLatency(), 0);
         const int outputLatency = std::max(context->stretch.outputLatency(), 0);
-        const int totalFrames = inputLatency + outputLatency;
+        const float tempoRatio = std::max(context->tempoRatio, 0.0001f);
+        const int processOutputFrames = inputLatency > 0
+            ? static_cast<int>(std::ceil(inputLatency / tempoRatio))
+            : 0;
+        const int totalFrames = processOutputFrames + outputLatency;
         if (totalFrames <= 0) return emptyArray(env);
 
         std::vector<float> processOutput;
         if (inputLatency > 0) {
-            context->resizeBuffers(inputLatency);
+            context->resizeBuffers(inputLatency, processOutputFrames);
             std::fill(context->inputFloat.begin(), context->inputFloat.end(), 0.0f);
             context->stretch.process(
                 context->inputBuffers,
                 inputLatency,
                 context->outputBuffers,
-                inputLatency
+                processOutputFrames
             );
             processOutput = context->outputFloat;
         }
 
         std::vector<float> flushOutput;
         if (outputLatency > 0) {
-            context->resizeBuffers(outputLatency);
-            context->stretch.flush(context->outputBuffers, outputLatency);
+            context->resizeBuffers(outputLatency, outputLatency);
+            if (tempoRatio == 1.0f) {
+                context->stretch.flush(context->outputBuffers, outputLatency);
+            } else {
+                context->stretch.flush(context->outputBuffers, outputLatency, tempoRatio);
+            }
             flushOutput = context->outputFloat;
         }
 
@@ -238,8 +279,8 @@ Java_com_aistudio_voicenote_cvtr_audio_PitchShifterJni_flush(
         for (int channel = 0; channel < context->channels; ++channel) {
             if (inputLatency > 0) {
                 std::copy(
-                    processOutput.begin() + channel * inputLatency,
-                    processOutput.begin() + (channel + 1) * inputLatency,
+                    processOutput.begin() + channel * processOutputFrames,
+                    processOutput.begin() + (channel + 1) * processOutputFrames,
                     combined.begin() + channel * totalFrames
                 );
             }
@@ -247,7 +288,7 @@ Java_com_aistudio_voicenote_cvtr_audio_PitchShifterJni_flush(
                 std::copy(
                     flushOutput.begin() + channel * outputLatency,
                     flushOutput.begin() + (channel + 1) * outputLatency,
-                    combined.begin() + channel * totalFrames + inputLatency
+                    combined.begin() + channel * totalFrames + processOutputFrames
                 );
             }
         }
