@@ -49,6 +49,53 @@ class ClipProcessorTest {
         processor.close()
     }
 
+    @Test
+    fun `discontinuous renders recreate state and flush is trimmed to exact frames`() {
+        val created = mutableListOf<LifecycleEffect>()
+        val processor = ClipProcessor(ClipEffectProcessorFactory { _, _ ->
+            LifecycleEffect().also(created::add)
+        })
+        val clip = clip(ClipEffects(speed = 2f))
+
+        val first = processor.process(clip, ShortArray(4), 0L, outputFrameCount = 2)
+        val contiguous = processor.process(clip, ShortArray(4), 2L, outputFrameCount = 2)
+        val discontinuous = processor.process(clip, ShortArray(4), 10L, outputFrameCount = 2)
+        val tail = processor.flush(clip, outputStartFrame = 12L, outputFrameCount = 1)
+
+        assertEquals(2, first.size)
+        assertEquals(2, contiguous.size)
+        assertEquals(2, discontinuous.size)
+        assertEquals(1, tail.size)
+        assertEquals(2, created.size)
+        assertEquals(2, created[0].processCalls)
+        assertEquals(1, created[0].closeCalls)
+        assertEquals(0, created[0].flushCalls)
+        assertFalse(created[0] === created[1])
+        assertEquals(1, created[1].flushCalls)
+        assertEquals(1, created[1].closeCalls)
+        processor.close()
+    }
+
+    private class LifecycleEffect : ClipEffectProcessor {
+        var processCalls = 0
+        var flushCalls = 0
+        var closeCalls = 0
+
+        override fun process(input: ShortArray, outputFrames: Int): ShortArray {
+            processCalls += 1
+            return ShortArray(outputFrames + 1) { 16_384 }
+        }
+
+        override fun flush(): ShortArray {
+            flushCalls += 1
+            return ShortArray(3) { 8_192 }
+        }
+
+        override fun close() {
+            closeCalls += 1
+        }
+    }
+
     private fun clip(effects: ClipEffects): AudioClip = AudioClip(
         id = "clip",
         source = AudioSourceRef("content://source", durationMs = 10_000L),

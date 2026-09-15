@@ -17,3 +17,20 @@ Risks:
 
 1. Native output quality and flush-tail behavior for non-1x tempo require device/ABI verification.
 2. Gradle/native assembly still needs to run in a fully provisioned Android environment.
+
+## Fix Round 1
+
+- ClipProcessor now tracks the expected next output frame, recreates effect state after seeks/non-contiguous chunks, drains and trims/pads effect tails to the exact requested boundary, and carries fractional frame remainder when the timeline does not supply an explicit count.
+- StreamingPitchShifter now sizes input/output in frames while preserving interleaved sample counts for multichannel streams; its injectable engine seam keeps lifecycle tests JVM-only and native handles exception-safe.
+
+Verification:
+
+- Focused `:app:testDebugUnitTest` (ClipProcessor, StreamingPitchShifter, TrackMixer, MasterLimiter): passed.
+- Existing `:app:testDebugUnitTest --tests '*Pitch*'`: passed.
+- `:app:assembleDebug --offline`: passed; CMake linked `arm64-v8a`, `armeabi-v7a`, and `x86_64` native ABIs.
+- Direct Kotlin/JUnit harness: 6 focused DSP tests passed.
+
+Risks:
+
+1. Native waveform quality remains covered by assembly/API checks rather than a device fixture.
+2. Timeline callers must provide exact output frame counts when their mapping is authoritative; fallback carries fractional remainder.
