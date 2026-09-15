@@ -190,6 +190,11 @@ internal sealed interface EditorIntent {
     data object StartExport : EditorIntent
     data object CancelExport : EditorIntent
     data object RetryExport : EditorIntent
+    data class StartCleanup(
+        val targetClipId: String?,
+        val normalize: Boolean,
+        val preset: com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength
+    ) : EditorIntent
 }
 
 internal data class EditorUiState(
@@ -343,6 +348,7 @@ internal class EditorViewModel(
             EditorIntent.StartExport -> startExport()
             EditorIntent.CancelExport -> cancelExport()
             EditorIntent.RetryExport -> retryExport()
+            is EditorIntent.StartCleanup -> startCleanup(intent.targetClipId, intent.normalize, intent.preset)
         }
     }
 
@@ -611,6 +617,55 @@ internal class EditorViewModel(
                 }
             } finally {
                 synchronized(exportGate) { exportEnqueueInFlight = false }
+            }
+        }
+    }
+
+    private fun startCleanup(targetClipId: String?, normalize: Boolean, preset: com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength) {
+        val session = _uiState.value.session
+        val clipId = targetClipId ?: session.selectedClipId ?: return
+        val track = session.tracks.firstOrNull { t -> t.clips.any { it.id == clipId } } ?: return
+        
+        val clipsToProcess = if (targetClipId == null) {
+            track.clips // process all clips in track
+        } else {
+            listOf(track.clips.first { it.id == clipId })
+        }
+        
+        val workManager = androidx.work.WorkManager.getInstance(getApplication())
+        val requests = mutableListOf<androidx.work.OneTimeWorkRequest>()
+        
+        for (clip in clipsToProcess) {
+            val fingerprint = clip.source.uri
+            val request = com.aistudio.voicenote.cvtr.editor.work.CleanupEffectWork.request(
+                sourceUri = clip.source.uri,
+                sourceFingerprint = fingerprint,
+                sourceStartMs = clip.sourceStartMs,
+                sourceEndMs = clip.sourceEndMs,
+                cleanupStrength = preset,
+                normalized = normalize
+            )
+            val uniqueName = com.aistudio.voicenote.cvtr.editor.work.CleanupEffectWork.uniqueWorkName(fingerprint, clip.sourceStartMs, clip.sourceEndMs)
+            
+            workManager.beginUniqueWork(
+                uniqueName,
+                androidx.work.ExistingWorkPolicy.REPLACE,
+                request
+            ).enqueue()
+            
+            requests.add(request)
+            
+            viewModelScope.launch {
+                workManager.getWorkInfoByIdLiveData(request.id).observeForever { info ->
+                    if (info != null && info.state == androidx.work.WorkInfo.State.SUCCEEDED) {
+                        val cacheKey = info.outputData.getString(com.aistudio.voicenote.cvtr.editor.work.CleanupEffectWork.RESULT_CACHE_KEY_FILENAME)
+                        if (cacheKey != null) {
+                            runSerializedMutation {
+                                execute(com.aistudio.voicenote.cvtr.editor.command.ApplyProcessedSourceCommand(clip.id, cacheKey))
+                            }
+                        }
+                    }
+                }
             }
         }
     }

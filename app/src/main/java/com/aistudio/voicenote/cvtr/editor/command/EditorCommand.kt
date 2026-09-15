@@ -143,3 +143,12 @@ internal data class SelectClipCommand(
 /** Applies validation while marking a command as a rendered-audio mutation. */
 private fun validateRenderedMutation(session: EditorSession): TimelineResult =
     TimelineOperations.validate(session.copy(dirty = true))
+
+internal data class ApplyProcessedSourceCommand(
+    val clipId: String,
+    val processedCacheKey: String,
+) : EditorCommand {
+    override fun applyTo(session: EditorSession): TimelineResult {
+        return TimelineOperations.applyProcessedSource(session, clipId, processedCacheKey)
+    }
+}

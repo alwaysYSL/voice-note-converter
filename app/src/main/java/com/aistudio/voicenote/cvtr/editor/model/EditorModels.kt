@@ -18,6 +18,7 @@ internal class ClipEffects(
     val gain: Float = 1f,
     pitchSemitones: Float = 0f,
     speed: Float = 1f,
+    val processedCacheKey: String? = null,
 ) {
     init {
         require(gain.isFinite()) { "gain must be finite" }
@@ -43,20 +44,23 @@ internal class ClipEffects(
         gain: Float = this.gain,
         pitchSemitones: Float = this.pitchSemitones,
         speed: Float = this.speed,
-    ): ClipEffects = ClipEffects(fadeInMs, fadeOutMs, gain, pitchSemitones, speed)
+        processedCacheKey: String? = this.processedCacheKey,
+    ): ClipEffects = ClipEffects(fadeInMs, fadeOutMs, gain, pitchSemitones, speed, processedCacheKey)
 
     operator fun component1(): Long = fadeInMs
     operator fun component2(): Long = fadeOutMs
     operator fun component3(): Float = gain
     operator fun component4(): Float = pitchSemitones
     operator fun component5(): Float = speed
+    operator fun component6(): String? = processedCacheKey
 
     override fun equals(other: Any?): Boolean = other is ClipEffects &&
         fadeInMs == other.fadeInMs &&
         fadeOutMs == other.fadeOutMs &&
         gain == other.gain &&
         pitchSemitones == other.pitchSemitones &&
-        speed == other.speed
+        speed == other.speed &&
+        processedCacheKey == other.processedCacheKey
 
     override fun hashCode(): Int {
         var result = fadeInMs.hashCode()
@@ -64,12 +68,13 @@ internal class ClipEffects(
         result = 31 * result + gain.hashCode()
         result = 31 * result + pitchSemitones.hashCode()
         result = 31 * result + speed.hashCode()
+        result = 31 * result + (processedCacheKey?.hashCode() ?: 0)
         return result
     }
 
     override fun toString(): String =
         "ClipEffects(fadeInMs=$fadeInMs, fadeOutMs=$fadeOutMs, gain=$gain, " +
-            "pitchSemitones=$pitchSemitones, speed=$speed)"
+            "pitchSemitones=$pitchSemitones, speed=$speed, processedCacheKey=$processedCacheKey)"
 
     companion object {
         const val MAX_FADE_MS = 5_000L

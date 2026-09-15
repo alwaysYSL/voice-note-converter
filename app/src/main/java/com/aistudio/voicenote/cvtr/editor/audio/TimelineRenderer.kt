@@ -21,8 +21,10 @@ internal class DefaultTimelineRenderer(
     private val sourceFactory: PcmSourceReaderFactory,
     private val clipProcessor: ClipProcessor = ClipProcessor(),
     private val trackMixer: TrackMixer = TrackMixer(),
+    private val cacheDir: java.io.File? = null,
 ) : TimelineRenderer {
     private val readers = LinkedHashMap<AudioSourceRef, PcmSourceReader>()
+    private val cacheReaders = LinkedHashMap<String, PcmSourceReader>()
     private val renderLock = Any()
     private var sessionId: String? = null
     private var closed = false
@@ -99,7 +101,7 @@ internal class DefaultTimelineRenderer(
                 val sourceFrames = if (requestedSourceFrames == 0 || readableFrames == 0) {
                     ShortArray(0)
                 } else {
-                    read(clip.source, sourceFrame, minOf(requestedSourceFrames, readableFrames))
+                    read(clip, sourceFrame, minOf(requestedSourceFrames, readableFrames))
                 }
                 val processed = clipProcessor.process(
                     clip = clip,
@@ -130,12 +132,28 @@ internal class DefaultTimelineRenderer(
     private fun sourceFrameLimit(clip: AudioClip): Long =
         clip.sourceEndMs * EDITOR_SAMPLE_RATE / 1_000L
 
-    private fun read(source: AudioSourceRef, sourceFrame: Long, frameCount: Int): ShortArray {
-        val reader = readers.getOrPut(source) { sourceFactory.open(source) }
+    private fun read(clip: AudioClip, sourceFrame: Long, frameCount: Int): ShortArray {
+        val cacheKey = clip.effects.processedCacheKey
+        if (cacheKey != null && cacheDir != null) {
+            val reader = cacheReaders.getOrPut(cacheKey) {
+                CachedPcmSourceReader(java.io.File(cacheDir, "$cacheKey.pcm"))
+            }
+            try {
+                // cache stores from sourceStartMs
+                val cacheStartFrame = clip.sourceStartMs * EDITOR_SAMPLE_RATE / 1_000L
+                return reader.read(sourceFrame - cacheStartFrame, frameCount)
+            } catch (error: Throwable) {
+                cacheReaders.remove(cacheKey)?.let { runCatching { it.close() } }
+                // fallback to source?
+                // we should probably just fallback if cache read fails
+            }
+        }
+
+        val reader = readers.getOrPut(clip.source) { sourceFactory.open(clip.source) }
         return try {
             reader.read(sourceFrame, frameCount)
         } catch (error: Throwable) {
-            readers.remove(source)?.let { runCatching { it.close() } }
+            readers.remove(clip.source)?.let { runCatching { it.close() } }
             throw error
         }
     }
@@ -147,6 +165,8 @@ internal class DefaultTimelineRenderer(
             if (sourceIds.isEmpty()) {
                 readers.values.forEach { runCatching { it.close() } }
                 readers.clear()
+                cacheReaders.values.forEach { runCatching { it.close() } }
+                cacheReaders.clear()
             } else {
                 val removed = readers.keys.filter { it.uri in sourceIds }
                 removed.forEach { source ->
@@ -163,10 +183,51 @@ internal class DefaultTimelineRenderer(
             clipProcessor.close()
             readers.values.forEach { runCatching { it.close() } }
             readers.clear()
+            cacheReaders.values.forEach { runCatching { it.close() } }
+            cacheReaders.clear()
         }
     }
 
     private companion object {
         const val RENDER_CHUNK_FRAMES = 960
+    }
+}
+
+internal class CachedPcmSourceReader(private val file: java.io.File) : PcmSourceReader {
+    override val sampleRate: Int = EDITOR_SAMPLE_RATE
+    private var raf: java.io.RandomAccessFile? = null
+    private var closed = false
+
+    override fun read(sourceFrame: Long, frameCount: Int): ShortArray {
+        if (closed) throw IllegalStateException("closed")
+        if (raf == null) {
+            raf = java.io.RandomAccessFile(file, "r")
+        }
+        val raf = this.raf!!
+        
+        val offset = 44L + sourceFrame * 2L
+        if (offset >= raf.length()) return ShortArray(0)
+        
+        raf.seek(offset)
+        
+        val maxFrames = ((raf.length() - offset) / 2L).toInt()
+        val toRead = minOf(frameCount, maxFrames)
+        if (toRead <= 0) return ShortArray(0)
+        
+        val bytes = ByteArray(toRead * 2)
+        val readCount = raf.read(bytes)
+        if (readCount <= 0) return ShortArray(0)
+        
+        val actualFrames = readCount / 2
+        val shorts = ShortArray(actualFrames)
+        java.nio.ByteBuffer.wrap(bytes, 0, readCount).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shorts)
+        return shorts
+    }
+
+    override fun close() {
+        if (closed) return
+        closed = true
+        raf?.close()
+        raf = null
     }
 }

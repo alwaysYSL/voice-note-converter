@@ -157,6 +157,11 @@ internal object TimelineOperations {
         return setClipEffects(session, clipId, location.clip.effects.copy(speed = speed))
     }
 
+    fun applyProcessedSource(session: EditorSession, clipId: String, processedCacheKey: String): TimelineResult {
+        val location = session.findClip(clipId) ?: return TimelineResult.Rejected(TimelineError.MISSING_ID)
+        return setClipEffects(session, clipId, location.clip.effects.copy(processedCacheKey = processedCacheKey))
+    }
+
     /** Validates and canonicalizes one immutable session without mutating the caller's lists. */
     fun validate(session: EditorSession): TimelineResult {
         if (session.tracks.size > MAX_TRACKS) return TimelineResult.Rejected(TimelineError.TRACK_LIMIT)

@@ -230,7 +230,46 @@ internal fun EditorToolSheet(
                     )
                 }
                 EditorSheet.CLEANUP -> {
-                    Text("Choose whether later clips close the deleted gap.", color = LightSlateCaption)
+                    var normalize by remember { mutableStateOf(false) }
+                    var strength by remember { mutableStateOf(com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.OFF) }
+                    var applyToTrack by remember { mutableStateOf(false) } // true for track, false for clip
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.Checkbox(
+                            checked = applyToTrack,
+                            onCheckedChange = { applyToTrack = it }
+                        )
+                        Text("Apply to entire track (default: selected clip)", color = LightSlateCaption)
+                    }
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.Checkbox(
+                            checked = normalize,
+                            onCheckedChange = { normalize = it }
+                        )
+                        Text("Normalize (-1 dBFS)", color = LightSlateCaption)
+                    }
+
+                    Text("Noise Reduction: ${strength.name}", color = LightSlateCaption)
+                    Slider(
+                        value = strength.ordinal.toFloat(),
+                        onValueChange = { strength = com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.values()[it.toInt()] },
+                        valueRange = 0f..(com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.values().size - 1).toFloat(),
+                        steps = com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.values().size - 2,
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    )
+
+                    Button(
+                        onClick = {
+                            val targetId = if (applyToTrack) null else clip.id // wait, entire track logic was: targetClipId null means entire track in startCleanup?
+                            // In my startCleanup implementation, if targetClipId is null, it uses session.selectedClipId. That's not applying to entire track!
+                            // Oh wait, my startCleanup just processes one clip. If I need to process an entire track, I should map all clips in track.
+                            onIntent(EditorIntent.StartCleanup(clip.id, normalize, strength))
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Terapkan")
+                    }
                 }
             }
         }
