@@ -4,6 +4,7 @@ import com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength
 import com.aistudio.voicenote.cvtr.editor.audio.EDITOR_CHANNEL_COUNT
 import com.aistudio.voicenote.cvtr.editor.audio.EDITOR_SAMPLE_RATE
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
@@ -109,6 +110,10 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
     init {
         check(cacheDir.exists() || cacheDir.mkdirs()) { "Unable to create cache directory" }
         rootState = roots.computeIfAbsent(cacheDir.canonicalFile.path) { SharedRootState() }
+        synchronized(rootState.lock) { loadLeasesLocked() }
+        // A process restart loses the in-memory active-temp registry. Only old partials are
+        // removed; live workers in this process remain protected by SharedRootState.activeTemps.
+        clearPartials()
     }
 
     /** Finds only a valid cache file and updates its persisted access time for LRU eviction. */
@@ -182,6 +187,42 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
         synchronized(rootState.lock) {
             val newCount = (rootState.references[filename] ?: 0) - 1
             if (newCount <= 0) rootState.references.remove(filename) else rootState.references[filename] = newCount
+        }
+    }
+
+    /**
+     * Persists an export-owned lease before WorkManager enqueue. The lease survives ViewModel
+     * teardown and is also loaded by the worker's cache instance, so eviction cannot remove PCM
+     * that a queued/running export still needs.
+     */
+    fun acquireLease(attemptId: String, filenames: Map<String, Int>) {
+        require(attemptId.isNotBlank() && '\n' !in attemptId && '\r' !in attemptId) {
+            "Cache lease attempt id must be non-blank and single-line"
+        }
+        val normalized = filenames.filterValues { it > 0 }
+        synchronized(rootState.lock) {
+            if (normalized.isNotEmpty()) writeLeaseLocked(attemptId, normalized)
+            else leaseFile(attemptId).delete()
+            rootState.leases.remove(attemptId)?.forEach { (name, count) ->
+                decrementReferenceLocked(name, count)
+            }
+            if (normalized.isNotEmpty()) {
+                rootState.leases[attemptId] = normalized
+                normalized.forEach { (name, count) ->
+                    rootState.references[name] = (rootState.references[name] ?: 0) + count
+                }
+            }
+        }
+    }
+
+    /** Releases a durable export lease. Releasing twice is safe. */
+    fun releaseLease(attemptId: String) {
+        if (attemptId.isBlank()) return
+        synchronized(rootState.lock) {
+            rootState.leases.remove(attemptId)?.forEach { (name, count) ->
+                decrementReferenceLocked(name, count)
+            }
+            runCatching { leaseFile(attemptId).delete() }
         }
     }
 
@@ -284,6 +325,67 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
     private fun activeFile(key: ProcessedAudioKey): File =
         File(cacheDir, "${key.toFilename()}.pcm")
 
+    private fun leaseFile(attemptId: String): File {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(attemptId.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        return File(File(cacheDir, LEASE_DIRECTORY), "$digest.lease")
+    }
+
+    private fun loadLeasesLocked() {
+        if (rootState.leasesLoaded) return
+        rootState.leasesLoaded = true
+        val directory = File(cacheDir, LEASE_DIRECTORY)
+        directory.listFiles { _, name -> name.endsWith(".lease") }?.forEach { file ->
+            if (file.lastModified() <= System.currentTimeMillis() - LEASE_RETENTION_MS) {
+                runCatching { file.delete() }
+                return@forEach
+            }
+            val lines = runCatching { file.readLines(Charsets.UTF_8) }.getOrNull()
+            val attemptId = lines?.firstOrNull()?.removePrefix(LEASE_ATTEMPT_PREFIX)
+            val values = lines?.drop(1)?.mapNotNull { line ->
+                val parts = line.split('=', limit = 2)
+                if (parts.size != 2) return@mapNotNull null
+                val count = parts[1].toIntOrNull() ?: return@mapNotNull null
+                parts[0].takeIf { it.length == 64 && it.all { ch -> ch in '0'..'9' || ch in 'a'..'f' } }
+                    ?.let { it to count.takeIf { value -> value > 0 } }
+            }?.mapNotNull { (name, count) -> count?.let { name to it } }
+                ?.toMap()
+            if (attemptId.isNullOrBlank() || values.isNullOrEmpty()) {
+                runCatching { file.delete() }
+            } else {
+                rootState.leases[attemptId] = values
+                values.forEach { (name, count) ->
+                    rootState.references[name] = (rootState.references[name] ?: 0) + count
+                }
+            }
+        }
+    }
+
+    private fun writeLeaseLocked(attemptId: String, filenames: Map<String, Int>) {
+        val directory = File(cacheDir, LEASE_DIRECTORY)
+        check(directory.exists() || directory.mkdirs()) { "Unable to create cache lease directory" }
+        val target = leaseFile(attemptId)
+        val temporary = File.createTempFile(".${target.name}.", ".tmp", directory)
+        try {
+            FileOutputStream(temporary).use { output ->
+                val content = buildString {
+                    append(LEASE_ATTEMPT_PREFIX).append(attemptId).append('\n')
+                    filenames.forEach { (name, count) -> append(name).append('=').append(count).append('\n') }
+                }.toByteArray(Charsets.UTF_8)
+                output.write(content)
+                output.flush()
+                output.fd.sync()
+            }
+            if (!temporary.renameTo(target)) {
+                if (target.exists()) require(target.delete()) { "Cannot replace cache lease" }
+                require(temporary.renameTo(target)) { "Cannot publish cache lease" }
+            }
+        } finally {
+            runCatching { temporary.delete() }
+        }
+    }
+
     private fun touch(file: File) {
         val timestamp = maxOf(System.currentTimeMillis(), accessClock.incrementAndGet())
         accessClock.updateAndGet { maxOf(it, timestamp) }
@@ -329,6 +431,9 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
         const val CACHE_ALGORITHM_VERSION = "cleanup-rnnoise-peak-v1"
         const val WAV_HEADER_BYTES = 44L
         const val PARTIAL_RETENTION_MS = 24L * 60L * 60L * 1_000L
+        const val LEASE_RETENTION_MS = 24L * 60L * 60L * 1_000L
+        private const val LEASE_DIRECTORY = "leases"
+        private const val LEASE_ATTEMPT_PREFIX = "attempt="
 
         private val roots = ConcurrentHashMap<String, SharedRootState>()
     }
@@ -337,6 +442,8 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
         val lock = Any()
         val references = mutableMapOf<String, Int>()
         val ownerReferences = mutableMapOf<String, Map<String, Int>>()
+        val leases = mutableMapOf<String, Map<String, Int>>()
+        var leasesLoaded = false
         val activeTemps = mutableSetOf<String>()
     }
 }

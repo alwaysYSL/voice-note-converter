@@ -22,6 +22,7 @@ import com.aistudio.voicenote.cvtr.editor.audio.MediaCodecPcmSourceReaderFactory
 import com.aistudio.voicenote.cvtr.audio.OggOpusWriter
 import com.aistudio.voicenote.cvtr.audio.SoftwareOpusEncoder
 import com.aistudio.voicenote.cvtr.editor.audio.TimelineRenderer
+import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioCache
 import com.aistudio.voicenote.cvtr.audio.VoiceNoteStorage
 import com.aistudio.voicenote.cvtr.audio.WaveformCodec
 import com.aistudio.voicenote.cvtr.data.local.AppDatabase
@@ -452,27 +453,35 @@ internal class EditorExportWorker(
     private val dependencies: Dependencies = Dependencies.production(appContext),
 ) : CoroutineWorker(appContext, workerParams) {
     override suspend fun doWork(): Result {
+        val processedCache = ProcessedAudioCache(File(applicationContext.cacheDir, "processed_audio"))
+        val requestedAttemptId = inputData.getString(EditorExportWork.EXPORT_ATTEMPT_ID)
+        val requestedWorkerLeaseId = requestedAttemptId?.let { exportWorkerLeaseId(it) }
         val manifestPath = inputData.getString(EditorExportWork.MANIFEST_PATH)
-            ?: return failure("Editor manifest is missing", canRetry = false)
+            ?: return failure("Editor manifest is missing", canRetry = false).also {
+                requestedWorkerLeaseId?.let(processedCache::releaseLease)
+            }
         val file = File(manifestPath)
         var manifest = try {
             EditorRenderManifest.readValidated(file)
         } catch (error: Throwable) {
+            requestedWorkerLeaseId?.let(processedCache::releaseLease)
             error.rethrowIfFatal()
             file.delete()
             return failure(error.message ?: "Editor manifest is invalid", canRetry = false)
         }
-        val requestedAttemptId = inputData.getString(EditorExportWork.EXPORT_ATTEMPT_ID)
         if (requestedAttemptId != null && requestedAttemptId != manifest.exportAttemptId) {
             file.delete()
+            requestedWorkerLeaseId?.let(processedCache::releaseLease)
             return failure("Editor export attempt does not match its manifest", canRetry = false)
         }
+        val workerLeaseId = exportWorkerLeaseId(manifest.exportAttemptId)
         val requestedOutputUri = inputData.getString(EditorExportWork.OUTPUT_URI)
         if (manifest.reservedOutputUri != null && !requestedOutputUri.isNullOrBlank() &&
             requestedOutputUri != manifest.reservedOutputUri &&
             requestedOutputUri != manifest.reservedOutputFinalUri
         ) {
             file.delete()
+            processedCache.releaseLease(workerLeaseId)
             return failure("Editor output identity does not match its manifest", canRetry = false)
         }
         val requestedOutputName = inputData.getString(EditorExportWork.OUTPUT_NAME)
@@ -481,15 +490,30 @@ internal class EditorExportWorker(
             dependencies.history.findByExportAttemptId(manifest.exportAttemptId)
         } catch (error: CancellationException) {
             file.delete()
+            processedCache.releaseLease(workerLeaseId)
             throw error
         } catch (error: Throwable) {
+            processedCache.releaseLease(workerLeaseId)
             error.rethrowIfFatal()
             file.delete()
             return failure(error.message ?: "Could not inspect export history", canRetry = true)
         }
+        if (existingHistory == null) {
+            processedCache.acquireLease(
+                workerLeaseId,
+                manifest.renderSession.tracks.asSequence()
+                    .flatMap { it.clips.asSequence() }
+                    .mapNotNull { it.effects.processedCacheKey }
+                    .groupingBy { it }
+                    .eachCount(),
+            )
+        } else {
+            processedCache.releaseLease(workerLeaseId)
+        }
         try {
             setForeground(createForegroundInfo(inputData.getString(EditorExportWork.OUTPUT_NAME).orEmpty()))
         } catch (error: Throwable) {
+            processedCache.releaseLease(workerLeaseId)
             error.rethrowIfFatal()
             file.delete()
             return failure(error.message ?: "Editor export cannot start in background", canRetry = true)
@@ -520,9 +544,11 @@ internal class EditorExportWorker(
             }
         } catch (error: CancellationException) {
             if (identityClaimed) resolvedIdentity?.let { dependencies.reservation.release(it) }
+            processedCache.releaseLease(workerLeaseId)
             file.delete()
             throw error
         } catch (error: Throwable) {
+            processedCache.releaseLease(workerLeaseId)
             error.rethrowIfFatal()
             if (identityClaimed) resolvedIdentity?.let { dependencies.reservation.release(it) }
             file.delete()
@@ -582,6 +608,9 @@ internal class EditorExportWorker(
             }
             workerResult
         } finally {
+            // Release first so even a fatal reservation-cleanup exception cannot leave a durable
+            // cache lease protecting an attempt that has already reached a terminal worker path.
+            processedCache.releaseLease(workerLeaseId)
             val identity = resolvedIdentity
             val successOwnsIdentity = (exportResult as? EditorExportResult.Success)?.let { result ->
                 result.uri.toString() == identity?.uri || result.uri.toString() == identity?.finalUri
@@ -599,6 +628,8 @@ internal class EditorExportWorker(
             file.delete()
         }
     }
+
+    private fun exportWorkerLeaseId(attemptId: String): String = "$attemptId:worker:$id"
 
     private fun failure(message: String, canRetry: Boolean, cleanupWarning: String? = null): Result =
         Result.failure(

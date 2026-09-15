@@ -9,7 +9,7 @@ import androidx.work.OneTimeWorkRequest
 import androidx.work.ExistingWorkPolicy
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
-import androidx.work.getWorkInfoByIdFlow
+import androidx.lifecycle.Observer
 import com.aistudio.voicenote.cvtr.audio.VoiceNoteConverter
 import com.aistudio.voicenote.cvtr.audio.WaveformCodec
 import com.aistudio.voicenote.cvtr.data.local.AppDatabase
@@ -64,9 +64,9 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.channels.awaitClose
 
 /** Metadata extracted before a source is added to the timeline. */
 internal data class AudioSourceInfo(
@@ -153,7 +153,7 @@ internal interface EditorExportScheduler {
     fun enqueueUnique(
         uniqueName: String,
         request: OneTimeWorkRequest,
-        replaceExisting: Boolean = false,
+        replaceExisting: Boolean,
     ): UUID = enqueue(request)
     fun cancel(id: UUID)
     fun observe(id: UUID): Flow<WorkInfo?>
@@ -161,7 +161,7 @@ internal interface EditorExportScheduler {
 
 /** Small WorkManager seam used by cleanup tests and by the all-or-nothing track workflow. */
 internal interface EditorCleanupScheduler {
-    fun enqueueUnique(uniqueName: String, request: OneTimeWorkRequest, replaceExisting: Boolean = false): UUID
+    fun enqueueUnique(uniqueName: String, request: OneTimeWorkRequest, replaceExisting: Boolean): UUID
     fun cancel(id: UUID)
     fun observe(id: UUID): Flow<WorkInfo?>
 }
@@ -188,8 +188,14 @@ private class WorkManagerEditorExportScheduler(
     override fun cancel(id: UUID) {
         workManager.cancelWorkById(id)
     }
-    override fun observe(id: UUID): Flow<WorkInfo?> =
-        workManager.getWorkInfoByIdFlow(id).map { it }.flowOn(Dispatchers.IO)
+    override fun observe(id: UUID): Flow<WorkInfo?> = callbackFlow {
+        val liveData = workManager.getWorkInfoByIdLiveData(id)
+        val observer = Observer<WorkInfo?> { info -> trySend(info) }
+        // The observer is scoped to this Flow collection. awaitClose always unregisters it when
+        // the observation job is cancelled or the collector leaves the screen.
+        liveData.observeForever(observer)
+        awaitClose { liveData.removeObserver(observer) }
+    }
 }
 
 /** Intents shared by the editor shell and its timeline controls. */
@@ -312,18 +318,22 @@ internal class EditorViewModel(
     private val importsInFlight = AtomicInteger(0)
     private var commandHistory: CommandHistory? = null
     private var launchJob: Job
-    private var exportObservationJob: Job? = null
+    private val exportObservationJobs = mutableMapOf<UUID, Job>()
     private var exportWorkId: UUID? = null
     private var exportManifestPath: String? = null
-    private var exportWorkerStarted = false
+    private val exportWorkerStartedByWorkId = mutableSetOf<UUID>()
     private var editorSourceHistoryId: Long? = null
     private val exportGate = Any()
     private var exportEnqueueInFlight = false
     private var exportCancelRequested = false
-    private val exportRetainedKeys = mutableMapOf<String, Int>()
+    /** UI-side enqueue leases are separate from worker leases so cancellation cannot unpin a running job. */
+    private val exportLeaseAttempts = mutableSetOf<String>()
+    private val exportLeaseByWorkId = mutableMapOf<UUID, String>()
+    private var exportEnqueueAttemptId: String? = null
     private var cleanupObservationJobs: List<Job> = emptyList()
     private var cleanupPreparationJob: Job? = null
     private var cleanupBatch: CleanupBatch? = null
+    private val cleanupOwnershipLock = Any()
     private val processedCache = ProcessedAudioCache(File(application.cacheDir, "processed_audio"))
 
     init {
@@ -633,9 +643,9 @@ internal class EditorViewModel(
             }
             exportEnqueueInFlight = true
             exportCancelRequested = false
-            exportWorkerStarted = false
             exportAttemptId = requestedAttemptId ?: UUID.randomUUID().toString()
-            retainExportReferences(current.session)
+            exportEnqueueAttemptId = exportAttemptId
+            acquireExportLease(current.session, exportAttemptId)
         }
         viewModelScope.launch(Dispatchers.IO) {
             var manifest: File? = null
@@ -666,6 +676,7 @@ internal class EditorViewModel(
                 )
                 val cancelledAfterEnqueue = synchronized(exportGate) {
                     exportWorkId = id
+                    exportLeaseByWorkId[id] = exportAttemptId
                     exportCancelRequested
                 }
                 if (cancelledAfterEnqueue) {
@@ -675,6 +686,11 @@ internal class EditorViewModel(
                         exportManifestPath = null
                         exportWorkId = null
                     }
+                    releaseExportLease(exportAttemptId)
+                    // Keep observing the cancelled WorkManager attempt so its terminal state
+                    // releases the UI-side lease if it was not already released above. The worker
+                    // owns a separate lease for its actual render lifetime.
+                    observeExport(id)
                     _uiState.update { it.copy(export = it.export.copy(
                         status = EditorExportStatus.CANCELLED,
                         canRetry = true,
@@ -695,17 +711,20 @@ internal class EditorViewModel(
                 observeExport(id)
             } catch (error: CancellationException) {
                 manifest?.delete()
-                releaseExportReferences()
+                releaseExportLease(exportAttemptId)
                 throw error
             } catch (error: Throwable) {
                 manifest?.delete()
-                releaseExportReferences()
+                releaseExportLease(exportAttemptId)
                 error.rethrowIfFatal()
                 _uiState.update {
                     it.copy(export = it.export.copy(status = EditorExportStatus.FAILED, error = error.message ?: "Export failed", canRetry = true))
                 }
             } finally {
-                synchronized(exportGate) { exportEnqueueInFlight = false }
+                synchronized(exportGate) {
+                    exportEnqueueInFlight = false
+                    if (exportEnqueueAttemptId == exportAttemptId) exportEnqueueAttemptId = null
+                }
             }
         }
     }
@@ -734,7 +753,7 @@ internal class EditorViewModel(
             preset = preset,
             clips = clipsToProcess.map { clip -> CleanupTarget(clip) },
         )
-        cleanupBatch = batch
+        synchronized(cleanupOwnershipLock) { cleanupBatch = batch }
         _uiState.update {
             it.copy(cleanup = EditorCleanupUiState(
                 status = EditorCleanupStatus.QUEUED,
@@ -744,7 +763,8 @@ internal class EditorViewModel(
                 preset = preset,
             ))
         }
-        cleanupPreparationJob = viewModelScope.launch(Dispatchers.IO) {
+        val preparationJob = viewModelScope.launch(Dispatchers.IO) {
+            var ownedBatch = batch
             try {
                 val requiredBytes = batch.clips.sumOf { target ->
                     val frames = (target.sourceEndMs - target.sourceStartMs).coerceAtLeast(0L) * 48L / 1_000L
@@ -754,7 +774,7 @@ internal class EditorViewModel(
                     completeCleanupFailure(batch, "Insufficient storage for cleanup render", cancelled = false)
                     return@launch
                 }
-                if (cleanupBatch?.id != batch.id) return@launch
+                if (!isCurrentCleanup(batch)) return@launch
                 val prepared = batch.clips.map { target ->
                     target.copy(
                         fingerprint = StableSourceFingerprint.compute(
@@ -762,45 +782,71 @@ internal class EditorViewModel(
                         )
                     )
                 }
-                if (cleanupBatch?.id != batch.id) return@launch
+                if (!isCurrentCleanup(batch)) return@launch
                 val preparedBatch = batch.copy(clips = prepared)
-                cleanupBatch = preparedBatch
-                preparedBatch.clips.forEach { target ->
+                ownedBatch = preparedBatch
+                synchronized(cleanupOwnershipLock) {
                     if (cleanupBatch?.id != batch.id) return@launch
-                    val request = CleanupEffectWork.request(
-                        sourceUri = target.sourceUri,
-                        sourceFingerprint = target.fingerprint,
-                        sourceStartMs = target.sourceStartMs,
-                        sourceEndMs = target.sourceEndMs,
-                        cleanupStrength = preset,
-                        normalized = normalize,
-                    )
-                    val uniqueName = CleanupEffectWork.uniqueWorkName(
-                        sourceFingerprint = target.fingerprint,
-                        start = target.sourceStartMs,
-                        end = target.sourceEndMs,
-                        cleanupStrength = preset,
-                        normalized = normalize,
-                        attemptIdentity = "${batch.id}-${target.clipId}",
-                    )
-                    val workId = cleanupScheduler.enqueueUnique(uniqueName, request, replaceExisting = true)
-                    target.workId = workId
+                    cleanupBatch = preparedBatch
                 }
+                preparedBatch.clips.forEach { target ->
+                    synchronized(cleanupOwnershipLock) {
+                        if (cleanupBatch?.id != batch.id) return@launch
+                        val request = CleanupEffectWork.request(
+                            sourceUri = target.sourceUri,
+                            sourceFingerprint = target.fingerprint,
+                            sourceStartMs = target.sourceStartMs,
+                            sourceEndMs = target.sourceEndMs,
+                            cleanupStrength = preset,
+                            normalized = normalize,
+                        )
+                        val uniqueName = CleanupEffectWork.uniqueWorkName(
+                            sourceFingerprint = target.fingerprint,
+                            start = target.sourceStartMs,
+                            end = target.sourceEndMs,
+                            cleanupStrength = preset,
+                            normalized = normalize,
+                            attemptIdentity = "${batch.id}-${target.clipId}",
+                        )
+                        // Enqueue and record the id under one lock. Cancellation cannot detach
+                        // between WorkManager enqueue and ownership bookkeeping.
+                        target.workId = cleanupScheduler.enqueueUnique(uniqueName, request, replaceExisting = true)
+                    }
+                }
+                if (!isCurrentCleanup(batch)) return@launch
                 _uiState.update { it.copy(cleanup = it.cleanup.copy(status = EditorCleanupStatus.RUNNING)) }
-                cleanupObservationJobs = preparedBatch.clips.map { target ->
+                val observations = preparedBatch.clips.map { target ->
                     viewModelScope.launch(Dispatchers.IO) { observeCleanup(preparedBatch, target) }
+                }
+                synchronized(cleanupOwnershipLock) {
+                    if (cleanupBatch?.id == batch.id) {
+                        cleanupObservationJobs = observations
+                    } else {
+                        observations.forEach { it.cancel() }
+                    }
                 }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
-                completeCleanupFailure(prepared = cleanupBatch, message = error.message ?: "Cleanup could not start", cancelled = false)
+                completeCleanupFailure(prepared = ownedBatch, message = error.message ?: "Cleanup could not start", cancelled = false)
+            }
+        }
+        synchronized(cleanupOwnershipLock) {
+            if (cleanupBatch?.id == batch.id) {
+                cleanupPreparationJob = preparationJob
+            } else {
+                preparationJob.cancel()
             }
         }
     }
 
+    private fun isCurrentCleanup(batch: CleanupBatch): Boolean = synchronized(cleanupOwnershipLock) {
+        cleanupBatch?.id == batch.id
+    }
+
     private suspend fun observeCleanup(batch: CleanupBatch, target: CleanupTarget) {
         cleanupScheduler.observe(target.workId ?: return).filterNotNull().collect { info ->
-            if (cleanupBatch?.id != batch.id) return@collect
+            if (!isCurrentCleanup(batch)) return@collect
             val progress = info.progress.getFloat(CleanupEffectWork.PROGRESS, 0f)
             val done = synchronized(batch.completed) { batch.completed.size }
             val total = batch.clips.size.coerceAtLeast(1)
@@ -850,7 +896,7 @@ internal class EditorViewModel(
 
     private suspend fun applyCompletedCleanup(batch: CleanupBatch) {
         mutationMutex.withLock {
-            if (cleanupBatch?.id != batch.id) return@withLock
+            if (!isCurrentCleanup(batch)) return@withLock
             val current = _uiState.value.session
             val completed = synchronized(batch.completed) { batch.completed.toMap() }
             val valid = batch.clips.all { target ->
@@ -875,9 +921,14 @@ internal class EditorViewModel(
             if (result is TimelineResult.Accepted) {
                 publishSession(result.value)
                 syncCacheReferences()
-                cleanupBatch = null
-                cleanupObservationJobs.forEach { it.cancel() }
-                cleanupObservationJobs = emptyList()
+                synchronized(cleanupOwnershipLock) {
+                    if (cleanupBatch?.id == batch.id) {
+                        cleanupBatch = null
+                        cleanupPreparationJob = null
+                        cleanupObservationJobs.forEach { it.cancel() }
+                        cleanupObservationJobs = emptyList()
+                    }
+                }
                 _uiState.update { it.copy(cleanup = it.cleanup.copy(status = EditorCleanupStatus.SUCCEEDED, progress = 1f, error = null, canRetry = false)) }
             } else {
                 completeCleanupFailure(batch, "Cleanup result could not be applied", cancelled = false)
@@ -886,13 +937,18 @@ internal class EditorViewModel(
     }
 
     private fun completeCleanupFailure(prepared: CleanupBatch?, message: String, cancelled: Boolean) {
-        if (prepared == null || cleanupBatch?.id != prepared.id) return
-        prepared.clips.mapNotNull { it.workId }.forEach(cleanupScheduler::cancel)
+        if (prepared == null) return
+        val workIds = synchronized(cleanupOwnershipLock) {
+            if (cleanupBatch?.id != prepared.id) return
+            cleanupBatch = null
+            cleanupPreparationJob = null
+            cleanupObservationJobs.forEach { it.cancel() }
+            cleanupObservationJobs = emptyList()
+            prepared.clips.mapNotNull { it.workId }
+        }
+        workIds.forEach(cleanupScheduler::cancel)
         synchronized(prepared.completed) { prepared.completed.values.toList() }
             .forEach(processedCache::deleteIfUnreferenced)
-        cleanupObservationJobs.forEach { it.cancel() }
-        cleanupObservationJobs = emptyList()
-        cleanupBatch = null
         _uiState.update {
             it.copy(cleanup = it.cleanup.copy(
                 status = if (cancelled) EditorCleanupStatus.CANCELLED else EditorCleanupStatus.FAILED,
@@ -903,15 +959,19 @@ internal class EditorViewModel(
     }
 
     private fun cancelCleanup(publishCancelled: Boolean = true) {
-        cleanupPreparationJob?.cancel()
-        cleanupPreparationJob = null
-        val batch = cleanupBatch ?: return
-        batch.clips.mapNotNull { it.workId }.forEach(cleanupScheduler::cancel)
-        cleanupObservationJobs.forEach { it.cancel() }
-        cleanupObservationJobs = emptyList()
+        val cancellation = synchronized(cleanupOwnershipLock) {
+            cleanupPreparationJob?.cancel()
+            cleanupPreparationJob = null
+            val batch = cleanupBatch ?: return@synchronized null
+            cleanupBatch = null
+            cleanupObservationJobs.forEach { it.cancel() }
+            cleanupObservationJobs = emptyList()
+            batch to batch.clips.mapNotNull { it.workId }
+        } ?: return
+        val (batch, workIds) = cancellation
+        workIds.forEach(cleanupScheduler::cancel)
         synchronized(batch.completed) { batch.completed.values.toList() }
             .forEach(processedCache::deleteIfUnreferenced)
-        cleanupBatch = null
         if (publishCancelled) {
             _uiState.update { it.copy(cleanup = it.cleanup.copy(status = EditorCleanupStatus.CANCELLED, canRetry = true, error = "Cleanup cancelled")) }
         }
@@ -924,81 +984,107 @@ internal class EditorViewModel(
     }
 
     private fun observeExport(id: UUID) {
-        exportObservationJob?.cancel()
-        exportObservationJob = viewModelScope.launch {
-            exportScheduler.observe(id).filterNotNull().collect { info ->
+        val (previous, _) = synchronized(exportGate) {
+            val previousJob = exportObservationJobs.remove(id)
+            val observationJob = viewModelScope.launch {
+                exportScheduler.observe(id).filterNotNull().collect { info ->
+                val isCurrentWork = synchronized(exportGate) { exportWorkId == id }
+                if (!isCurrentWork && info.state != WorkInfo.State.SUCCEEDED &&
+                    info.state != WorkInfo.State.FAILED && info.state != WorkInfo.State.CANCELLED
+                ) return@collect
                 val progress = info.progress.getFloat(EditorExportWork.PROGRESS, _uiState.value.export.progress)
                 when (info.state) {
                     WorkInfo.State.ENQUEUED -> _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.QUEUED, progress = progress)) }
                     WorkInfo.State.RUNNING -> {
-                        synchronized(exportGate) { exportWorkerStarted = true }
+                        synchronized(exportGate) { exportWorkerStartedByWorkId += id }
                         _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.RUNNING, progress = progress)) }
                     }
                     WorkInfo.State.SUCCEEDED -> {
-                        _uiState.update {
-                            it.copy(export = it.export.copy(
-                                status = EditorExportStatus.SUCCEEDED,
-                                progress = 1f,
-                                resultUri = info.outputData.getString(EditorExportWork.RESULT_URI),
-                                resultHistoryId = info.outputData.getLong(EditorExportWork.RESULT_HISTORY_ID, 0L).takeIf { id -> id > 0L },
-                                error = null,
-                                canRetry = false,
-                                cleanupWarning = info.outputData.getString(EditorExportWork.CLEANUP_WARNING),
-                            ))
+                        if (isCurrentWork) {
+                            _uiState.update {
+                                it.copy(export = it.export.copy(
+                                    status = EditorExportStatus.SUCCEEDED,
+                                    progress = 1f,
+                                    resultUri = info.outputData.getString(EditorExportWork.RESULT_URI),
+                                    resultHistoryId = info.outputData.getLong(EditorExportWork.RESULT_HISTORY_ID, 0L).takeIf { id -> id > 0L },
+                                    error = null,
+                                    canRetry = false,
+                                    cleanupWarning = info.outputData.getString(EditorExportWork.CLEANUP_WARNING),
+                                ))
+                            }
+                            synchronized(exportGate) {
+                                exportManifestPath = null
+                                exportWorkId = null
+                            }
                         }
-                        synchronized(exportGate) {
-                            exportManifestPath = null
-                            exportWorkId = null
-                        }
-                        releaseExportReferences()
-                        exportObservationJob?.cancel()
+                        synchronized(exportGate) { exportWorkerStartedByWorkId.remove(id) }
+                        releaseExportLeaseForWork(id)
+                        synchronized(exportGate) { exportObservationJobs.remove(id) }?.cancel()
                     }
                     WorkInfo.State.FAILED -> {
-                        _uiState.update {
-                            it.copy(export = it.export.copy(
-                                status = EditorExportStatus.FAILED,
-                                error = info.outputData.getString(EditorExportWork.ERROR_MESSAGE) ?: "Export failed",
-                                canRetry = info.outputData.getBoolean(EditorExportWork.CAN_RETRY, true),
-                                cleanupWarning = info.outputData.getString(EditorExportWork.CLEANUP_WARNING),
-                            ))
+                        if (isCurrentWork) {
+                            _uiState.update {
+                                it.copy(export = it.export.copy(
+                                    status = EditorExportStatus.FAILED,
+                                    error = info.outputData.getString(EditorExportWork.ERROR_MESSAGE) ?: "Export failed",
+                                    canRetry = info.outputData.getBoolean(EditorExportWork.CAN_RETRY, true),
+                                    cleanupWarning = info.outputData.getString(EditorExportWork.CLEANUP_WARNING),
+                                ))
+                            }
+                            synchronized(exportGate) {
+                                exportManifestPath = null
+                                exportWorkId = null
+                            }
                         }
-                        synchronized(exportGate) {
-                            exportManifestPath = null
-                            exportWorkId = null
-                        }
-                        releaseExportReferences()
-                        exportObservationJob?.cancel()
+                        synchronized(exportGate) { exportWorkerStartedByWorkId.remove(id) }
+                        releaseExportLeaseForWork(id)
+                        synchronized(exportGate) { exportObservationJobs.remove(id) }?.cancel()
                     }
                     WorkInfo.State.CANCELLED -> {
-                        _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.CANCELLED)) }
-                        synchronized(exportGate) {
-                            exportManifestPath = null
-                            exportWorkId = null
+                        if (isCurrentWork) {
+                            _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.CANCELLED)) }
+                            synchronized(exportGate) {
+                                exportManifestPath = null
+                                exportWorkId = null
+                            }
                         }
-                        releaseExportReferences()
-                        exportObservationJob?.cancel()
+                        synchronized(exportGate) { exportWorkerStartedByWorkId.remove(id) }
+                        releaseExportLeaseForWork(id)
+                        synchronized(exportGate) { exportObservationJobs.remove(id) }?.cancel()
                     }
                     WorkInfo.State.BLOCKED -> Unit
                 }
+                }
             }
+            exportObservationJobs[id] = observationJob
+            previousJob to observationJob
         }
+        previous?.cancel()
     }
 
     private fun cancelExport() {
         val workId: UUID?
         val manifestPath: String?
+        val attemptId: String?
         synchronized(exportGate) {
             if (!exportEnqueueInFlight && exportWorkId == null) return
             exportCancelRequested = true
             workId = exportWorkId
-            manifestPath = exportManifestPath.takeIf { workId == null || !exportWorkerStarted }
+            attemptId = workId?.let(exportLeaseByWorkId::get)
+                ?: exportEnqueueAttemptId
+                ?: _uiState.value.export.exportAttemptId
+            manifestPath = exportManifestPath.takeIf {
+                workId == null || workId !in exportWorkerStartedByWorkId
+            }
             if (manifestPath != null) exportManifestPath = null
         }
         workId?.let(exportScheduler::cancel)
         manifestPath?.let { File(it).delete() }
-        // Cancellation is the terminal ownership transition for the queued export. The worker
-        // still performs its own best-effort file cleanup, but cache eviction may proceed now.
-        releaseExportReferences()
+        // Release only the UI enqueue lease. A worker that raced into RUNNING has its own
+        // durable lease and will release it from its terminal finally block.
+        attemptId?.let(::releaseExportLease)
+        // The durable worker lease remains until WorkManager reports a terminal state. Releasing
+        // here would let eviction delete PCM while a running worker still needs it.
         _uiState.update { it.copy(export = it.export.copy(
             status = EditorExportStatus.CANCELLED,
             canRetry = true,
@@ -1114,23 +1200,27 @@ internal class EditorViewModel(
         processedCache.replaceSessionReferences(counts)
     }
 
-    private fun retainExportReferences(session: EditorSession) {
-        releaseExportReferences()
-        session.tracks.asSequence()
+    private fun acquireExportLease(session: EditorSession, attemptId: String) {
+        val counts = session.tracks.asSequence()
             .flatMap { it.clips.asSequence() }
             .mapNotNull { it.effects.processedCacheKey }
             .groupingBy { it }
             .eachCount()
-            .forEach { (key, count) ->
-                repeat(count) { processedCache.retainFilename(key) }
-                exportRetainedKeys[key] = count
-            }
+        processedCache.acquireLease(exportUiLeaseId(attemptId), counts)
+        exportLeaseAttempts += attemptId
     }
 
-    private fun releaseExportReferences() {
-        exportRetainedKeys.forEach { (key, count) -> repeat(count) { processedCache.releaseFilename(key) } }
-        exportRetainedKeys.clear()
+    private fun releaseExportLease(attemptId: String) {
+        val owned = synchronized(exportGate) { exportLeaseAttempts.remove(attemptId) }
+        if (owned) processedCache.releaseLease(exportUiLeaseId(attemptId))
     }
+
+    private fun releaseExportLeaseForWork(workId: UUID) {
+        val attemptId = synchronized(exportGate) { exportLeaseByWorkId.remove(workId) }
+        attemptId?.let(::releaseExportLease)
+    }
+
+    private fun exportUiLeaseId(attemptId: String): String = "$attemptId:ui"
 
     private fun processedCacheDir(): File = File(getApplication<Application>().cacheDir, "processed_audio")
 

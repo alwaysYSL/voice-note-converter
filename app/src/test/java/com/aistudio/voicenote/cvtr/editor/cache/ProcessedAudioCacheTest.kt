@@ -112,6 +112,33 @@ class ProcessedAudioCacheTest {
     }
 
     @Test
+    fun `export lease protects cache until terminal release`() {
+        cache.commit(referencedKey, validFixture)
+        val filename = referencedKey.toFilename()
+
+        cache.acquireLease("export-attempt-1", mapOf(filename to 1))
+        cache.evictToSize(0)
+        assertNotNull(cache.find(referencedKey))
+
+        cache.releaseLease("export-attempt-1")
+        cache.evictToSize(0)
+        assertNull(cache.find(referencedKey))
+    }
+
+    @Test
+    fun `startup removes aged orphan partials`() {
+        val startupCacheDir = tempFolder.newFolder("startup-cache")
+        val orphan = File(startupCacheDir, "orphan.partial").apply {
+            writeText("stale")
+            setLastModified(System.currentTimeMillis() - ProcessedAudioCache.PARTIAL_RETENTION_MS - 1L)
+        }
+
+        ProcessedAudioCache(startupCacheDir)
+
+        assertFalse(orphan.exists())
+    }
+
+    @Test
     fun `corrupt output never replaces valid active cache`() {
         val active = cache.commit(key, validFixture)
         val before = active.readBytes()
