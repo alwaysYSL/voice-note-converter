@@ -5,6 +5,7 @@ import androidx.work.Data
 import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
 import com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength
+import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioCache
 
 internal object CleanupEffectWork {
     const val SOURCE_URI = "cleanup.sourceUri"
@@ -13,6 +14,7 @@ internal object CleanupEffectWork {
     const val SOURCE_END_MS = "cleanup.sourceEndMs"
     const val CLEANUP_STRENGTH = "cleanup.strength"
     const val NORMALIZED = "cleanup.normalized"
+    const val ALGORITHM_VERSION = "cleanup.algorithmVersion"
     
     const val RESULT_CACHE_KEY_FILENAME = "cleanup.resultCacheKeyFilename"
     const val RESULT_CACHE_KEY_FINGERPRINT = "cleanup.resultCacheKeyFingerprint"
@@ -25,6 +27,7 @@ internal object CleanupEffectWork {
         sourceEndMs: Long,
         cleanupStrength: CleanupStrength,
         normalized: Boolean,
+        algorithmVersion: String = ProcessedAudioCache.CACHE_ALGORITHM_VERSION,
     ): OneTimeWorkRequest {
         val input = Data.Builder()
             .putString(SOURCE_URI, sourceUri)
@@ -33,6 +36,7 @@ internal object CleanupEffectWork {
             .putLong(SOURCE_END_MS, sourceEndMs)
             .putString(CLEANUP_STRENGTH, cleanupStrength.name)
             .putBoolean(NORMALIZED, normalized)
+            .putString(ALGORITHM_VERSION, algorithmVersion)
             .build()
             
         return OneTimeWorkRequestBuilder<CleanupEffectWorker>()
@@ -45,7 +49,14 @@ internal object CleanupEffectWork {
             .build()
     }
 
-    fun uniqueWorkName(sourceFingerprint: String, start: Long, end: Long): String {
-        return "cleanup.$sourceFingerprint.$start.$end"
+    fun uniqueWorkName(
+        sourceFingerprint: String,
+        start: Long,
+        end: Long,
+        cleanupStrength: CleanupStrength = CleanupStrength.OFF,
+        normalized: Boolean = false,
+        algorithmVersion: String = ProcessedAudioCache.CACHE_ALGORITHM_VERSION,
+    ): String {
+        return "cleanup.$sourceFingerprint.$start.$end.${cleanupStrength.name}.$normalized.$algorithmVersion"
     }
 }

@@ -15,7 +15,6 @@ class ProcessedAudioCacheTest {
     @get:Rule
     val tempFolder = TemporaryFolder()
 
-    private lateinit by lazy { tempFolder.newFolder("cache") } // Wait I shouldn't use by lazy
     private lateinit var cacheDir: File
     private lateinit var cache: ProcessedAudioCache
 
@@ -79,5 +78,38 @@ class ProcessedAudioCacheTest {
         
         assertNotNull(cache.find(referencedKey))
         assertNull(cache.find(unreferencedKey))
+    }
+
+    @Test
+    fun `corrupt output never replaces valid active cache`() {
+        val active = cache.commit(key, validFixture)
+        val before = active.readBytes()
+        val corrupt = tempFolder.newFile("corrupt.pcm").apply {
+            writeBytes(ByteArray(44))
+        }
+
+        try {
+            cache.commit(key, corrupt)
+            fail("corrupt output must be rejected")
+        } catch (_: IllegalArgumentException) {
+            // The active cache remains untouched.
+        } catch (_: java.io.IOException) {
+            // The active cache remains untouched.
+        }
+
+        assertArrayEquals(before, active.readBytes())
+        assertEquals(active.absolutePath, cache.find(key)?.absolutePath)
+        assertTrue(cache.partialFiles().isEmpty())
+    }
+
+    @Test
+    fun `key includes version and every processing option`() {
+        val same = key.copy()
+        val changedAlgorithm = key.copy(algorithmVersion = "cleanup-rnnoise-peak-v2")
+        val changedMode = key.copy(normalized = false)
+
+        assertEquals(same.toFilename(), key.toFilename())
+        assertNotEquals(key.toFilename(), changedAlgorithm.toFilename())
+        assertNotEquals(key.toFilename(), changedMode.toFilename())
     }
 }
