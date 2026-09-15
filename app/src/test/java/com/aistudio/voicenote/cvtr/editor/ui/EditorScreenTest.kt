@@ -113,6 +113,7 @@ class EditorScreenTest {
         }
 
         compose.onNodeWithTag("cleanup_toolbar").performClick()
+        compose.waitForIdle()
         compose.onNodeWithTag("cleanup_apply").performClick()
 
         val cleanup = intents.filterIsInstance<EditorIntent.StartCleanup>().single()

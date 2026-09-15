@@ -2,6 +2,7 @@ package com.aistudio.voicenote.cvtr.editor.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -79,6 +80,15 @@ internal fun ContextualEditorToolbar(
                 }
             },
         )
+        // Keep the cleanup entry point in the leading viewport of the compact,
+        // horizontally scrolling toolbar so it is reachable without a hidden
+        // scroll gesture.
+        EditorToolButton(
+            label = "Cleanup",
+            enabled = hasSelection,
+            onClick = { onIntent(EditorIntent.ShowSheet(EditorSheet.CLEANUP)) },
+            modifier = Modifier.testTag("cleanup_toolbar"),
+        )
         EditorToolButton(
             label = "Fade",
             enabled = hasSelection,
@@ -93,12 +103,6 @@ internal fun ContextualEditorToolbar(
             label = "Speed",
             enabled = hasSelection,
             onClick = { onIntent(EditorIntent.ShowSheet(EditorSheet.SPEED)) },
-        )
-        EditorToolButton(
-            label = "Cleanup",
-            enabled = hasSelection,
-            onClick = { onIntent(EditorIntent.ShowSheet(EditorSheet.CLEANUP)) },
-            modifier = Modifier.testTag("cleanup_toolbar"),
         )
         androidx.compose.foundation.layout.Box {
             OutlinedButton(
@@ -164,7 +168,9 @@ internal fun EditorToolSheet(
         shape = MaterialTheme.shapes.medium,
     ) {
         Column(
-            modifier = Modifier.padding(16.dp),
+            modifier = Modifier
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Row(
@@ -243,6 +249,34 @@ internal fun EditorToolSheet(
                     var strength by remember { mutableStateOf(com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.OFF) }
                     var applyToTrack by remember { mutableStateOf(false) }
 
+                    when (cleanupState.status) {
+                        EditorCleanupStatus.QUEUED, EditorCleanupStatus.RUNNING -> {
+                            Text("Processing ${(cleanupState.progress * 100f).toInt().coerceIn(0, 100)}%", modifier = Modifier.testTag("cleanup_progress"))
+                            androidx.compose.material3.LinearProgressIndicator(
+                                progress = { cleanupState.progress.coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            Button(onClick = { onIntent(EditorIntent.CancelCleanup) }, modifier = Modifier.fillMaxWidth()) {
+                                Text("Cancel")
+                            }
+                        }
+                        EditorCleanupStatus.FAILED, EditorCleanupStatus.CANCELLED -> {
+                            cleanupState.error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("cleanup_error")) }
+                            Button(onClick = { onIntent(EditorIntent.RetryCleanup) }, modifier = Modifier.fillMaxWidth()) { Text("Retry") }
+                        }
+                        else -> {
+                            // Keep the primary action above optional controls so it remains
+                            // reachable in the compact editor viewport; the panel scrolls for
+                            // the target and preset choices below.
+                            Button(
+                                onClick = {
+                                    onIntent(EditorIntent.StartCleanup(clip.id, normalize, strength, applyToTrack))
+                                },
+                                modifier = Modifier.fillMaxWidth().testTag("cleanup_apply"),
+                            ) { Text("Terapkan") }
+                        }
+                    }
+
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         androidx.compose.material3.Checkbox(
                             checked = applyToTrack,
@@ -274,30 +308,6 @@ internal fun EditorToolSheet(
                         }
                     }
 
-                    when (cleanupState.status) {
-                        EditorCleanupStatus.QUEUED, EditorCleanupStatus.RUNNING -> {
-                            Text("Processing ${(cleanupState.progress * 100f).toInt().coerceIn(0, 100)}%", modifier = Modifier.testTag("cleanup_progress"))
-                            androidx.compose.material3.LinearProgressIndicator(
-                                progress = { cleanupState.progress.coerceIn(0f, 1f) },
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                            Button(onClick = { onIntent(EditorIntent.CancelCleanup) }, modifier = Modifier.fillMaxWidth()) {
-                                Text("Cancel")
-                            }
-                        }
-                        EditorCleanupStatus.FAILED, EditorCleanupStatus.CANCELLED -> {
-                            cleanupState.error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("cleanup_error")) }
-                            Button(onClick = { onIntent(EditorIntent.RetryCleanup) }, modifier = Modifier.fillMaxWidth()) { Text("Retry") }
-                        }
-                        else -> {
-                            Button(
-                                onClick = {
-                                    onIntent(EditorIntent.StartCleanup(clip.id, normalize, strength, applyToTrack))
-                                },
-                                modifier = Modifier.fillMaxWidth().testTag("cleanup_apply"),
-                            ) { Text("Terapkan") }
-                        }
-                    }
                 }
             }
         }
