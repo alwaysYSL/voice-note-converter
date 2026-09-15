@@ -1,7 +1,16 @@
 package com.aistudio.voicenote.cvtr.editor.work
 
 import android.app.Application
+import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
+import androidx.work.Data
+import androidx.work.ForegroundUpdater
+import androidx.work.ListenableWorker
+import androidx.work.ProgressUpdater
+import androidx.work.WorkerFactory
+import androidx.work.WorkerParameters
+import androidx.work.impl.utils.taskexecutor.SerialExecutor
+import androidx.work.impl.utils.taskexecutor.TaskExecutor
 import com.aistudio.voicenote.cvtr.data.local.AppDatabase
 import com.aistudio.voicenote.cvtr.data.local.ConversionHistory
 import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioCache
@@ -15,7 +24,11 @@ import com.aistudio.voicenote.cvtr.editor.model.EditorSession
 import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
+import com.google.common.util.concurrent.Futures
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -52,8 +65,9 @@ class EditorMaintenanceWorkerTest {
             freeSpace = { Long.MAX_VALUE },
             safetyBytes = 0L,
         )
+        val database = Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).build()
         val repository = EditorDraftRepository(
-            database = AppDatabase.getDatabase(app),
+            database = database,
             sourceStorage = sourceStorage,
             processedAudioCache = ProcessedAudioCache(File(app.cacheDir, "processed_audio")),
         )
@@ -83,7 +97,7 @@ class EditorMaintenanceWorkerTest {
             parentFile?.mkdirs()
             writeText("history")
         }
-        AppDatabase.getDatabase(app).conversionHistoryDao().insert(
+        database.conversionHistoryDao().insert(
             ConversionHistory(
                 originalFileName = "input.wav",
                 outputFileName = "history.ogg",
@@ -115,7 +129,7 @@ class EditorMaintenanceWorkerTest {
         )
         EditorRenderManifest.writePrivate(app, session, exportAttemptId = attemptId)
 
-        EditorMaintenanceWorker.runOnce(app, nowMs = now)
+        EditorMaintenanceWorker.runOnce(app, nowMs = now, database = database)
 
         assertFalse(orphan.exists())
         assertTrue(draftSource.exists())
@@ -124,5 +138,59 @@ class EditorMaintenanceWorkerTest {
         repository.delete(draftId)
         sourceFile.delete()
         historyOutput.delete()
+        database.close()
+    }
+
+    @Test
+    fun `cancellation is propagated instead of converted to retry`() = runTest {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val worker = EditorMaintenanceWorker(
+            app,
+            workerParameters(Data.Builder().build()),
+            maintenance = { throw CancellationException("cancelled") },
+        )
+
+        var propagated = false
+        try {
+            worker.doWork()
+        } catch (_: CancellationException) {
+            propagated = true
+        }
+        assertTrue(propagated)
+    }
+
+    private fun workerParameters(input: Data): WorkerParameters {
+        val executor = Executors.newSingleThreadExecutor()
+        val serial = object : SerialExecutor {
+            override fun execute(command: Runnable) = executor.execute(command)
+            override fun hasPendingTasks(): Boolean = false
+        }
+        val taskExecutor = object : TaskExecutor {
+            override fun getMainThreadExecutor(): Executor = executor
+            override fun getSerialTaskExecutor(): SerialExecutor = serial
+        }
+        val workerFactory = object : WorkerFactory() {
+            override fun createWorker(
+                appContext: android.content.Context,
+                workerClassName: String,
+                workerParameters: WorkerParameters,
+            ): ListenableWorker? = null
+        }
+        val progress = ProgressUpdater { _, _, _ -> Futures.immediateVoidFuture() }
+        val foreground = ForegroundUpdater { _, _, _ -> Futures.immediateVoidFuture() }
+        return WorkerParameters(
+            UUID.randomUUID(),
+            input,
+            emptyList<String>(),
+            WorkerParameters.RuntimeExtras(),
+            0,
+            0,
+            executor,
+            kotlinx.coroutines.Dispatchers.Default,
+            taskExecutor,
+            workerFactory,
+            progress,
+            foreground,
+        )
     }
 }

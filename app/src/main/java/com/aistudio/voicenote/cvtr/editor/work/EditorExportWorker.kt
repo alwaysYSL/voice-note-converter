@@ -31,6 +31,7 @@ import com.aistudio.voicenote.cvtr.editor.model.ExportPreset
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.security.MessageDigest
@@ -145,6 +146,7 @@ internal class EditorExportRunner(
     private val history: EditorExportHistory,
     private val reservationStore: EditorExportReservationStore? = null,
     private val workId: String = UUID.randomUUID().toString(),
+    private val availableSpaceBytes: () -> Long = { Long.MAX_VALUE },
 ) {
     suspend fun run(
         manifest: EditorRenderManifest,
@@ -242,6 +244,13 @@ internal class EditorExportRunner(
                 partialFile = storage.createPartialFile(workId)
                 publishedUri = recoveredUri
             } else {
+                val requiredBytes = estimateRequiredBytes(
+                    manifest.timelineDurationFrames,
+                    normalized = false,
+                )
+                if (availableSpaceBytes() < requiredBytes) {
+                    throw IOException("Insufficient storage for export")
+                }
                 partialFile = storage.createPartialFile(workId)
                 // Own the reserved identity throughout rendering, so cancellation or encoder
                 // failure can remove a pending MediaStore/file reservation as well.
@@ -563,6 +572,7 @@ internal class EditorExportWorker(
             // The attempt id survives WorkManager process recreation, unlike a transient worker
             // instance. This also makes any unfinished private partial path deterministic.
             workId = manifest.exportAttemptId,
+            availableSpaceBytes = dependencies.availableSpaceBytes,
         )
         return try {
             workerResult = when (val result = runner.run(
@@ -677,6 +687,7 @@ internal class EditorExportWorker(
         val storage: EditorExportStorage,
         val history: EditorExportHistory,
         val reservation: EditorExportReservationStore,
+        val availableSpaceBytes: () -> Long = { Long.MAX_VALUE },
     ) {
         companion object {
             fun production(context: Context): Dependencies = Dependencies(
@@ -718,6 +729,7 @@ internal class EditorExportWorker(
                 storage = AndroidEditorExportStorage(context),
                 history = RoomEditorExportHistory(AppDatabase.getDatabase(context).conversionHistoryDao()),
                 reservation = AndroidEditorExportReservationStore(context),
+                availableSpaceBytes = { context.filesDir.usableSpace },
             )
         }
     }

@@ -103,6 +103,26 @@ class CommandHistoryTest {
     }
 
     @Test
+    fun `undo back to saved content is clean while redo becomes dirty again`() {
+        val history = CommandHistory(initialSession()).also { it.markClean("draft-1") }
+
+        history.execute(SetTrackMutedCommand("track-1", true))
+        assertTrue(history.session.dirty)
+
+        history.undo()
+        assertFalse(history.session.dirty)
+        history.redo()
+        assertTrue(history.session.dirty)
+
+        // Selection and playhead are transient and do not dirty a durable baseline.
+        history.updateSelection("clip-b")
+        assertTrue(history.session.dirty)
+        history.undo()
+        history.updateSelection("clip-c")
+        assertFalse(history.session.dirty)
+    }
+
+    @Test
     fun `caller-owned lists cannot mutate active session or history snapshots`() {
         val clips = mutableListOf(
             AudioClip("clip-a", AudioSourceRef("content://source", 60_000), 0, 1_000, 0),

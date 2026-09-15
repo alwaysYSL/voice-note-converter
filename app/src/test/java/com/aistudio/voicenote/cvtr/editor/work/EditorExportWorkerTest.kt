@@ -285,6 +285,43 @@ class EditorExportWorkerTest {
         }
     }
 
+    @Test
+    fun `worker refuses low space before creating a render partial`() = runBlocking {
+        val root = File(System.getProperty("java.io.tmpdir"), "editor-export-low-space-${UUID.randomUUID()}")
+            .also { it.mkdirs() }
+        val manifestFile = File(root, "manifest.json")
+        val storage = FakeStorage()
+        val snapshot = manifest().copy(exportAttemptId = "worker-low-space")
+        snapshot.writeTo(manifestFile)
+        val request = EditorExportWork.request(
+            manifestPath = manifestFile.absolutePath,
+            outputName = "mix.ogg",
+            preset = snapshot.preset,
+            exportAttemptId = snapshot.exportAttemptId,
+        )
+        val dependencies = EditorExportWorker.Dependencies(
+            rendererFactory = { error("renderer must not start") },
+            encoderFactory = { _, _, _ -> error("encoder must not start") },
+            storage = storage,
+            history = FakeHistory(),
+            reservation = FakeReservationStore(storage),
+            availableSpaceBytes = { 0L },
+        )
+
+        try {
+            val result = EditorExportWorker(
+                ApplicationProvider.getApplicationContext<Context>(),
+                workerParameters(request.workSpec.input),
+                dependencies,
+            ).doWork()
+
+            assertTrue(result is ListenableWorker.Result.Failure)
+            assertTrue(storage.partial.isEmpty())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     private fun runner(
         storage: EditorExportStorage,
         history: FakeHistory,

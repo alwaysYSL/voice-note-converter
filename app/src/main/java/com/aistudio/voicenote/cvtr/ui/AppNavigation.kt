@@ -128,6 +128,7 @@ fun AppNavigation(
                         pendingEditorLaunch = null
                         navController.navigate("editor?draftId=$draftId")
                     },
+                    onDeleteDraft = historyViewModel::deleteDraft,
                     bottomOverlayClearance = BottomOverlayClearance
                 )
             }

@@ -13,6 +13,7 @@ import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioCache
 import com.aistudio.voicenote.cvtr.editor.data.DraftSourceStorage
 import com.aistudio.voicenote.cvtr.editor.data.EditorDraftRepository
 import java.io.File
+import kotlinx.coroutines.CancellationException
 import java.util.concurrent.TimeUnit
 
 /**
@@ -22,10 +23,13 @@ import java.util.concurrent.TimeUnit
 class EditorMaintenanceWorker(
     appContext: Context,
     workerParams: WorkerParameters,
+    private val maintenance: suspend () -> Unit = { runOnce(appContext) },
 ) : CoroutineWorker(appContext, workerParams) {
     override suspend fun doWork(): Result = try {
-        runOnce(applicationContext)
+        maintenance()
         Result.success()
+    } catch (error: CancellationException) {
+        throw error
     } catch (_: Throwable) {
         Result.retry()
     }
@@ -39,9 +43,9 @@ class EditorMaintenanceWorker(
             context: Context,
             nowMs: Long = System.currentTimeMillis(),
             retentionMs: Long = RETENTION_MS,
+            database: AppDatabase = AppDatabase.getDatabase(context),
         ): MaintenanceSummary {
             require(retentionMs >= 0L) { "retentionMs must not be negative" }
-            val database = AppDatabase.getDatabase(context)
             val cache = ProcessedAudioCache(File(context.cacheDir, CACHE_DIRECTORY))
             val draftRepository = EditorDraftRepository(
                 database = database,

@@ -20,3 +20,16 @@
 
 1. Valid export manifests are conservatively retained until a later maintenance pass; malformed/temporary orphan manifests and unowned aged partials are removed.
 2. Full device validation of WorkManager cancellation and URI-provider duration probing remains pending.
+
+## Fix Round 1
+
+- Wired History draft deletion through `AppNavigation` and the real `HistoryViewModel` callback.
+- Reworked `CommandHistory` around a durable rendered-content baseline so undo/redo recomputes dirty state while selection/playhead remain transient; initial save failures retain `Simpan sebagai draft`.
+- Serialized source replacement from probe through persistence and publish, with durable-draft reload after post-commit/lease failures.
+- Draft loads now probe metadata and waveform decode for every private source and mark corrupt/short audio offline.
+- Maintenance rethrows cancellation; export rechecks the explicit storage estimate immediately before rendering a partial.
+
+Verification:
+
+- Focused Fix Round 1 suite: **82 tests, 0 failures**.
+- `:app:assembleDebug` — BUILD SUCCESSFUL for arm64-v8a, armeabi-v7a, and x86_64.

@@ -21,6 +21,9 @@ internal class CommandHistory(
     var session: EditorSession = initial
         private set
 
+    /** Durable rendered-audio baseline. Selection/playhead/session ids never participate. */
+    private var durableBaseline: EditorSession = initial
+
     private val undo = ArrayDeque<EditorSession>()
     private val redo = ArrayDeque<EditorSession>()
 
@@ -39,6 +42,7 @@ internal class CommandHistory(
     /** Marks the current timeline as the durable baseline after an explicit draft save. */
     @Synchronized
     fun markClean(draftId: String = session.draftId ?: session.id): EditorSession {
+        durableBaseline = session.copy(id = draftId, draftId = draftId, dirty = false)
         session = session.copy(id = draftId, draftId = draftId, dirty = false)
         return session
     }
@@ -59,7 +63,7 @@ internal class CommandHistory(
         if (result is TimelineResult.Accepted) {
             undo.addLast(session)
             trimToCapacity(undo)
-            session = result.value
+            session = withDirtyBaseline(result.value)
             redo.clear()
         }
         return result
@@ -70,7 +74,7 @@ internal class CommandHistory(
     fun undo(): EditorSession {
         if (undo.isEmpty()) return session
         redo.addLast(session)
-        session = restoreTransientState(undo.removeLast())
+        session = withDirtyBaseline(restoreTransientState(undo.removeLast()))
         return session
     }
 
@@ -80,7 +84,7 @@ internal class CommandHistory(
         if (redo.isEmpty()) return session
         undo.addLast(session)
         trimToCapacity(undo)
-        session = restoreTransientState(redo.removeLast())
+        session = withDirtyBaseline(restoreTransientState(redo.removeLast()))
         return session
     }
 
@@ -95,9 +99,12 @@ internal class CommandHistory(
                 is TimelineResult.Accepted -> it.value
                 is TimelineResult.Rejected -> return it
             }
-        }
+        }.let(::withDirtyBaseline)
         return TimelineResult.Accepted(session)
     }
+
+    private fun withDirtyBaseline(candidate: EditorSession): EditorSession =
+        candidate.copy(dirty = !sameRenderedContent(candidate, durableBaseline))
 
     private fun restoreTransientState(snapshot: EditorSession): EditorSession {
         val selected = session.selectedClipId?.takeIf { clipId ->
@@ -108,6 +115,25 @@ internal class CommandHistory(
 
     private fun trimToCapacity(stack: ArrayDeque<EditorSession>) {
         while (stack.size > maxUndoDepth) stack.removeFirst()
+    }
+
+    private fun sameRenderedContent(left: EditorSession, right: EditorSession): Boolean {
+        if (left.exportPreset != right.exportPreset || left.tracks.size != right.tracks.size) return false
+        return left.tracks.zip(right.tracks).all { (leftTrack, rightTrack) ->
+            leftTrack.id == rightTrack.id &&
+                leftTrack.name == rightTrack.name &&
+                leftTrack.volume == rightTrack.volume &&
+                leftTrack.muted == rightTrack.muted &&
+                leftTrack.clips.size == rightTrack.clips.size &&
+                leftTrack.clips.zip(rightTrack.clips).all { (leftClip, rightClip) ->
+                    leftClip.id == rightClip.id &&
+                        leftClip.source == rightClip.source &&
+                        leftClip.sourceStartMs == rightClip.sourceStartMs &&
+                        leftClip.sourceEndMs == rightClip.sourceEndMs &&
+                        leftClip.timelineStartMs == rightClip.timelineStartMs &&
+                        leftClip.effects == rightClip.effects
+                }
+        }
     }
 
     private companion object {
