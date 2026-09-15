@@ -201,15 +201,34 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
         }
         val normalized = filenames.filterValues { it > 0 }
         synchronized(rootState.lock) {
-            if (normalized.isNotEmpty()) writeLeaseLocked(attemptId, normalized)
-            else leaseFile(attemptId).delete()
-            rootState.leases.remove(attemptId)?.forEach { (name, count) ->
-                decrementReferenceLocked(name, count)
+            replaceLeaseLocked(attemptId, normalized)
+        }
+    }
+
+    /** Repairs all editor-draft leases from Room truth while preserving pending crash protection. */
+    fun reconcileDraftLeases(expectedByDraft: Map<String, Map<String, Int>>) {
+        synchronized(rootState.lock) {
+            val normalizedExpected = expectedByDraft.mapValues { (_, values) ->
+                values.filterValues { it > 0 }
             }
-            if (normalized.isNotEmpty()) {
-                rootState.leases[attemptId] = normalized
-                normalized.forEach { (name, count) ->
-                    rootState.references[name] = (rootState.references[name] ?: 0) + count
+            val draftLeaseIds = rootState.leases.keys.filter { it.startsWith(DRAFT_LEASE_PREFIX) }
+            draftLeaseIds.filter { leaseId ->
+                draftIdForLease(leaseId)?.let { it !in normalizedExpected } ?: false
+            }.forEach(::removeLeaseLocked)
+            normalizedExpected.forEach { (draftId, filenames) ->
+                val canonical = "$DRAFT_LEASE_PREFIX$draftId"
+                try {
+                    replaceLeaseLocked(canonical, filenames)
+                    // A pending lease can survive a process death between Room commit and the
+                    // canonical lease write. Once canonical truth is durable, drop only those
+                    // pending leases for this same draft.
+                    rootState.leases.keys
+                        .filter { it.startsWith("$canonical$DRAFT_PENDING_SUFFIX") }
+                        .toList()
+                        .forEach(::removeLeaseLocked)
+                } catch (_: Throwable) {
+                    // Keep the previous canonical and any pending lease. The draft remains
+                    // protected and a later reconciliation can retry the exact transition.
                 }
             }
         }
@@ -377,12 +396,52 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
                 output.flush()
                 output.fd.sync()
             }
-            if (!temporary.renameTo(target)) {
-                if (target.exists()) require(target.delete()) { "Cannot replace cache lease" }
-                require(temporary.renameTo(target)) { "Cannot publish cache lease" }
-            }
+            atomicRename(temporary, target)
         } finally {
             runCatching { temporary.delete() }
+        }
+    }
+
+    private fun replaceLeaseLocked(attemptId: String, filenames: Map<String, Int>) {
+        val old = rootState.leases[attemptId]
+        if (filenames.isNotEmpty()) {
+            // Publish first. If this fails, old references and its lease file remain intact.
+            writeLeaseLocked(attemptId, filenames)
+        } else {
+            runCatching { leaseFile(attemptId).delete() }
+        }
+        old?.forEach { (name, count) -> decrementReferenceLocked(name, count) }
+        if (filenames.isEmpty()) {
+            rootState.leases.remove(attemptId)
+        } else {
+            rootState.leases[attemptId] = filenames
+            filenames.forEach { (name, count) ->
+                rootState.references[name] = (rootState.references[name] ?: 0) + count
+            }
+        }
+    }
+
+    private fun removeLeaseLocked(attemptId: String) {
+        rootState.leases.remove(attemptId)?.forEach { (name, count) ->
+            decrementReferenceLocked(name, count)
+        }
+        runCatching { leaseFile(attemptId).delete() }
+    }
+
+    private fun draftIdForLease(leaseId: String): String? =
+        leaseId.removePrefix(DRAFT_LEASE_PREFIX).substringBefore(DRAFT_PENDING_SUFFIX).takeIf { it.isNotBlank() }
+
+    private fun atomicRename(source: File, target: File) {
+        try {
+            val osClass = Class.forName("android.system.Os")
+            val rename = osClass.getMethod("rename", String::class.java, String::class.java)
+            rename.invoke(null, source.absolutePath, target.absolutePath)
+        } catch (error: ClassNotFoundException) {
+            if (!source.renameTo(target)) throw IOException("Cannot publish cache lease", error)
+        } catch (error: java.lang.reflect.InvocationTargetException) {
+            if (!source.renameTo(target)) throw IOException("Cannot publish cache lease", error.cause ?: error)
+        } catch (error: ReflectiveOperationException) {
+            if (!source.renameTo(target)) throw IOException("Cannot publish cache lease", error)
         }
     }
 
@@ -434,6 +493,8 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
         const val LEASE_RETENTION_MS = 24L * 60L * 60L * 1_000L
         private const val LEASE_DIRECTORY = "leases"
         private const val LEASE_ATTEMPT_PREFIX = "attempt="
+        private const val DRAFT_LEASE_PREFIX = "editor-draft:"
+        private const val DRAFT_PENDING_SUFFIX = ":pending:"
 
         private val roots = ConcurrentHashMap<String, SharedRootState>()
     }

@@ -12,13 +12,28 @@ import com.aistudio.voicenote.cvtr.data.local.AppDatabase
 import java.io.File
 import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 internal class MissingDraftSourcesException(
     val draftId: String,
     val missingPaths: List<String>,
 ) : IOException("Draft $draftId has missing private sources: ${missingPaths.joinToString()}")
+
+class InvalidDraftSourceException(
+    val draftId: String,
+    val invalidPaths: List<String>,
+) : IOException("Draft $draftId contains invalid private sources: ${invalidPaths.joinToString()}")
+
+internal class CacheLeaseTransitionException(
+    val draftId: String,
+    cause: Throwable,
+) : IOException("Draft $draftId was committed with a pending cache lease repair", cause)
 
 /** Room snapshot plus private source versions. A save is the only operation that creates a row. */
 internal class EditorDraftRepository(
@@ -28,12 +43,21 @@ internal class EditorDraftRepository(
     private val now: () -> Long = { System.currentTimeMillis() },
 ) {
     private val dao: EditorDraftDao = database.editorDraftDao()
+    private val reconciliationMutex = Mutex()
+    @Volatile private var reconciled = false
 
-    fun observeAll(): Flow<List<EditorDraft>> = dao.observeDrafts().map { rows ->
-        rows.map(EditorDraft::from)
+    fun observeAll(): Flow<List<EditorDraft>> = flow {
+        ensureReconciled()
+        emitAll(dao.observeDrafts().map { rows -> rows.map(EditorDraft::from) })
     }
 
-    suspend fun save(session: EditorSession, name: String = session.id): String {
+    suspend fun save(session: EditorSession, name: String = session.id): String =
+        withDraftLock(session.id) {
+            ensureReconciled()
+            saveLocked(session, name)
+        }
+
+    private suspend fun saveLocked(session: EditorSession, name: String): String {
         require(session.id.isNotBlank()) { "Draft id must not be blank" }
         val draftId = session.id
         val old = dao.loadSnapshot(draftId)
@@ -50,7 +74,7 @@ internal class EditorDraftRepository(
             .distinctBy { it.uri }
             .toList()
         val stage = sourceStorage.stageSources(draftId, sourceInputs, version)
-        val committedDirectory = try {
+        try {
             sourceStorage.commitStage(stage)
         } catch (error: Throwable) {
             runCatching { stage.stagingDirectory.deleteRecursively() }
@@ -110,27 +134,40 @@ internal class EditorDraftRepository(
                 )
             }
         }
+        val cacheReferences = clips.mapNotNull { it.processedCacheKey }
+            .groupingBy { it }
+            .eachCount()
+            .filterKeys(::isCacheFilename)
+        val provisionalLease = "${cacheLease(draftId)}:pending:$version"
+        var provisionalOwned = false
         try {
+            processedAudioCache?.let {
+                it.acquireLease(provisionalLease, cacheReferences)
+                provisionalOwned = true
+            }
             // The source version is already durable before this transaction can publish its path.
             database.withTransaction {
                 dao.replaceSnapshot(draftEntity, tracks, clips)
             }
         } catch (error: Throwable) {
             // The old row and old version remain authoritative when Room rejects the update.
+            if (provisionalOwned) processedAudioCache?.releaseLease(provisionalLease)
             runCatching { sourceStorage.deleteVersion(draftId, version) }
             throw error
         }
 
-        val newLease = cacheLease(draftId)
-        val cacheReferences = clips.mapNotNull { it.processedCacheKey }
-            .groupingBy { it }
-            .eachCount()
-            .filterKeys(::isCacheFilename)
-        // This call replaces the old draft lease only after the Room commit succeeds. If a cache
-        // filesystem failure occurs, the committed draft remains loadable and the old lease is
-        // intentionally left in place for safety.
-        processedAudioCache?.let { cache ->
-            runCatching { cache.acquireLease(newLease, cacheReferences) }
+        try {
+            processedAudioCache?.let { cache ->
+                // The provisional lease protects the new cache keys across the Room commit. The
+                // canonical lease replaces old keys only after the snapshot is durable.
+                cache.acquireLease(cacheLease(draftId), cacheReferences)
+                if (provisionalOwned) cache.releaseLease(provisionalLease)
+            }
+        } catch (error: Throwable) {
+            // Keep the provisional lease and surface repair-needed state; the new snapshot is
+            // never left without a durable cache protection lease.
+            reconciled = false
+            throw CacheLeaseTransitionException(draftId, error)
         }
         old?.draft?.sourceVersion?.takeIf { it != version }?.let { previousVersion ->
             runCatching { sourceStorage.deleteVersion(draftId, previousVersion) }
@@ -138,20 +175,32 @@ internal class EditorDraftRepository(
         return draftId
     }
 
-    suspend fun load(draftId: String): EditorSession? {
-        val loaded = loadResult(draftId) ?: return null
+    suspend fun load(draftId: String): EditorSession? = withDraftLock(draftId) {
+        ensureReconciled()
+        val loaded = loadResultLocked(draftId) ?: return@withDraftLock null
         if (loaded.missingPrivateSources.isNotEmpty()) {
             throw MissingDraftSourcesException(draftId, loaded.missingPrivateSources)
         }
-        return loaded.session
+        loaded.session
     }
 
-    suspend fun loadResult(draftId: String): EditorDraftLoad? {
+    suspend fun loadResult(draftId: String): EditorDraftLoad? = withDraftLock(draftId) {
+        ensureReconciled()
+        loadResultLocked(draftId)
+    }
+
+    private suspend fun loadResultLocked(draftId: String): EditorDraftLoad? {
         val snapshot = dao.loadSnapshot(draftId) ?: return null
         val clipsByTrack = snapshot.clips.groupBy { it.trackId }
+        val invalid = snapshot.clips.asSequence()
+            .map { it.sourcePath }
+            .filterNot { sourceStorage.isContained(draftId, snapshot.draft.sourceVersion, it) }
+            .distinct()
+            .toList()
+        if (invalid.isNotEmpty()) throw InvalidDraftSourceException(draftId, invalid)
         val missing = snapshot.clips.asSequence()
             .map { it.sourcePath }
-            .filter { path -> !File(path).isFile || !File(path).canRead() }
+            .filter { path -> !sourceStorage.isReadable(draftId, snapshot.draft.sourceVersion, path) }
             .distinct()
             .toList()
         val tracks = snapshot.tracks.sortedBy { it.sortOrder }.map { track ->
@@ -176,7 +225,12 @@ internal class EditorDraftRepository(
         )
     }
 
-    suspend fun delete(draftId: String): Boolean {
+    suspend fun delete(draftId: String): Boolean = withDraftLock(draftId) {
+        ensureReconciled()
+        deleteLocked(draftId)
+    }
+
+    private suspend fun deleteLocked(draftId: String): Boolean {
         require(draftId.isNotBlank()) { "Draft id must not be blank" }
         val snapshot = dao.loadSnapshot(draftId) ?: return false
         val deleted = database.withTransaction { dao.deleteSnapshot(draftId) }
@@ -185,7 +239,38 @@ internal class EditorDraftRepository(
         // Database rows are gone before this exact canonical directory is removed. No path from
         // a row is ever used as a deletion target.
         sourceStorage.deleteDraftSources(snapshot.draft.id)
+        reconciled = false
         return true
+    }
+
+    suspend fun reconcileDraftStorage(): List<String> = reconciliationMutex.withLock {
+        reconcileFromRoomTruth().also { reconciled = true }
+    }
+
+    private suspend fun ensureReconciled() {
+        if (reconciled) return
+        reconciliationMutex.withLock {
+            if (!reconciled) {
+                reconcileFromRoomTruth()
+                reconciled = true
+            }
+        }
+    }
+
+    private suspend fun reconcileFromRoomTruth(): List<String> {
+        val drafts = dao.getAllDrafts()
+        val versions = drafts.associate { it.id to it.sourceVersion }
+        val deleted = sourceStorage.reconcileDraftSources(versions).toMutableList()
+        processedAudioCache?.reconcileDraftLeases(
+            drafts.associate { draft ->
+                draft.id to dao.getClips(draft.id)
+                    .mapNotNull { it.processedCacheKey }
+                    .groupingBy { it }
+                    .eachCount()
+                    .filterKeys(::isCacheFilename)
+            }
+        )
+        return deleted
     }
 
     private fun toClip(entity: EditorDraftClipEntity): AudioClip = AudioClip(
@@ -211,6 +296,28 @@ internal class EditorDraftRepository(
 
     private fun isCacheFilename(value: String): Boolean =
         value.length == 64 && value.all { it in '0'..'9' || it in 'a'..'f' }
+}
+
+private data class DraftLockEntry(val mutex: Mutex, var users: Int)
+
+private val draftLocks = ConcurrentHashMap<String, DraftLockEntry>()
+private val draftLocksGuard = Any()
+
+private suspend fun <T> withDraftLock(draftId: String, block: suspend () -> T): T {
+    require(draftId.isNotBlank()) { "Draft id must not be blank" }
+    val entry = synchronized(draftLocksGuard) {
+        draftLocks[draftId]?.also { it.users++ } ?: DraftLockEntry(Mutex(), 1).also {
+            draftLocks[draftId] = it
+        }
+    }
+    return try {
+        entry.mutex.withLock { block() }
+    } finally {
+        synchronized(draftLocksGuard) {
+            entry.users--
+            if (entry.users == 0) draftLocks.remove(draftId, entry)
+        }
+    }
 }
 
 private fun String.toExportPreset(): ExportPreset =

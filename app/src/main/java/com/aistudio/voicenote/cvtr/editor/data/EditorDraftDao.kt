@@ -15,6 +15,9 @@ abstract class EditorDraftDao {
     @Query("SELECT * FROM editor_drafts WHERE id = :draftId LIMIT 1")
     abstract suspend fun getDraft(draftId: String): EditorDraftEntity?
 
+    @Query("SELECT * FROM editor_drafts")
+    abstract suspend fun getAllDrafts(): List<EditorDraftEntity>
+
     @Query("SELECT * FROM editor_draft_tracks WHERE draftId = :draftId ORDER BY sortOrder ASC")
     abstract suspend fun getTracks(draftId: String): List<EditorDraftTrackEntity>
 

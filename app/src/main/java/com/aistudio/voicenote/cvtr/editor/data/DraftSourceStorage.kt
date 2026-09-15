@@ -10,6 +10,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 internal data class DraftSourceInput(
     val uri: String,
@@ -71,6 +72,7 @@ internal class DraftSourceStorage private constructor(
     )
 
     private val root: File = root.canonicalFile
+    private val rootState = roots.computeIfAbsent(root.path) { StorageRootState() }
 
     /** Test seam used to verify rollback after a later distinct source fails. */
     internal var failAfterCopies: Int? = null
@@ -89,12 +91,17 @@ internal class DraftSourceStorage private constructor(
         validateDraftId(draftId)
         validateVersion(version)
         val distinct = sources.filter { it.uri.isNotBlank() }.distinctBy { it.uri }
+        if (distinct.size > MAX_DISTINCT_SOURCES) {
+            throw IOException("Draft contains too many distinct sources")
+        }
         val estimatedBytes = distinct.sumOf { sourceSize(it.uri).coerceAtLeast(0L) }
         checkAvailable(estimatedBytes)
         val staging = File(root, ".${draftId}.staging-${UUID.randomUUID()}").canonicalFile
         require(isDirectChild(staging, root)) { "Invalid draft staging path" }
         require(staging.mkdirs()) { "Unable to create draft staging directory" }
+        synchronized(rootState.lock) { rootState.activeStaging += staging.path }
         val staged = LinkedHashMap<String, File>()
+        var unknownBytesCopied = 0L
         try {
             distinct.forEachIndexed { index, source ->
                 failAfterCopies?.let { limit ->
@@ -103,11 +110,18 @@ internal class DraftSourceStorage private constructor(
                 val extension = fileExtension(source.displayName.ifBlank { source.uri })
                 val target = File(staging, sha256(source.uri) + extension).canonicalFile
                 require(isDirectChild(target, staging)) { "Invalid staged source path" }
-                copyAndValidate(source, target)
+                val unknownSize = sourceSize(source.uri) <= 0L
+                val copied = copyAndValidate(
+                    source,
+                    target,
+                    unknownBytesCopied.takeIf { unknownSize },
+                )
+                if (unknownSize) unknownBytesCopied += copied
                 staged[source.uri] = target
             }
             return DraftSourceStage(draftId, version, staging, staged)
         } catch (error: Throwable) {
+            synchronized(rootState.lock) { rootState.activeStaging -= staging.path }
             staging.deleteRecursively()
             throw error
         }
@@ -140,9 +154,11 @@ internal class DraftSourceStorage private constructor(
         val committed = File(draftDirectory, "v${stage.version}").canonicalFile
         require(isDirectChild(committed, draftDirectory)) { "Invalid draft version path" }
         require(!committed.exists()) { "Draft source version already exists" }
-        require(stage.stagingDirectory.renameTo(committed)) {
-            "Unable to atomically publish draft sources"
+        if (!stage.stagingDirectory.renameTo(committed)) {
+            synchronized(rootState.lock) { rootState.activeStaging -= stage.stagingDirectory.path }
+            throw IOException("Unable to atomically publish draft sources")
         }
+        synchronized(rootState.lock) { rootState.activeStaging -= stage.stagingDirectory.path }
         stage.committedDirectory = committed
         try {
             stagedFilesReadable(stage)
@@ -183,13 +199,62 @@ internal class DraftSourceStorage private constructor(
         }
     }
 
+    /** Reconciles committed versions against Room truth; live stages are protected in-process. */
+    fun reconcileDraftSources(referencedVersions: Map<String, String>): List<String> {
+        val activeStages = synchronized(rootState.lock) { rootState.activeStaging.toSet() }
+        val deleted = mutableListOf<String>()
+        root.listFiles()?.forEach { child ->
+            val canonical = runCatching { child.canonicalFile }.getOrNull() ?: return@forEach
+            if (canonical.parentFile != root) return@forEach
+            if (canonical.name.startsWith(".") && canonical.name.contains(".staging-")) {
+                if (canonical.path !in activeStages && canonical.deleteRecursively()) deleted += canonical.path
+                return@forEach
+            }
+            if (!canonical.isDirectory || !isValidDraftId(canonical.name)) return@forEach
+            val expected = referencedVersions[canonical.name]
+            if (expected == null) {
+                if (canonical.deleteRecursively()) deleted += canonical.path
+                return@forEach
+            }
+            val expectedName = "v$expected"
+            canonical.listFiles()?.forEach { version ->
+                val versionCanonical = runCatching { version.canonicalFile }.getOrNull() ?: return@forEach
+                if (versionCanonical.parentFile != canonical) return@forEach
+                if (versionCanonical.name.startsWith("v") && versionCanonical.name != expectedName &&
+                    versionCanonical.deleteRecursively()
+                ) deleted += versionCanonical.path
+            }
+        }
+        return deleted
+    }
+
+    internal fun activeStagingPaths(): Set<String> = synchronized(rootState.lock) {
+        rootState.activeStaging.toSet()
+    }
+
+    internal fun isReadable(draftId: String, version: String, path: String): Boolean {
+        return isContained(draftId, version, path) && isReadable(path)
+    }
+
+    internal fun isContained(draftId: String, version: String, path: String): Boolean =
+        runCatching {
+            validateDraftId(draftId)
+            validateVersion(version)
+            val versionDirectory = File(File(root, draftId), "v$version").canonicalFile
+            File(path).canonicalFile.parentFile == versionDirectory
+        }.getOrDefault(false)
+
     fun isReadable(path: String): Boolean {
         val file = File(path).canonicalFile
-        return file.isFile && file.canRead() && file.length() <= MAX_SOURCE_BYTES &&
+        return file.isFile && file.canRead() && file.length() in 1L..MAX_SOURCE_BYTES &&
             file.parentFile?.parentFile?.parentFile?.canonicalFile == root
     }
 
-    private fun copyAndValidate(source: DraftSourceInput, target: File) {
+    private fun copyAndValidate(
+        source: DraftSourceInput,
+        target: File,
+        reservedUnknownBytes: Long?,
+    ): Long {
         val input = open(source.uri) ?: throw IOException("Unable to open source ${source.uri}")
         var copied = 0L
         try {
@@ -203,6 +268,9 @@ internal class DraftSourceStorage private constructor(
                     if (copied > MAX_SOURCE_BYTES) {
                         throw IOException("Draft source exceeds maximum size")
                     }
+                    checkAvailableForChunk(
+                        if (reservedUnknownBytes == null) count.toLong() else reservedUnknownBytes + copied,
+                    )
                     output.write(buffer, 0, count)
                 }
                 output.flush()
@@ -218,6 +286,7 @@ internal class DraftSourceStorage private constructor(
         if (expected > 0L && expected != copied) {
             throw IOException("Draft source changed while it was copied")
         }
+        return copied
     }
 
     private fun stagedFilesReadable(stage: DraftSourceStage) {
@@ -243,11 +312,17 @@ internal class DraftSourceStorage private constructor(
     }
 
     private fun checkAvailable(estimatedBytes: Long) {
-        if (estimatedBytes > MAX_SOURCE_BYTES * MAX_DISTINCT_SOURCES) {
+        if (estimatedBytes > MAX_SOURCE_BYTES * MAX_DISTINCT_SOURCES.toLong()) {
             throw IOException("Draft source set is too large")
         }
         val required = estimatedBytes.coerceAtLeast(1L) + safetyBytes
         if (freeSpace(root) < required) throw IOException("Insufficient storage for draft sources")
+    }
+
+    private fun checkAvailableForChunk(reservedBytes: Long) {
+        if (freeSpace(root) <= safetyBytes + reservedBytes) {
+            throw IOException("Insufficient storage while copying draft source")
+        }
     }
 
     private fun fileForUri(value: String): File? {
@@ -262,12 +337,15 @@ internal class DraftSourceStorage private constructor(
     }
 
     private fun validateDraftId(value: String) {
-        require(value.isNotBlank() && value != "." && value != ".." &&
-            value.none { it == '/' || it == '\\' || it == File.separatorChar } &&
-            value.all { it.isLetterOrDigit() || it == '-' || it == '_' }) {
+        require(isValidDraftId(value)) {
             "Invalid draft id"
         }
     }
+
+    private fun isValidDraftId(value: String): Boolean =
+        value.isNotBlank() && value != "." && value != ".." &&
+            value.none { it == '/' || it == '\\' || it == File.separatorChar } &&
+            value.all { it.isLetterOrDigit() || it == '-' || it == '_' }
 
     private fun validateVersion(value: String) {
         require(value.isNotBlank() && value.all { it.isLetterOrDigit() || it == '-' || it == '_' }) {
@@ -293,7 +371,13 @@ internal class DraftSourceStorage private constructor(
         const val ROOT_DIRECTORY = "editor-drafts"
         const val COPY_BUFFER_BYTES = 64 * 1024
         const val MAX_SOURCE_BYTES = 512L * 1024L * 1024L
-        const val MAX_DISTINCT_SOURCES = 64L
+        const val MAX_DISTINCT_SOURCES = 64
         const val MIN_FREE_BYTES = 1L * 1024L * 1024L
+        private val roots = ConcurrentHashMap<String, StorageRootState>()
+    }
+
+    private class StorageRootState {
+        val lock = Any()
+        val activeStaging = mutableSetOf<String>()
     }
 }
