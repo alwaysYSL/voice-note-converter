@@ -122,6 +122,26 @@ class EditorScreenTest {
     }
 
     @Test
+    fun `selected clip exposes non gesture move controls`() {
+        val intents = mutableListOf<EditorIntent>()
+        compose.setContent {
+            MyApplicationTheme {
+                EditorScreen(stateWithTwoClips(), intents::add)
+            }
+        }
+
+        compose.onNodeWithContentDescription("Move selected clip earlier by 100 milliseconds")
+            .assertIsEnabled()
+            .performClick()
+        assertTrue(intents.last() == EditorIntent.Move(0L))
+
+        compose.onNodeWithContentDescription("Move selected clip later by 100 milliseconds")
+            .assertIsEnabled()
+            .performClick()
+        assertTrue(intents.last() == EditorIntent.Move(100L))
+    }
+
+    @Test
     fun `redo becomes enabled after undo and dispatches redo`() {
         val intents = mutableListOf<EditorIntent>()
         compose.setContent {

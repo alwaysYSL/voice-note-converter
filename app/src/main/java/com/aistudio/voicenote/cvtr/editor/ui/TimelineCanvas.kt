@@ -280,7 +280,14 @@ private fun TrackHeader(
             .background(CardSurfaceWhite)
             .padding(horizontal = 8.dp, vertical = 8.dp)
             .testTag(trackSemanticsTag(track.id))
-            .alpha(if (enabled) 1f else .55f),
+            .alpha(if (enabled) 1f else .55f)
+            .semantics {
+                stateDescription = when {
+                    !enabled -> "Offline; replace source"
+                    track.muted -> "Muted"
+                    else -> "Active"
+                }
+            },
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -392,9 +399,15 @@ private fun TimelineClip(
             .alpha(if (enabled) 1f else .45f)
             .semantics {
                 this.selected = selected
+                stateDescription = when {
+                    !enabled -> "Offline; replace source"
+                    selected -> "Selected"
+                    else -> "Available"
+                }
                 contentDescription = buildString {
                     append("Clip ${clip.id}")
                     if (selected) append(", selected")
+                    if (!enabled) append(", offline")
                     if (!trimGesturesEnabled) append("; drag to move")
                 }
             }

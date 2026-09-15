@@ -43,6 +43,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import com.aistudio.voicenote.cvtr.editor.model.AudioClip
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
+import com.aistudio.voicenote.cvtr.editor.model.MAX_TIMELINE_MS
 import com.aistudio.voicenote.cvtr.editor.audio.EditorPlaybackState
 import com.aistudio.voicenote.cvtr.ui.theme.AccentCoral
 import com.aistudio.voicenote.cvtr.ui.theme.CardSurfaceWhite
@@ -83,6 +84,31 @@ internal fun ContextualEditorToolbar(
             },
             modifier = Modifier.semantics {
                 contentDescription = "Trim end by 100 milliseconds"
+            },
+        )
+        EditorToolButton(
+            label = "Move -100 ms",
+            enabled = hasSelection,
+            onClick = {
+                selectedClip?.let { clip ->
+                    onIntent(EditorIntent.Move((clip.timelineStartMs - 100L).coerceAtLeast(0L)))
+                }
+            },
+            modifier = Modifier.semantics {
+                contentDescription = "Move selected clip earlier by 100 milliseconds"
+            },
+        )
+        EditorToolButton(
+            label = "Move +100 ms",
+            enabled = hasSelection,
+            onClick = {
+                selectedClip?.let { clip ->
+                    val latestStart = (MAX_TIMELINE_MS - clip.timelineDurationMs).coerceAtLeast(0L)
+                    onIntent(EditorIntent.Move((clip.timelineStartMs + 100L).coerceAtMost(latestStart)))
+                }
+            },
+            modifier = Modifier.semantics {
+                contentDescription = "Move selected clip later by 100 milliseconds"
             },
         )
         // Keep the cleanup entry point in the leading viewport of the compact,
