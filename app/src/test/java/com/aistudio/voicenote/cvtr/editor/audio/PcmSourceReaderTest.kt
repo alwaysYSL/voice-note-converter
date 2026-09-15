@@ -1,7 +1,10 @@
 package com.aistudio.voicenote.cvtr.editor.audio
 
 import com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef
+import java.util.concurrent.CancellationException
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -17,6 +20,22 @@ class PcmSourceReaderTest {
         }
 
         assertTrue(fake.closed)
+    }
+
+    @Test
+    fun `cancelled decode invokes cleanup before aborting the read`() {
+        var cancelled = false
+        var cleanupCount = 0
+        val cancellation = PcmReadCancellation { cancelled }
+
+        assertThrows(CancellationException::class.java) {
+            readWithCleanup(cancellation, { cleanupCount++ }) {
+                cancelled = true
+                cancellation.check()
+            }
+        }
+
+        assertEquals(1, cleanupCount)
     }
 
     private class FakePcmSourceReader(private val samples: ShortArray) : PcmSourceReader {

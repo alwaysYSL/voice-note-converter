@@ -1,6 +1,6 @@
 package com.aistudio.voicenote.cvtr.editor.audio
 
-import kotlin.math.roundToLong
+import kotlin.math.floor
 
 /** Sample-frame mapping for one clip after its speed effect has been applied. */
 internal class ClipTimeMapper(
@@ -37,8 +37,11 @@ internal class ClipTimeMapper(
     /** Maps the sample at a timeline frame to the corresponding source sample. */
     fun sourceFrameForTimelineFrame(timelineFrame: Long): Long {
         val timelineDelta = timelineFrame.toDouble() - timelineStartFrame.toDouble()
-        val sourceDelta = (timelineDelta * speed.toDouble()).roundToLong()
-        return addSaturated(sourceStartFrame, sourceDelta)
+        val sourceDelta = (timelineDelta * speed.toDouble()).let(::floor).toLong()
+        val mappedFrame = addSaturated(sourceStartFrame, sourceDelta)
+        val endFrame = effectiveSourceEndFrame ?: return mappedFrame
+        if (endFrame <= sourceStartFrame) return sourceStartFrame
+        return mappedFrame.coerceIn(sourceStartFrame, endFrame - 1L)
     }
 
     /** The half-open output frame range occupied by the configured source range. */

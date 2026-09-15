@@ -12,6 +12,7 @@ import com.aistudio.voicenote.cvtr.audio.PcmDecoder
 import com.aistudio.voicenote.cvtr.audio.UnsupportedAudioFormatException
 import com.aistudio.voicenote.cvtr.audio.StreamingPcmProcessor
 import com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef
+import java.util.concurrent.CancellationException
 import kotlin.math.max
 import kotlin.math.min
 
@@ -29,6 +30,30 @@ internal interface PcmSourceReader : AutoCloseable {
 
 internal fun interface PcmSourceReaderFactory {
     fun open(source: AudioSourceRef): PcmSourceReader
+}
+
+/** Small cancellation seam shared by the decoder loop and deterministic unit tests. */
+internal class PcmReadCancellation(
+    private val isCancelled: () -> Boolean,
+) {
+    fun check() {
+        if (isCancelled()) throw CancellationException("PCM source read cancelled")
+    }
+}
+
+/** Ensures a failed read cannot retain native decoder resources. */
+internal fun <T> readWithCleanup(
+    cancellation: PcmReadCancellation,
+    cleanup: () -> Unit,
+    block: () -> T,
+): T {
+    try {
+        cancellation.check()
+        return block()
+    } catch (error: Throwable) {
+        runCatching(cleanup)
+        throw error
+    }
 }
 
 /** Creates MediaCodec-backed editor readers for content, file, and provider URIs. */
@@ -52,15 +77,20 @@ internal class MediaCodecPcmSourceReader(
 ) : PcmSourceReader {
     override val sampleRate: Int = EDITOR_SAMPLE_RATE
 
-    private val lock = Any()
+    private val readLock = Any()
+    private val closeLock = Any()
     private val extractor = MediaExtractor()
     private var decoder: MediaCodec? = null
     private var decoderStarted = false
+    @Volatile
     private var closed = false
     private var trackFormat: MediaFormat
     private var trackSampleRate: Int
     private var trackChannels: Int
     private var trackPcmEncoding: Int
+    private val cancellation = PcmReadCancellation {
+        closed || Thread.currentThread().isInterrupted
+    }
 
     init {
         try {
@@ -89,23 +119,30 @@ internal class MediaCodecPcmSourceReader(
         }
     }
 
-    override fun read(sourceFrame: Long, frameCount: Int): ShortArray = synchronized(lock) {
+    override fun read(sourceFrame: Long, frameCount: Int): ShortArray = synchronized(readLock) {
+        readWithCleanup(cancellation, ::close) {
+            readInternal(sourceFrame, frameCount)
+        }
+    }
+
+    private fun readInternal(sourceFrame: Long, frameCount: Int): ShortArray {
         check(!closed) { "PCM source reader is closed" }
         require(sourceFrame >= 0L) { "sourceFrame must be non-negative" }
         require(frameCount >= 0) { "frameCount must be non-negative" }
         require(frameCount <= MAX_PCM_READ_FRAMES) {
             "PCM reads are limited to $MAX_PCM_READ_FRAMES frames"
         }
-        if (frameCount == 0) return@synchronized ShortArray(0)
+        if (frameCount == 0) return ShortArray(0)
 
         val durationFrames = normalizedDurationFrames(source.durationMs)
-        if (durationFrames != null && sourceFrame >= durationFrames) return@synchronized ShortArray(0)
+        if (durationFrames != null && sourceFrame >= durationFrames) return ShortArray(0)
         val requestedCount = durationFrames?.let {
             min(frameCount.toLong(), it - sourceFrame).toInt()
         } ?: frameCount
-        if (requestedCount <= 0) return@synchronized ShortArray(0)
+        if (requestedCount <= 0) return ShortArray(0)
 
         val codec = checkNotNull(decoder) { "PCM decoder is unavailable" }
+        cancellation.check()
         val seekUs = sourceFrame * 1_000_000L / EDITOR_SAMPLE_RATE
         extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
         codec.flush()
@@ -119,6 +156,7 @@ internal class MediaCodecPcmSourceReader(
         var writtenUntil = sourceFrame
 
         while (!outputEnded && writtenUntil < sourceFrame + requestedCount) {
+            cancellation.check()
             if (!inputEnded) {
                 val inputIndex = codec.dequeueInputBuffer(TIMEOUT_US)
                 if (inputIndex >= 0) {
@@ -143,6 +181,7 @@ internal class MediaCodecPcmSourceReader(
             }
 
             val outputIndex = codec.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
+            cancellation.check()
             if (outputIndex >= 0) {
                 try {
                     val outputBuffer = codec.getOutputBuffer(outputIndex)
@@ -189,11 +228,11 @@ internal class MediaCodecPcmSourceReader(
         }
 
         val count = (writtenUntil - sourceFrame).coerceIn(0L, requestedCount.toLong()).toInt()
-        return@synchronized if (count == output.size) output else output.copyOf(count)
+        return if (count == output.size) output else output.copyOf(count)
     }
 
     override fun close() {
-        synchronized(lock) {
+        synchronized(closeLock) {
             if (closed) return
             closed = true
             if (decoderStarted) runCatching { decoder?.stop() }
