@@ -163,6 +163,8 @@ internal class EditorSession(
     val playheadMs: Long = 0L,
     val exportPreset: ExportPreset = ExportPreset.VOICE_NOTE_32,
     val dirty: Boolean = false,
+    /** Non-null only after the user explicitly saved this session as a durable draft. */
+    val draftId: String? = null,
 ) {
     val tracks: List<EditorTrack> = immutableList(tracks)
 
@@ -172,6 +174,7 @@ internal class EditorSession(
     operator fun component4(): Long = playheadMs
     operator fun component5(): ExportPreset = exportPreset
     operator fun component6(): Boolean = dirty
+    operator fun component7(): String? = draftId
 
     fun copy(
         id: String = this.id,
@@ -180,11 +183,13 @@ internal class EditorSession(
         playheadMs: Long = this.playheadMs,
         exportPreset: ExportPreset = this.exportPreset,
         dirty: Boolean = this.dirty,
-    ): EditorSession = EditorSession(id, tracks, selectedClipId, playheadMs, exportPreset, dirty)
+        draftId: String? = this.draftId,
+    ): EditorSession = EditorSession(id, tracks, selectedClipId, playheadMs, exportPreset, dirty, draftId)
 
     override fun equals(other: Any?): Boolean = other is EditorSession &&
         id == other.id && tracks == other.tracks && selectedClipId == other.selectedClipId &&
-        playheadMs == other.playheadMs && exportPreset == other.exportPreset && dirty == other.dirty
+        playheadMs == other.playheadMs && exportPreset == other.exportPreset && dirty == other.dirty &&
+            draftId == other.draftId
 
     override fun hashCode(): Int {
         var result = id.hashCode()
@@ -193,12 +198,13 @@ internal class EditorSession(
         result = 31 * result + playheadMs.hashCode()
         result = 31 * result + exportPreset.hashCode()
         result = 31 * result + dirty.hashCode()
+        result = 31 * result + (draftId?.hashCode() ?: 0)
         return result
     }
 
     override fun toString(): String =
         "EditorSession(id=$id, tracks=$tracks, selectedClipId=$selectedClipId, " +
-            "playheadMs=$playheadMs, exportPreset=$exportPreset, dirty=$dirty)"
+            "playheadMs=$playheadMs, exportPreset=$exportPreset, dirty=$dirty, draftId=$draftId)"
 
     companion object {
         internal fun empty(id: String = "session"): EditorSession = EditorSession(id = id, tracks = emptyList())

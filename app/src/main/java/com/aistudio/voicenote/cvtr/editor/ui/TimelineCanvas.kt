@@ -44,6 +44,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -147,6 +148,7 @@ internal fun TimelineCanvas(
                 state.session.tracks.forEach { track ->
                     TrackHeader(
                         track = track,
+                        enabled = track.clips.none { it.id in state.offlineClipIds },
                         onVolumeChange = { volume ->
                             onIntent(EditorIntent.SetTrackVolume(track.id, volume))
                         },
@@ -195,6 +197,7 @@ internal fun TimelineCanvas(
                             track = track,
                             waveformBySource = state.waveformBySource,
                             selectedClipId = selectedClipId,
+                            offlineClipIds = state.offlineClipIds,
                             dpPerMs = dpPerMs,
                             onIntent = onIntent,
                         )
@@ -266,6 +269,7 @@ private fun TimeRuler(
 @Composable
 private fun TrackHeader(
     track: EditorTrack,
+    enabled: Boolean = true,
     onVolumeChange: (Float) -> Unit,
     onMuteToggle: () -> Unit,
 ) {
@@ -275,7 +279,8 @@ private fun TrackHeader(
             .height(TrackRowHeight)
             .background(CardSurfaceWhite)
             .padding(horizontal = 8.dp, vertical = 8.dp)
-            .testTag(trackSemanticsTag(track.id)),
+            .testTag(trackSemanticsTag(track.id))
+            .alpha(if (enabled) 1f else .55f),
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -288,6 +293,7 @@ private fun TrackHeader(
             )
             IconButton(
                 onClick = onMuteToggle,
+                enabled = enabled,
                 modifier = Modifier.size(48.dp),
             ) {
                 Icon(
@@ -301,6 +307,7 @@ private fun TrackHeader(
             value = track.volume.coerceIn(0f, 1.5f),
             onValueChange = onVolumeChange,
             valueRange = 0f..1.5f,
+            enabled = enabled,
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(min = 48.dp),
@@ -318,6 +325,7 @@ private fun TrackTimelineRow(
     track: EditorTrack,
     waveformBySource: Map<String, List<Int>>,
     selectedClipId: String?,
+    offlineClipIds: Set<String> = emptySet(),
     dpPerMs: Float,
     onIntent: (EditorIntent) -> Unit,
 ) {
@@ -335,6 +343,7 @@ private fun TrackTimelineRow(
                 clip = clip,
                 waveform = waveformBySource[clip.source.uri].orEmpty(),
                 selected = selectedClipId == clip.id,
+                enabled = clip.id !in offlineClipIds,
                 width = clipWidth,
                 offset = clipOffset,
                 dpPerMs = dpPerMs,
@@ -353,6 +362,7 @@ private fun TimelineClip(
     clip: AudioClip,
     waveform: List<Int>,
     selected: Boolean,
+    enabled: Boolean = true,
     width: Dp,
     offset: Dp,
     dpPerMs: Float,
@@ -379,6 +389,7 @@ private fun TimelineClip(
             .width(interactionWidth)
             .height(88.dp)
             .testTag(clipSemanticsTag(clip.id))
+            .alpha(if (enabled) 1f else .45f)
             .semantics {
                 this.selected = selected
                 contentDescription = buildString {
@@ -387,7 +398,8 @@ private fun TimelineClip(
                     if (!trimGesturesEnabled) append("; drag to move")
                 }
             }
-            .pointerInput(clip.id, dpPerMs, selected) {
+            .pointerInput(clip.id, dpPerMs, selected, enabled) {
+                if (!enabled) return@pointerInput
                 var dragMode = 0
                 var totalTrimDragPx = 0f
                 detectHorizontalDragGestures(
@@ -445,7 +457,7 @@ private fun TimelineClip(
                     },
                 )
             }
-            .clickable(role = Role.Button, onClick = onSelect),
+            .clickable(enabled = enabled, role = Role.Button, onClick = onSelect),
         contentAlignment = Alignment.Center,
     ) {
         Box(

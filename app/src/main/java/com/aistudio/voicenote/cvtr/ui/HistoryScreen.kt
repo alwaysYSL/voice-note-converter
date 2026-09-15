@@ -86,6 +86,7 @@ import androidx.paging.compose.collectAsLazyPagingItems
 import com.aistudio.voicenote.cvtr.audio.PlaybackState
 import com.aistudio.voicenote.cvtr.data.local.ConversionHistory
 import com.aistudio.voicenote.cvtr.data.local.DeliveryStatus
+import com.aistudio.voicenote.cvtr.editor.data.EditorDraft
 import com.aistudio.voicenote.cvtr.audio.WaveformCodec
 import com.aistudio.voicenote.cvtr.ui.components.WaveformVisualizer
 import com.aistudio.voicenote.cvtr.ui.theme.AccentCoral
@@ -105,11 +106,13 @@ import java.util.Date
 import java.util.Locale
 
 @Composable
-fun HistoryScreen(
+internal fun HistoryScreen(
     viewModel: HistoryViewModel,
     modifier: Modifier = Modifier,
     onStartConversion: () -> Unit = {},
     onEditHistory: (Long) -> Unit = {},
+    onOpenDraft: (String) -> Unit = {},
+    onDeleteDraft: (EditorDraft) -> Unit = {},
     bottomOverlayClearance: Dp = 0.dp,
     statusBarInset: Dp? = null
 ) {
@@ -121,6 +124,7 @@ fun HistoryScreen(
     val historySort by viewModel.historySort.collectAsStateWithLifecycle()
     val currentlyPlayingId by viewModel.currentlyPlayingId.collectAsStateWithLifecycle()
     val message by viewModel.message.collectAsStateWithLifecycle()
+    val drafts by viewModel.drafts.collectAsStateWithLifecycle(initialValue = emptyList())
     val safeTopInset = statusBarInset
         ?: WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -177,7 +181,7 @@ fun HistoryScreen(
             .fillMaxSize()
             .background(AppCanvasBackground)
     ) {
-        if (totalHistoryCount == 0 && historyItems.itemCount == 0) {
+        if (totalHistoryCount == 0 && historyItems.itemCount == 0 && drafts.isEmpty()) {
             EmptyHistoryState(
                 modifier = Modifier.fillMaxSize(),
                 onStartConversion = onStartConversion
@@ -223,6 +227,15 @@ fun HistoryScreen(
                         onFilterChange = viewModel::setFilter,
                         onSortChange = viewModel::setSort
                     )
+                }
+                if (drafts.isNotEmpty()) {
+                    item(key = "draft-editor-section") {
+                        DraftEditorSection(
+                            drafts = drafts,
+                            onOpen = onOpenDraft,
+                            onDelete = onDeleteDraft,
+                        )
+                    }
                 }
                 if (historyItems.itemCount == 0) {
                     item(key = "history-no-results") {
@@ -640,6 +653,47 @@ private fun HistorySectionHeader(
                 contentDescription = if (expanded) "Lipat $title" else "Buka $title",
                 tint = SubtitleSlate
             )
+        }
+    }
+}
+
+@Composable
+internal fun DraftEditorSection(
+    drafts: List<EditorDraft>,
+    onOpen: (String) -> Unit,
+    onDelete: (EditorDraft) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("history_draft_section"),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text("Draft editor", style = MaterialTheme.typography.labelLarge, color = SubtitleSlate)
+        drafts.forEach { draft ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = CardSurfaceWhite),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(draft.name, color = DeepNavyDisplay, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("Draft audio editor", color = SubtitleSlate, style = MaterialTheme.typography.bodySmall)
+                    }
+                    Button(
+                        onClick = { onOpen(draft.id) },
+                        modifier = Modifier.testTag("history_draft_open_${draft.id}"),
+                    ) { Text("Buka") }
+                    TextButton(
+                        onClick = { onDelete(draft) },
+                        modifier = Modifier.testTag("history_draft_delete_${draft.id}"),
+                    ) { Text("Hapus") }
+                }
+            }
         }
     }
 }

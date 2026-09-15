@@ -36,6 +36,13 @@ internal class CommandHistory(
     val redoDepth: Int
         get() = redo.size
 
+    /** Marks the current timeline as the durable baseline after an explicit draft save. */
+    @Synchronized
+    fun markClean(draftId: String = session.draftId ?: session.id): EditorSession {
+        session = session.copy(id = draftId, draftId = draftId, dirty = false)
+        return session
+    }
+
     /** All snapshots that can still become audible through the current history branch. */
     @Synchronized
     fun referencedSessions(): List<EditorSession> = buildList {

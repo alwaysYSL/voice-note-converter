@@ -1,3 +1,10 @@
 <resources>
     <string name="app_name">Voice Note Converter</string>
+    <string name="editor_save_draft">Simpan sebagai draft</string>
+    <string name="editor_update_draft">Update draft</string>
+    <string name="editor_discard_session">Buang sesi</string>
+    <string name="editor_cancel">Batal</string>
+    <string name="editor_replace_source">Ganti file</string>
+    <string name="editor_draft_section">Draft editor</string>
+    <string name="editor_storage_error">Ruang penyimpanan tidak cukup.</string>
 </resources>

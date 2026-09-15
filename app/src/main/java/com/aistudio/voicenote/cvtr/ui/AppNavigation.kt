@@ -56,7 +56,7 @@ private sealed class Screen(val route: String, val label: String) {
     data object History : Screen("history", "Riwayat")
 }
 
-private const val EditorRoute = "editor?historyId={historyId}"
+private const val EditorRoute = "editor?historyId={historyId}&draftId={draftId}"
 private const val EditorRouteBase = "editor"
 
 private val BottomOverlayClearance = 128.dp
@@ -124,13 +124,22 @@ fun AppNavigation(
                         pendingEditorLaunch = null
                         navController.navigate("editor?historyId=$historyId")
                     },
+                    onOpenDraft = { draftId ->
+                        pendingEditorLaunch = null
+                        navController.navigate("editor?draftId=$draftId")
+                    },
                     bottomOverlayClearance = BottomOverlayClearance
                 )
             }
             composable(EditorRoute) { entry ->
                 val historyId = entry.arguments?.getString("historyId")?.toLongOrNull()
-                val launchSource = remember(historyId, pendingEditorLaunch) {
-                    historyId?.let(EditorLaunchSource::History) ?: pendingEditorLaunch
+                val draftId = entry.arguments?.getString("draftId")
+                val launchSource = remember(historyId, draftId, pendingEditorLaunch) {
+                    when {
+                        draftId != null -> EditorLaunchSource.Draft(draftId)
+                        historyId != null -> EditorLaunchSource.History(historyId)
+                        else -> pendingEditorLaunch
+                    }
                 }
                 if (launchSource == null) {
                     LaunchedEffect(Unit) {
@@ -160,11 +169,22 @@ fun AppNavigation(
                     ) { uri ->
                         uri?.let(editorViewModel::importTrack)
                     }
+                    var replacingClipId by remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+                    val replacePicker = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.OpenDocument(),
+                    ) { uri ->
+                        val clipId = replacingClipId
+                        if (uri != null && clipId != null) editorViewModel.replaceMissingSource(clipId, uri)
+                    }
                     EditorEntryScreen(
                         state = editorState,
                         onIntent = editorViewModel::dispatch,
                         onPickTrack = {
                             audioPicker.launch(arrayOf("audio/*"))
+                        },
+                        onReplaceSource = { clipId ->
+                            replacingClipId = clipId
+                            replacePicker.launch(arrayOf("audio/*"))
                         },
                         onBack = { navController.popBackStack() }
                     )
@@ -197,11 +217,13 @@ private fun EditorEntryScreen(
     onBack: () -> Unit,
     onIntent: (com.aistudio.voicenote.cvtr.editor.ui.EditorIntent) -> Unit = {},
     onPickTrack: () -> Unit = {},
+    onReplaceSource: (String) -> Unit = {},
 ) {
     com.aistudio.voicenote.cvtr.editor.ui.EditorScreen(
         state = state,
         onIntent = onIntent,
         onPickTrack = onPickTrack,
+        onReplaceSource = onReplaceSource,
         onBack = onBack,
     )
 }

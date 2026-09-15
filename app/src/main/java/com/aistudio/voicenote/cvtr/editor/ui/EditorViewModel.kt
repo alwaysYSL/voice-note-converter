@@ -22,6 +22,7 @@ import com.aistudio.voicenote.cvtr.editor.command.DeleteClipCommand
 import com.aistudio.voicenote.cvtr.editor.command.EditorCommand
 import com.aistudio.voicenote.cvtr.editor.command.MoveClipCommand
 import com.aistudio.voicenote.cvtr.editor.command.RemoveTrackCommand
+import com.aistudio.voicenote.cvtr.editor.command.ReplaceClipSourceCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetClipFadeCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetClipPitchCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetClipSpeedCommand
@@ -49,6 +50,8 @@ import com.aistudio.voicenote.cvtr.editor.model.MAX_TIMELINE_MS
 import com.aistudio.voicenote.cvtr.editor.model.TimelineError
 import com.aistudio.voicenote.cvtr.editor.model.TimelineResult
 import com.aistudio.voicenote.cvtr.editor.model.value
+import com.aistudio.voicenote.cvtr.editor.data.DraftSourceStorage
+import com.aistudio.voicenote.cvtr.editor.data.EditorDraftRepository
 import com.aistudio.voicenote.cvtr.editor.work.EditorExportWork
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
@@ -85,6 +88,7 @@ sealed interface EditorLaunchSource {
     ) : EditorLaunchSource
 
     data class History(val historyId: Long) : EditorLaunchSource
+    data class Draft(val draftId: String) : EditorLaunchSource
 }
 
 internal enum class EditorMessage {
@@ -93,7 +97,22 @@ internal enum class EditorMessage {
     HISTORY_NOT_FOUND,
     IMPORT_FAILED,
     PROCESSED_AUDIO_UNAVAILABLE,
+    DRAFT_SAVE_FAILED,
+    DRAFT_NOT_FOUND,
+    SOURCE_REPLACEMENT_INVALID,
+    SOURCE_REPLACEMENT_FAILED,
 }
+
+internal enum class EditorDraftSaveStatus { IDLE, SAVING, SUCCEEDED, FAILED }
+
+internal data class EditorDraftUiState(
+    val status: EditorDraftSaveStatus = EditorDraftSaveStatus.IDLE,
+    val draftId: String? = null,
+    val progress: Float = 0f,
+    val error: String? = null,
+    val canRetry: Boolean = false,
+    val exitAfterSave: Boolean = false,
+)
 
 internal enum class EditorSheet {
     FADE,
@@ -219,6 +238,8 @@ internal sealed interface EditorIntent {
         val sourceStartMs: Long,
         val sourceEndMs: Long,
     ) : EditorIntent
+    /** Accessible trim nudge used by the toolbar; unlike the old no-op dispatch, it changes a bound. */
+    data class NudgeTrim(val startDeltaMs: Long = 0L, val endDeltaMs: Long = 0L) : EditorIntent
     data class Move(val timelineStartMs: Long) : EditorIntent
     data class Delete(val ripple: Boolean = true) : EditorIntent
     data class SetFade(val fadeInMs: Long, val fadeOutMs: Long) : EditorIntent
@@ -245,6 +266,8 @@ internal sealed interface EditorIntent {
     ) : EditorIntent
     data object CancelCleanup : EditorIntent
     data object RetryCleanup : EditorIntent
+    data class SaveDraft(val exitAfterSave: Boolean = false) : EditorIntent
+    data object RetrySaveDraft : EditorIntent
 }
 
 internal data class EditorUiState(
@@ -259,6 +282,9 @@ internal data class EditorUiState(
     val playback: EditorPlaybackState = EditorPlaybackState(),
     val export: EditorExportUiState = EditorExportUiState(),
     val cleanup: EditorCleanupUiState = EditorCleanupUiState(),
+    val draft: EditorDraftUiState = EditorDraftUiState(),
+    val offlineClipIds: Set<String> = emptySet(),
+    val sourceError: String? = null,
 )
 
 private data class CleanupTarget(
@@ -299,6 +325,11 @@ internal class EditorViewModel(
     private val launchSource: EditorLaunchSource,
     private val repository: ConversionHistoryRepository = ConversionHistoryRepository(
         AppDatabase.getDatabase(application).conversionHistoryDao()
+    ),
+    private val draftRepository: EditorDraftRepository = EditorDraftRepository(
+        database = AppDatabase.getDatabase(application),
+        sourceStorage = DraftSourceStorage(application),
+        processedAudioCache = ProcessedAudioCache(File(application.cacheDir, "processed_audio")),
     ),
     private val sourceAnalyzer: suspend (Uri) -> AudioSourceInfo = { uri ->
         val (name, durationMs) = VoiceNoteConverter.getMediaInfo(application, uri)
@@ -390,6 +421,17 @@ internal class EditorViewModel(
             is EditorIntent.Trim -> runSerializedMutation {
                 selectedClip()?.let { execute(TrimClipCommand(it, intent.sourceStartMs, intent.sourceEndMs)) }
             }
+            is EditorIntent.NudgeTrim -> runSerializedMutation {
+                selectedClip()?.let { clipId ->
+                    _uiState.value.session.findClipForCleanup(clipId)?.let { clip ->
+                        val start = (clip.sourceStartMs + intent.startDeltaMs)
+                            .coerceIn(0L, clip.sourceEndMs - 1L)
+                        val end = (clip.sourceEndMs + intent.endDeltaMs)
+                            .coerceIn(start + 1L, clip.source.durationMs.takeIf { it >= 0L } ?: Long.MAX_VALUE)
+                        execute(TrimClipCommand(clip.id, start, end))
+                    }
+                }
+            }
             is EditorIntent.Move -> runSerializedMutation {
                 selectedClip()?.let { execute(MoveClipCommand(it, intent.timelineStartMs)) }
             }
@@ -453,6 +495,128 @@ internal class EditorViewModel(
             )
             EditorIntent.CancelCleanup -> cancelCleanup()
             EditorIntent.RetryCleanup -> retryCleanup()
+            is EditorIntent.SaveDraft -> saveDraft(intent.exitAfterSave)
+            EditorIntent.RetrySaveDraft -> saveDraft(_uiState.value.draft.exitAfterSave)
+        }
+    }
+
+    /** Persists the immutable current snapshot; the in-memory baseline changes only afterwards. */
+    private fun saveDraft(exitAfterSave: Boolean) {
+        val current = _uiState.value
+        if (current.loading || current.draft.status == EditorDraftSaveStatus.SAVING) return
+        _uiState.update {
+            it.copy(draft = it.draft.copy(
+                status = EditorDraftSaveStatus.SAVING,
+                progress = 0.1f,
+                error = null,
+                canRetry = false,
+                exitAfterSave = exitAfterSave,
+                draftId = it.session.draftId ?: it.session.id,
+            ))
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                mutationMutex.withLock {
+                    val session = _uiState.value.session
+                    val draftName = session.tracks.firstOrNull()?.name?.ifBlank { null } ?: "Audio editor"
+                    val id = draftRepository.save(session, name = draftName)
+                    val clean = commandHistory?.markClean(id) ?: session.copy(
+                        id = id,
+                        draftId = id,
+                        dirty = false,
+                    )
+                    _uiState.update {
+                        it.copy(
+                            session = clean,
+                            message = null,
+                            draft = it.draft.copy(
+                                status = EditorDraftSaveStatus.SUCCEEDED,
+                                draftId = id,
+                                progress = 1f,
+                                error = null,
+                                canRetry = false,
+                            ),
+                        )
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        message = EditorMessage.DRAFT_SAVE_FAILED,
+                        draft = it.draft.copy(
+                            status = EditorDraftSaveStatus.FAILED,
+                            progress = 0f,
+                            error = error.message ?: "Draft could not be saved",
+                            canRetry = true,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    /** Validates a replacement before mutating the timeline; a draft update is rolled back on save failure. */
+    fun replaceMissingSource(clipId: String, uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                retainReadPermission(uri)
+                val metadata = sourceAnalyzer(uri)
+                val clip = _uiState.value.session.findClipForCleanup(clipId)
+                    ?: throw IllegalArgumentException("Missing source clip is unavailable")
+                if (metadata.durationMs <= 0L || metadata.durationMs < clip.sourceEndMs) {
+                    showMessage(EditorMessage.SOURCE_REPLACEMENT_INVALID)
+                    return@launch
+                }
+                var previous: EditorSession? = null
+                var replaced = false
+                mutationMutex.withLock {
+                    previous = _uiState.value.session
+                    val result = commandHistory?.execute(
+                        ReplaceClipSourceCommand(
+                            clipId = clipId,
+                            source = AudioSourceRef(uri.toString(), metadata.durationMs),
+                            sourceStartMs = clip.sourceStartMs,
+                            sourceEndMs = clip.sourceEndMs,
+                        )
+                    )
+                    if (result is TimelineResult.Accepted) {
+                        publishSession(result.value)
+                        _uiState.update {
+                            it.copy(
+                                offlineClipIds = it.offlineClipIds - clipId,
+                                sourceError = null,
+                            )
+                        }
+                        replaced = true
+                    }
+                }
+                if (!replaced) {
+                    showMessage(EditorMessage.SOURCE_REPLACEMENT_FAILED)
+                    return@launch
+                }
+                val draftId = previous?.draftId
+                if (draftId != null) {
+                    try {
+                        val current = _uiState.value.session
+                        draftRepository.save(current, name = current.tracks.firstOrNull()?.name ?: "Audio editor")
+                        val clean = commandHistory?.markClean(draftId) ?: current.copy(dirty = false)
+                        _uiState.update { it.copy(session = clean, draft = it.draft.copy(status = EditorDraftSaveStatus.SUCCEEDED, draftId = draftId, progress = 1f)) }
+                    } catch (error: Throwable) {
+                        mutationMutex.withLock {
+                            commandHistory?.undo()?.let(::publishSession)
+                            _uiState.update { it.copy(sourceError = "Source replacement failed", offlineClipIds = it.offlineClipIds + clipId) }
+                        }
+                        showMessage(EditorMessage.SOURCE_REPLACEMENT_FAILED)
+                    }
+                }
+                loadWaveform(uri)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                showMessage(EditorMessage.SOURCE_REPLACEMENT_INVALID)
+            }
         }
     }
 
@@ -520,6 +684,7 @@ internal class EditorViewModel(
             when (val source = launchSource) {
                 is EditorLaunchSource.Converted -> resolveConverted(source)
                 is EditorLaunchSource.History -> resolveHistory(source.historyId)
+                is EditorLaunchSource.Draft -> resolveDraft(source.draftId)
             }
         } catch (error: CancellationException) {
             throw error
@@ -586,6 +751,40 @@ internal class EditorViewModel(
         }
     }
 
+    private suspend fun resolveDraft(draftId: String) {
+        if (draftId.isBlank()) {
+            showMessage(EditorMessage.DRAFT_NOT_FOUND)
+            finishLoading(EditorSession.empty())
+            return
+        }
+        val loaded = draftRepository.loadResult(draftId)
+        if (loaded == null) {
+            showMessage(EditorMessage.DRAFT_NOT_FOUND)
+            finishLoading(EditorSession.empty())
+            return
+        }
+        finishLoading(loaded.session)
+        val missing = loaded.missingPrivateSources.toSet()
+        val missingClipIds = loaded.session.tracks.asSequence()
+            .flatMap { it.clips.asSequence() }
+            .filter { it.source.uri in missing }
+            .map { it.id }
+            .toSet()
+        _uiState.update {
+            it.copy(
+                offlineClipIds = missingClipIds,
+                sourceError = if (missingClipIds.isEmpty()) null else "Draft source is unavailable",
+                draft = it.draft.copy(draftId = draftId),
+            )
+        }
+        loaded.session.tracks.asSequence()
+            .flatMap { it.clips.asSequence() }
+            .map { it.source.uri }
+            .filterNot { it in missing }
+            .distinct()
+            .forEach { loadWaveform(it.toUriForEditor()) }
+    }
+
     private fun sessionFor(uri: Uri, displayName: String, durationMs: Long): EditorSession {
         val clipId = "clip-1"
         return EditorSession(
@@ -623,6 +822,15 @@ internal class EditorViewModel(
                     outputName = defaultExportName(session),
                     estimatedSizeBytes = estimateExportSize(session, it.export.preset),
                 ),
+                draft = it.draft.copy(
+                    status = EditorDraftSaveStatus.IDLE,
+                    draftId = session.draftId,
+                    error = null,
+                    canRetry = false,
+                    exitAfterSave = false,
+                ),
+                offlineClipIds = emptySet(),
+                sourceError = null,
             )
         }
     }
@@ -659,6 +867,25 @@ internal class EditorViewModel(
             var manifest: File? = null
             try {
                 val requestedOutputName = current.export.outputName.ifBlank { defaultExportName(current.session) }
+                val renderFrames = current.session.tracks.asSequence()
+                    .flatMap { it.clips.asSequence() }
+                    .map { it.timelineEndMs.coerceAtLeast(0L) }
+                    .maxOrNull()
+                    ?.times(48L)
+                    ?.div(1_000L)
+                    ?: 0L
+                val requiredBytes = estimateRequiredBytes(renderFrames, normalized = false)
+                if (getApplication<Application>().filesDir.usableSpace < requiredBytes) {
+                    releaseExportLease(exportAttemptId)
+                    _uiState.update {
+                        it.copy(export = it.export.copy(
+                            status = EditorExportStatus.FAILED,
+                            error = "Insufficient storage for export",
+                            canRetry = false,
+                        ))
+                    }
+                    return@launch
+                }
                 manifest = EditorRenderManifest.writePrivate(
                     context = getApplication(),
                     session = current.session,

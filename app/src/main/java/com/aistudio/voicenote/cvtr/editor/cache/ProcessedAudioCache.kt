@@ -313,6 +313,26 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
         }
     }
 
+    /** Removes only aged, unreferenced canonical PCM entries under this cache root. */
+    fun removeUnreferencedOlderThan(
+        maxAgeMs: Long = PARTIAL_RETENTION_MS,
+        nowMs: Long = System.currentTimeMillis(),
+    ): Int {
+        require(maxAgeMs >= 0L) { "maxAgeMs must be non-negative" }
+        val cutoff = nowMs - maxAgeMs
+        val files = cacheDir.listFiles { _, name ->
+            name.length == 68 && name.endsWith(".pcm") &&
+                name.removeSuffix(".pcm").all { it in '0'..'9' || it in 'a'..'f' }
+        }.orEmpty()
+        return files.count { file ->
+            val retained = synchronized(rootState.lock) {
+                rootState.references.containsKey(file.name.removeSuffix(".pcm")) ||
+                    rootState.activeTemps.contains(file.canonicalFile.path)
+            }
+            !retained && file.lastModified() <= cutoff && runCatching { file.delete() }.getOrDefault(false)
+        }
+    }
+
     fun partialFiles(): List<File> =
         cacheDir.listFiles { _, name -> name.endsWith(".partial") }?.toList() ?: emptyList()
 

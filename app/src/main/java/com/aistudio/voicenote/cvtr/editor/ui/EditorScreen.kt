@@ -20,6 +20,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.AlertDialog
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -33,6 +35,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -49,12 +52,23 @@ internal fun EditorScreen(
     state: EditorUiState,
     onIntent: (EditorIntent) -> Unit,
     onPickTrack: () -> Unit = {},
+    onReplaceSource: (String) -> Unit = {},
     onBack: () -> Unit = {},
 ) {
+    var showExitDialog by remember { mutableStateOf(false) }
+    fun requestBack() {
+        if (state.session.dirty) showExitDialog = true else onBack()
+    }
+    BackHandler { requestBack() }
+    LaunchedEffect(state.draft.status, state.draft.exitAfterSave) {
+        if (state.draft.status == EditorDraftSaveStatus.SUCCEEDED && state.draft.exitAfterSave) {
+            onBack()
+        }
+    }
     val selectedClip = state.session.tracks
         .asSequence()
         .flatMap { it.clips.asSequence() }
-        .firstOrNull { it.id == state.session.selectedClipId }
+        .firstOrNull { it.id == state.session.selectedClipId && it.id !in state.offlineClipIds }
 
     Column(
         modifier = Modifier
@@ -72,7 +86,7 @@ internal fun EditorScreen(
                 }
             },
             navigationIcon = {
-                IconButton(onClick = onBack) {
+                IconButton(onClick = ::requestBack, modifier = Modifier.testTag("editor_back")) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                 }
             },
@@ -98,6 +112,21 @@ internal fun EditorScreen(
                 selectedClip = selectedClip,
                 onIntent = onIntent,
             )
+            if (state.offlineClipIds.isNotEmpty()) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+                    Text(
+                        text = state.sourceError ?: "Draft source is unavailable",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    state.offlineClipIds.forEach { clipId ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Clip $clipId offline", modifier = Modifier.weight(1f))
+                            Button(onClick = { onReplaceSource(clipId) }) { Text("Ganti file") }
+                        }
+                    }
+                }
+            }
             state.activeSheet?.let { sheet ->
                 selectedClip?.let { clip ->
                     EditorToolSheet(
@@ -127,15 +156,51 @@ internal fun EditorScreen(
                     color = MaterialTheme.colorScheme.error,
                 )
             }
+            when (state.draft.status) {
+                EditorDraftSaveStatus.SAVING -> Text(
+                    "Menyimpan draft… ${(state.draft.progress * 100f).toInt()}%",
+                    modifier = Modifier.testTag("editor_draft_progress"),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                EditorDraftSaveStatus.SUCCEEDED -> Text(
+                    "Draft tersimpan",
+                    modifier = Modifier.testTag("editor_draft_success"),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                EditorDraftSaveStatus.FAILED -> state.draft.error?.let { error ->
+                    Text(error, color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("editor_draft_error"))
+                }
+                EditorDraftSaveStatus.IDLE -> Unit
+            }
             EditorBottomActions(
                 session = state.session,
                 canUndo = state.canUndo,
                 canRedo = state.canRedo,
                 exportState = state.export,
+                draftState = state.draft,
                 onIntent = onIntent,
                 onPickTrack = onPickTrack,
             )
         }
+    }
+    if (showExitDialog) {
+        AlertDialog(
+            onDismissRequest = { showExitDialog = false },
+            title = { Text("Perubahan belum disimpan") },
+            text = { Text("Simpan perubahan sebelum keluar dari editor?") },
+            confirmButton = {
+                Button(onClick = {
+                    showExitDialog = false
+                    onIntent(EditorIntent.SaveDraft(exitAfterSave = true))
+                }) { Text("Simpan sebagai draft") }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { showExitDialog = false; onBack() }) { Text("Buang sesi") }
+                    Button(onClick = { showExitDialog = false }) { Text("Batal") }
+                }
+            },
+        )
     }
 }
 
@@ -226,4 +291,8 @@ private fun editorMessageText(message: EditorMessage): String = when (message) {
     EditorMessage.HISTORY_NOT_FOUND -> "This history item is no longer available."
     EditorMessage.IMPORT_FAILED -> "The track could not be imported."
     EditorMessage.PROCESSED_AUDIO_UNAVAILABLE -> "Processed cleanup audio is unavailable; the original source is playing."
+    EditorMessage.DRAFT_SAVE_FAILED -> "Draft gagal disimpan. Perubahan tetap ada di editor."
+    EditorMessage.DRAFT_NOT_FOUND -> "Draft tidak ditemukan."
+    EditorMessage.SOURCE_REPLACEMENT_INVALID -> "File pengganti tidak dapat dibaca atau terlalu pendek."
+    EditorMessage.SOURCE_REPLACEMENT_FAILED -> "File pengganti gagal disimpan; sumber lama dipertahankan."
 }

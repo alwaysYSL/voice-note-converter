@@ -102,6 +102,9 @@ interface ConversionHistoryDao {
     @Query("SELECT * FROM conversion_history WHERE editorExportAttemptId = :attemptId LIMIT 1")
     suspend fun getByEditorExportAttemptId(attemptId: String): ConversionHistory?
 
+    @Query("SELECT outputFilePath FROM conversion_history")
+    suspend fun getAllOutputFilePaths(): List<String>
+
     @Query(
         "SELECT * FROM conversion_history WHERE createdAt < :cutoff ORDER BY createdAt ASC"
     )

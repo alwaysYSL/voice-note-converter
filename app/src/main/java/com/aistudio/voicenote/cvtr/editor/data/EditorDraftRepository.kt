@@ -57,14 +57,14 @@ internal class EditorDraftRepository(
     }
 
     suspend fun save(session: EditorSession, name: String = session.id): String =
-        withDraftLock(session.id) {
+        withDraftLock(session.draftId ?: session.id) {
             ensureReconciled()
             saveLocked(session, name)
         }
 
     private suspend fun saveLocked(session: EditorSession, name: String): String {
         require(session.id.isNotBlank()) { "Draft id must not be blank" }
-        val draftId = session.id
+        val draftId = session.draftId ?: session.id
         val old = dao.loadSnapshot(draftId)
         val version = "${now()}-${UUID.randomUUID().toString().take(8)}"
         val sourceInputs = session.tracks.asSequence()
@@ -235,6 +235,7 @@ internal class EditorDraftRepository(
                 playheadMs = snapshot.draft.playheadMs,
                 exportPreset = snapshot.draft.exportPreset.toExportPreset(),
                 dirty = false,
+                draftId = snapshot.draft.id,
             ),
             missingPrivateSources = missing,
         )

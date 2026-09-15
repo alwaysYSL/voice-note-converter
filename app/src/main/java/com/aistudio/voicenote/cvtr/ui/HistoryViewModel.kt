@@ -13,6 +13,8 @@ import com.aistudio.voicenote.cvtr.audio.VoiceNoteStorage
 import com.aistudio.voicenote.cvtr.data.local.AppDatabase
 import com.aistudio.voicenote.cvtr.data.local.ConversionHistory
 import com.aistudio.voicenote.cvtr.data.repository.ConversionHistoryRepository
+import com.aistudio.voicenote.cvtr.editor.data.EditorDraft
+import com.aistudio.voicenote.cvtr.editor.data.EditorDraftRepository
 import com.aistudio.voicenote.cvtr.telegram.SendResult
 import com.aistudio.voicenote.cvtr.telegram.TelegramSender
 import kotlinx.coroutines.CoroutineScope
@@ -37,15 +39,23 @@ import kotlinx.coroutines.withContext
     kotlinx.coroutines.FlowPreview::class,
     kotlinx.coroutines.ExperimentalCoroutinesApi::class
 )
-class HistoryViewModel(
+internal class HistoryViewModel(
     app: Application,
     private val repository: ConversionHistoryRepository = ConversionHistoryRepository(
         AppDatabase.getDatabase(app).conversionHistoryDao()
+    ),
+    private val draftRepository: EditorDraftRepository = EditorDraftRepository(
+        database = AppDatabase.getDatabase(app),
+        sourceStorage = com.aistudio.voicenote.cvtr.editor.data.DraftSourceStorage(app),
+        processedAudioCache = com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioCache(
+            java.io.File(app.cacheDir, "processed_audio")
+        ),
     ),
     private val telegramSender: TelegramSender = TelegramSender(),
     audioPlayerFactory: (android.content.Context, CoroutineScope) -> AudioPreviewPlayer =
         ::AudioPreviewPlayer
 ) : AndroidViewModel(app) {
+    internal val drafts: Flow<List<EditorDraft>> = draftRepository.observeAll()
     private val _searchQuery = MutableStateFlow("")
     val searchQuery = _searchQuery.asStateFlow()
     private val _historyFilter = MutableStateFlow(HistoryFilter.ALL)
@@ -251,6 +261,17 @@ class HistoryViewModel(
 
     fun clearMessage() {
         _message.value = null
+    }
+
+    fun deleteDraft(draft: EditorDraft) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                draftRepository.delete(draft.id)
+                _message.value = "Draft dihapus."
+            } catch (error: Throwable) {
+                _message.value = error.message ?: "Draft tidak dapat dihapus."
+            }
+        }
     }
 
     fun pausePlayback() {

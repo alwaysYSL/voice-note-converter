@@ -76,8 +76,13 @@ internal fun ContextualEditorToolbar(
             enabled = hasSelection,
             onClick = {
                 selectedClip?.let { clip ->
-                    onIntent(EditorIntent.Trim(clip.sourceStartMs, clip.sourceEndMs))
+                    // The toolbar action must make a real, accessible adjustment. Drag handles
+                    // remain available for precise editing; this nudges the end boundary by 100 ms.
+                    onIntent(EditorIntent.NudgeTrim(endDeltaMs = -100L))
                 }
+            },
+            modifier = Modifier.semantics {
+                contentDescription = "Trim end by 100 milliseconds"
             },
         )
         // Keep the cleanup entry point in the leading viewport of the compact,
@@ -377,6 +382,7 @@ internal fun EditorBottomActions(
     canUndo: Boolean,
     canRedo: Boolean,
     exportState: EditorExportUiState = EditorExportUiState(),
+    draftState: EditorDraftUiState = EditorDraftUiState(),
     onIntent: (EditorIntent) -> Unit,
     onPickTrack: () -> Unit,
 ) {
@@ -415,6 +421,22 @@ internal fun EditorBottomActions(
                 .testTag("add_track"),
         ) {
             Text("Add track")
+        }
+        Button(
+            onClick = { onIntent(EditorIntent.SaveDraft()) },
+            enabled = draftState.status != EditorDraftSaveStatus.SAVING,
+            modifier = Modifier
+                .weight(1f)
+                .heightIn(min = 48.dp)
+                .testTag("editor_save_draft"),
+        ) {
+            Text(
+                when {
+                    draftState.status == EditorDraftSaveStatus.SAVING -> "Menyimpan…"
+                    draftState.draftId == null -> "Simpan sebagai draft"
+                    else -> "Update draft"
+                }
+            )
         }
         Button(
             onClick = { onIntent(EditorIntent.ShowExportSheet(true)) },
