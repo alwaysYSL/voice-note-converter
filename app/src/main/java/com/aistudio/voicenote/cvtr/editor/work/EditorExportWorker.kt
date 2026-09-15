@@ -32,6 +32,7 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.security.MessageDigest
 import java.util.UUID
 import kotlin.math.ceil
 import kotlinx.coroutines.CancellationException
@@ -654,11 +655,7 @@ internal class AndroidEditorExportStorage(
                     "Cannot publish reserved editor output"
                 }
             }
-            ContentResolver.SCHEME_FILE -> {
-                FileOutputStream(uri.path ?: error("Reserved editor output path is missing")).use { output ->
-                    FileInputStream(partialFile).use { input -> input.copyTo(output) }
-                }
-            }
+            ContentResolver.SCHEME_FILE -> return publishPreQReserved(partialFile, uri)
             else -> error("Reserved editor output identity is invalid")
         }
         check(finalizeReserved(uri)) { "Cannot finalize reserved editor output" }
@@ -674,6 +671,9 @@ internal class AndroidEditorExportStorage(
     }
 
     override fun validatePublished(uri: Uri): Boolean {
+        if (uri.scheme == ContentResolver.SCHEME_FILE && uri.path.orEmpty().endsWith(PRE_Q_PENDING_SUFFIX)) {
+            return false
+        }
         return try {
             open(uri).use { input ->
                 val bytes = ByteArray(64 * 1024)
@@ -699,7 +699,19 @@ internal class AndroidEditorExportStorage(
         0L
     }
 
-    override fun deletePublished(uri: Uri): Boolean = VoiceNoteStorage.deleteFromStorage(context, uri.toString())
+    override fun deletePublished(uri: Uri): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && uri.scheme == ContentResolver.SCHEME_FILE) {
+            val path = uri.path ?: return false
+            val pending = if (path.endsWith(PRE_Q_PENDING_SUFFIX)) path else "$path$PRE_Q_PENDING_SUFFIX"
+            val final = if (path.endsWith(PRE_Q_PENDING_SUFFIX)) path.removeSuffix(PRE_Q_PENDING_SUFFIX) else path
+            val temporary = "$final$PRE_Q_RENAME_TEMP_SUFFIX"
+            val finalDeleted = !File(final).exists() || File(final).delete()
+            val pendingDeleted = !File(pending).exists() || File(pending).delete()
+            val temporaryDeleted = !File(temporary).exists() || File(temporary).delete()
+            return finalDeleted && pendingDeleted && temporaryDeleted
+        }
+        return VoiceNoteStorage.deleteFromStorage(context, uri.toString())
+    }
 
     override fun deletePartial(file: File): Boolean = !file.exists() || file.delete()
 
@@ -732,30 +744,28 @@ internal class AndroidEditorExportStorage(
         @Suppress("DEPRECATION")
         val directory = VoiceNoteStorage.getStorageFolder()
         check(directory.exists() || directory.mkdirs()) { "Cannot create editor output directory" }
-        val marker = reservationMarkerFile(manifest.exportAttemptId)
-        if (marker.isFile) {
-            val candidate = marker.readText(Charsets.UTF_8).trim()
-            if (candidate.isNotBlank()) {
-                val file = File(directory, candidate)
-                if (file.exists() || file.createNewFile()) {
-                    return EditorExportOutputIdentity(candidate, Uri.fromFile(file).toString())
-                }
-            }
+        val suffix = stableAttemptSuffix(manifest.exportAttemptId)
+        val stem = requested.removeSuffix(".ogg").take(PRE_Q_OUTPUT_STEM_LIMIT)
+        val finalName = "${stem}_$suffix.ogg"
+        val finalFile = File(directory, finalName)
+        val pendingFile = File(directory, "$finalName$PRE_Q_PENDING_SUFFIX")
+        val temporaryFile = File(directory, "$finalName$PRE_Q_RENAME_TEMP_SUFFIX")
+        if (finalFile.isFile && validatePreQFile(finalFile)) {
+            return EditorExportOutputIdentity(finalName, Uri.fromFile(finalFile).toString())
         }
-        var candidate = requested
-        var suffix = 1
-        while (true) {
-            val file = File(directory, candidate)
-            if (file.createNewFile()) {
-                check(marker.parentFile?.exists() == true || marker.parentFile?.mkdirs() == true) {
-                    "Cannot create editor reservation marker"
-                }
-                FileOutputStream(marker).use { it.write(candidate.toByteArray(Charsets.UTF_8)) }
-                return EditorExportOutputIdentity(candidate, Uri.fromFile(file).toString())
-            }
-            val stem = requested.removeSuffix(".ogg")
-            candidate = "${stem.take(71)}_${suffix++}.ogg"
+        if (finalFile.exists()) {
+            check(finalFile.delete()) { "Cannot replace invalid editor output" }
         }
+        if (temporaryFile.exists()) {
+            check(temporaryFile.delete()) { "Cannot clean editor output rename temporary" }
+        }
+        if (pendingFile.exists() && !pendingFile.delete()) {
+            check(validatePreQFile(pendingFile)) { "Cannot replace invalid editor output partial" }
+        }
+        if (!pendingFile.exists()) {
+            check(pendingFile.createNewFile()) { "Cannot reserve editor output partial" }
+        }
+        return EditorExportOutputIdentity(finalName, Uri.fromFile(pendingFile).toString())
     }
 
     private fun findMediaStoreReservation(attemptId: String): EditorExportOutputIdentity? {
@@ -781,16 +791,73 @@ internal class AndroidEditorExportStorage(
         }
     }
 
-    private fun reservationMarkerFile(attemptId: String): File {
-        val directory = File(context.filesDir, "editor/reservations")
-        return File(directory, "${attemptId.replace(Regex("[^A-Za-z0-9._-]"), "_")}.marker")
-    }
-
     private fun reservationMarker(attemptId: String): String =
         "VoiceNoteConverter editor export $attemptId"
 
+    private fun publishPreQReserved(partialFile: File, reservedUri: Uri): Uri {
+        val pendingPath = reservedUri.path ?: error("Reserved editor output path is missing")
+        val pendingFile = File(pendingPath)
+        val finalFile = if (pendingPath.endsWith(PRE_Q_PENDING_SUFFIX)) {
+            File(pendingPath.removeSuffix(PRE_Q_PENDING_SUFFIX))
+        } else {
+            pendingFile
+        }
+        check(pendingFile.exists() || pendingFile.createNewFile()) { "Cannot open reserved editor output" }
+        if (!validatePreQFile(pendingFile)) {
+            FileOutputStream(pendingFile).use { output ->
+                FileInputStream(partialFile).use { input -> input.copyTo(output) }
+            }
+        }
+        if (finalFile.exists()) {
+            if (validatePreQFile(finalFile)) {
+                pendingFile.delete()
+                return Uri.fromFile(finalFile)
+            }
+            check(finalFile.delete()) { "Cannot replace invalid editor output" }
+        }
+        if (!pendingFile.renameTo(finalFile)) {
+            val temporary = File(finalFile.parentFile, "${finalFile.name}$PRE_Q_RENAME_TEMP_SUFFIX")
+            FileInputStream(pendingFile).use { input ->
+                FileOutputStream(temporary).use { output -> input.copyTo(output) }
+            }
+            check(temporary.renameTo(finalFile)) { "Cannot publish editor output" }
+            check(pendingFile.delete()) { "Cannot clean editor output partial" }
+        }
+        return Uri.fromFile(finalFile)
+    }
+
+    private fun validatePreQFile(file: File): Boolean {
+        if (!file.isFile || file.length() < 4L) return false
+        return try {
+            FileInputStream(file).use { input ->
+                val bytes = ByteArray(64 * 1024)
+                val read = input.read(bytes)
+                if (read < 4) return false
+                val hasOgg = bytes.copyOfRange(0, 4).contentEquals(byteArrayOf(0x4f, 0x67, 0x67, 0x53))
+                val header = "OpusHead".toByteArray(Charsets.US_ASCII)
+                val hasOpus = read >= header.size && (0..(read - header.size)).any { offset ->
+                    bytes.copyOfRange(offset, offset + header.size).contentEquals(header)
+                }
+                hasOgg && hasOpus
+            }
+        } catch (error: Throwable) {
+            error.rethrowIfFatal()
+            false
+        }
+    }
+
+    private fun stableAttemptSuffix(attemptId: String): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(attemptId.toByteArray(Charsets.UTF_8))
+            .take(PRE_Q_ATTEMPT_SUFFIX_BYTES)
+            .joinToString("") { "%02x".format(it) }
+
     private companion object {
         const val MEDIASTORE_DESCRIPTION = "description"
+        const val PRE_Q_PENDING_SUFFIX = ".pending"
+        const val PRE_Q_RENAME_TEMP_SUFFIX = ".tmp"
+        const val PRE_Q_OUTPUT_STEM_LIMIT = 59
+        const val PRE_Q_ATTEMPT_SUFFIX_BYTES = 6
     }
 
     private fun open(uri: Uri): InputStream {

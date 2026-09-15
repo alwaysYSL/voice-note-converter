@@ -10,6 +10,8 @@ import com.aistudio.voicenote.cvtr.editor.model.EditorSession
 import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
 import com.aistudio.voicenote.cvtr.editor.model.ExportPreset
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.OutputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
@@ -176,9 +178,39 @@ class EditorExportWorkerTest {
         assertTrue(storage.partial.isEmpty())
     }
 
+    @Test
+    fun `pre-q retry reuses attempt-owned pending path without touching requested file`() = runBlocking {
+        val root = File(System.getProperty("java.io.tmpdir"), "editor-export-pre-q-${java.util.UUID.randomUUID()}")
+            .also { it.mkdirs() }
+        val storage = PreQFakeStorage(root)
+        val reservation = PreQFakeReservationStore(root)
+        val requested = File(root, "mix.ogg").also { it.writeText("keep-source") }
+        val snapshot = manifest()
+        storage.crashAfterCopy = true
+
+        try {
+            assertThrows(SimulatedProcessDeath::class.java) {
+                runBlocking {
+                    runner(storage, FakeHistory(), reservation).run(snapshot, "mix.ogg", snapshot.preset)
+                }
+            }
+            assertTrue(storage.pendingFiles.single().exists())
+
+            val retry = runner(storage, FakeHistory(), reservation).run(snapshot, "mix.ogg", snapshot.preset)
+            assertTrue(retry is EditorExportResult.Success)
+            assertEquals(1, storage.finalFiles.count { it.exists() })
+            assertTrue(storage.pendingFiles.none { it.exists() })
+            assertFalse(root.listFiles()?.any { it.name.endsWith(".marker") } == true)
+            assertEquals("keep-source", requested.readText())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     private fun runner(
-        storage: FakeStorage,
+        storage: EditorExportStorage,
         history: FakeHistory,
+        reservationStore: EditorExportReservationStore? = (storage as? FakeStorage)?.let(::FakeReservationStore),
         cancelAfterFirstChunk: Boolean = false,
     ): EditorExportRunner = EditorExportRunner(
         rendererFactory = { object : TimelineRenderer {
@@ -195,7 +227,7 @@ class EditorExportWorkerTest {
         encoderFactory = { output, _, _ -> FakeEncoder(output) },
         storage = storage,
         history = history,
-        reservationStore = FakeReservationStore(storage),
+        reservationStore = reservationStore,
         workId = "test-export",
     )
 
@@ -284,6 +316,82 @@ class EditorExportWorkerTest {
 
         override fun release(identity: EditorExportOutputIdentity): Boolean =
             storage.deletePublished(android.net.Uri.parse(identity.uri))
+    }
+
+    private class PreQFakeReservationStore(
+        private val root: File,
+    ) : EditorExportReservationStore {
+        private val identities = mutableMapOf<String, EditorExportOutputIdentity>()
+
+        override fun reserve(
+            manifest: EditorRenderManifest,
+            requestedName: String?,
+        ): EditorExportOutputIdentity = identities.getOrPut(manifest.exportAttemptId) {
+            val suffix = manifest.exportAttemptId.replace(Regex("[^A-Za-z0-9]"), "").take(12)
+            val finalName = "${requestedName?.removeSuffix(".ogg") ?: "mix"}_$suffix.ogg"
+            val final = File(root, finalName)
+            val pending = File(root, "$finalName.pending")
+            when {
+                final.exists() -> EditorExportOutputIdentity(finalName, android.net.Uri.fromFile(final).toString())
+                else -> {
+                    check(pending.exists() || pending.createNewFile())
+                    EditorExportOutputIdentity(finalName, android.net.Uri.fromFile(pending).toString())
+                }
+            }
+        }
+
+        override fun release(identity: EditorExportOutputIdentity): Boolean = true
+    }
+
+    private class PreQFakeStorage(
+        private val root: File,
+    ) : EditorExportStorage {
+        val pendingFiles = mutableListOf<File>()
+        val finalFiles = mutableListOf<File>()
+        var crashAfterCopy = false
+
+        override fun createPartialFile(workId: String): File = File(root, "$workId.partial")
+
+        override fun publish(partialFile: File, outputName: String): android.net.Uri =
+            error("pre-Q export must use its reserved output")
+
+        override fun publishReserved(
+            partialFile: File,
+            outputName: String,
+            outputUri: String?,
+        ): android.net.Uri {
+            val pending = File(android.net.Uri.parse(outputUri ?: error("missing pending URI")).path!!)
+            val final = File(pending.path.removeSuffix(".pending"))
+            if (!pending.exists()) check(pending.createNewFile())
+            if (pending !in pendingFiles) pendingFiles += pending
+            if (pending.length() == 0L) {
+                FileInputStream(partialFile).use { input ->
+                    FileOutputStream(pending).use { output -> input.copyTo(output) }
+                }
+            }
+            if (crashAfterCopy) {
+                crashAfterCopy = false
+                throw SimulatedProcessDeath()
+            }
+            check(!final.exists()) { "would overwrite unrelated final" }
+            check(pending.renameTo(final))
+            finalFiles += final
+            return android.net.Uri.fromFile(final)
+        }
+
+        override fun validatePublished(uri: android.net.Uri): Boolean {
+            val file = File(uri.path ?: return false)
+            return !file.name.endsWith(".pending") && file.isFile && file.length() > 0L
+        }
+
+        override fun deletePublished(uri: android.net.Uri): Boolean {
+            val path = uri.path ?: return false
+            val pending = File(if (path.endsWith(".pending")) path else "$path.pending")
+            val final = File(if (path.endsWith(".pending")) path.removeSuffix(".pending") else path)
+            return (!pending.exists() || pending.delete()) && (!final.exists() || final.delete())
+        }
+
+        override fun deletePartial(file: File): Boolean = !file.exists() || file.delete()
     }
 
     private class FakeHistory(
