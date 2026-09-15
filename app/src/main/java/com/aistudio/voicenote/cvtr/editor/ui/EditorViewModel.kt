@@ -3,6 +3,8 @@ package com.aistudio.voicenote.cvtr.editor.ui
 import android.app.Application
 import android.content.Intent
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.work.OneTimeWorkRequest
@@ -67,6 +69,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.withContext
 
 /** Metadata extracted before a source is added to the timeline. */
 internal data class AudioSourceInfo(
@@ -191,10 +194,17 @@ private class WorkManagerEditorExportScheduler(
     override fun observe(id: UUID): Flow<WorkInfo?> = callbackFlow {
         val liveData = workManager.getWorkInfoByIdLiveData(id)
         val observer = Observer<WorkInfo?> { info -> trySend(info) }
-        // The observer is scoped to this Flow collection. awaitClose always unregisters it when
-        // the observation job is cancelled or the collector leaves the screen.
-        liveData.observeForever(observer)
-        awaitClose { liveData.removeObserver(observer) }
+        // LiveData requires both observer registration and removal on the main thread, while
+        // cleanup/export collectors intentionally run on Dispatchers.IO.
+        withContext(Dispatchers.Main.immediate) { liveData.observeForever(observer) }
+        val mainHandler = Handler(Looper.getMainLooper())
+        awaitClose {
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                liveData.removeObserver(observer)
+            } else {
+                mainHandler.post { liveData.removeObserver(observer) }
+            }
+        }
     }
 }
 
@@ -326,10 +336,9 @@ internal class EditorViewModel(
     private val exportGate = Any()
     private var exportEnqueueInFlight = false
     private var exportCancelRequested = false
-    /** UI-side enqueue leases are separate from worker leases so cancellation cannot unpin a running job. */
+    /** Attempt leases are released only by enqueue failure or terminal WorkManager observation. */
     private val exportLeaseAttempts = mutableSetOf<String>()
     private val exportLeaseByWorkId = mutableMapOf<UUID, String>()
-    private var exportEnqueueAttemptId: String? = null
     private var cleanupObservationJobs: List<Job> = emptyList()
     private var cleanupPreparationJob: Job? = null
     private var cleanupBatch: CleanupBatch? = null
@@ -644,7 +653,6 @@ internal class EditorViewModel(
             exportEnqueueInFlight = true
             exportCancelRequested = false
             exportAttemptId = requestedAttemptId ?: UUID.randomUUID().toString()
-            exportEnqueueAttemptId = exportAttemptId
             acquireExportLease(current.session, exportAttemptId)
         }
         viewModelScope.launch(Dispatchers.IO) {
@@ -686,10 +694,8 @@ internal class EditorViewModel(
                         exportManifestPath = null
                         exportWorkId = null
                     }
-                    releaseExportLease(exportAttemptId)
                     // Keep observing the cancelled WorkManager attempt so its terminal state
-                    // releases the UI-side lease if it was not already released above. The worker
-                    // owns a separate lease for its actual render lifetime.
+                    // releases the single attempt lease after WorkManager confirms cancellation.
                     observeExport(id)
                     _uiState.update { it.copy(export = it.export.copy(
                         status = EditorExportStatus.CANCELLED,
@@ -723,7 +729,6 @@ internal class EditorViewModel(
             } finally {
                 synchronized(exportGate) {
                     exportEnqueueInFlight = false
-                    if (exportEnqueueAttemptId == exportAttemptId) exportEnqueueAttemptId = null
                 }
             }
         }
@@ -947,8 +952,8 @@ internal class EditorViewModel(
             prepared.clips.mapNotNull { it.workId }
         }
         workIds.forEach(cleanupScheduler::cancel)
-        synchronized(prepared.completed) { prepared.completed.values.toList() }
-            .forEach(processedCache::deleteIfUnreferenced)
+        // Completed content-addressed outputs remain unreferenced for the cache LRU. Do not
+        // delete them here: a newer batch may already be using the same key.
         _uiState.update {
             it.copy(cleanup = it.cleanup.copy(
                 status = if (cancelled) EditorCleanupStatus.CANCELLED else EditorCleanupStatus.FAILED,
@@ -968,10 +973,9 @@ internal class EditorViewModel(
             cleanupObservationJobs = emptyList()
             batch to batch.clips.mapNotNull { it.workId }
         } ?: return
-        val (batch, workIds) = cancellation
+        val (_, workIds) = cancellation
         workIds.forEach(cleanupScheduler::cancel)
-        synchronized(batch.completed) { batch.completed.values.toList() }
-            .forEach(processedCache::deleteIfUnreferenced)
+        // Leave valid outputs for cache eviction; another concurrent batch may share the key.
         if (publishCancelled) {
             _uiState.update { it.copy(cleanup = it.cleanup.copy(status = EditorCleanupStatus.CANCELLED, canRetry = true, error = "Cleanup cancelled")) }
         }
@@ -1065,14 +1069,10 @@ internal class EditorViewModel(
     private fun cancelExport() {
         val workId: UUID?
         val manifestPath: String?
-        val attemptId: String?
         synchronized(exportGate) {
             if (!exportEnqueueInFlight && exportWorkId == null) return
             exportCancelRequested = true
             workId = exportWorkId
-            attemptId = workId?.let(exportLeaseByWorkId::get)
-                ?: exportEnqueueAttemptId
-                ?: _uiState.value.export.exportAttemptId
             manifestPath = exportManifestPath.takeIf {
                 workId == null || workId !in exportWorkerStartedByWorkId
             }
@@ -1080,11 +1080,8 @@ internal class EditorViewModel(
         }
         workId?.let(exportScheduler::cancel)
         manifestPath?.let { File(it).delete() }
-        // Release only the UI enqueue lease. A worker that raced into RUNNING has its own
-        // durable lease and will release it from its terminal finally block.
-        attemptId?.let(::releaseExportLease)
-        // The durable worker lease remains until WorkManager reports a terminal state. Releasing
-        // here would let eviction delete PCM while a running worker still needs it.
+        // The attempt lease remains until WorkManager reports a terminal state. Releasing it here
+        // would let eviction delete PCM while a worker that raced into RUNNING still needs it.
         _uiState.update { it.copy(export = it.export.copy(
             status = EditorExportStatus.CANCELLED,
             canRetry = true,
@@ -1096,7 +1093,10 @@ internal class EditorViewModel(
         if (export.canRetry || export.status == EditorExportStatus.CANCELLED) {
             val requestedOutputName = export.outputName.ifBlank { defaultExportName(_uiState.value.session) }
             val previousAttemptId = export.exportAttemptId
-            val reuseAttempt = previousAttemptId != null &&
+            // A cancelled WorkManager item may still be delivering its terminal callback. A fresh
+            // attempt prevents that old callback from releasing the new attempt's single lease.
+            val reuseAttempt = export.status != EditorExportStatus.CANCELLED &&
+                previousAttemptId != null &&
                 export.attemptOutputName == requestedOutputName &&
                 export.attemptPreset == export.preset
             _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.IDLE, error = null, progress = 0f)) }
@@ -1206,21 +1206,19 @@ internal class EditorViewModel(
             .mapNotNull { it.effects.processedCacheKey }
             .groupingBy { it }
             .eachCount()
-        processedCache.acquireLease(exportUiLeaseId(attemptId), counts)
+        processedCache.acquireLease(attemptId, counts)
         exportLeaseAttempts += attemptId
     }
 
     private fun releaseExportLease(attemptId: String) {
         val owned = synchronized(exportGate) { exportLeaseAttempts.remove(attemptId) }
-        if (owned) processedCache.releaseLease(exportUiLeaseId(attemptId))
+        if (owned) processedCache.releaseLease(attemptId)
     }
 
     private fun releaseExportLeaseForWork(workId: UUID) {
         val attemptId = synchronized(exportGate) { exportLeaseByWorkId.remove(workId) }
         attemptId?.let(::releaseExportLease)
     }
-
-    private fun exportUiLeaseId(attemptId: String): String = "$attemptId:ui"
 
     private fun processedCacheDir(): File = File(getApplication<Application>().cacheDir, "processed_audio")
 

@@ -98,6 +98,16 @@ internal fun EditorScreen(
                 selectedClip = selectedClip,
                 onIntent = onIntent,
             )
+            state.activeSheet?.let { sheet ->
+                selectedClip?.let { clip ->
+                    EditorToolSheet(
+                        sheet = sheet,
+                        clip = clip,
+                        onIntent = onIntent,
+                        cleanupState = state.cleanup,
+                    )
+                }
+            }
             TimelineCanvas(
                 state = state,
                 onIntent = onIntent,
@@ -106,16 +116,6 @@ internal fun EditorScreen(
                     .weight(1f)
                     .testTag("editor_timeline"),
             )
-            state.activeSheet?.let { sheet ->
-                selectedClip?.let { clip ->
-                     EditorToolSheet(
-                         sheet = sheet,
-                         clip = clip,
-                         onIntent = onIntent,
-                         cleanupState = state.cleanup,
-                     )
-                }
-            }
             if (state.export.sheetOpen) {
                 EditorExportSheet(state.export, onIntent)
             }
