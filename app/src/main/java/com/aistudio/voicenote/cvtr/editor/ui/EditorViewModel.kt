@@ -429,7 +429,9 @@ internal class EditorViewModel(
 
     private fun publishSession(session: EditorSession) {
         val history = commandHistory
-        previewEngine.load(session)
+        if (!sameAudioContent(_uiState.value.session, session)) {
+            previewEngine.updateSession(session)
+        }
         _uiState.update {
             it.copy(
                 session = session,
@@ -479,6 +481,24 @@ internal class EditorViewModel(
 
     private fun showMessage(message: EditorMessage) {
         _uiState.update { it.copy(message = message) }
+    }
+
+    private fun sameAudioContent(left: EditorSession, right: EditorSession): Boolean {
+        if (left.tracks.size != right.tracks.size) return false
+        return left.tracks.zip(right.tracks).all { (leftTrack, rightTrack) ->
+            leftTrack.id == rightTrack.id &&
+                leftTrack.volume == rightTrack.volume &&
+                leftTrack.muted == rightTrack.muted &&
+                leftTrack.clips.size == rightTrack.clips.size &&
+                leftTrack.clips.zip(rightTrack.clips).all { (leftClip, rightClip) ->
+                    leftClip.id == rightClip.id &&
+                        leftClip.source == rightClip.source &&
+                        leftClip.sourceStartMs == rightClip.sourceStartMs &&
+                        leftClip.sourceEndMs == rightClip.sourceEndMs &&
+                        leftClip.timelineStartMs == rightClip.timelineStartMs &&
+                        leftClip.effects == rightClip.effects
+                }
+        }
     }
 
     private fun TimelineError.toEditorMessage(): EditorMessage = when (this) {

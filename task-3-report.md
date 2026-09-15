@@ -22,3 +22,11 @@ Implemented the shared timeline render contract and rolling AudioTrack preview.
 1. Android playback-head values are platform-driven; device-level underrun behavior still needs the Phase 2 end-to-end gate.
 2. Preview uses a three-second queue target; unusually slow decoders may still underrun before Task 4/export work adds further tuning.
 3. Source decoder reads are URI-backed and intentionally remain uncached until Phase 3 cleanup caches.
+
+## Fix Round 1
+
+- Serialized renderer `render`, `invalidate`, and `close` operations so decoder/effect resources cannot close mid-render.
+- Clamped rendered activity to `AudioClip.timelineEndMs`, flushed completed clip processors at the model boundary, and retained the limiter across render chunks.
+- Added mutation-preserving preview session updates; selection-only changes no longer flush audio, and actual played-frame position survives audio mutations.
+- Preview now waits for queued audio to drain before EOS pause, restarts replay from frame zero, bounds the Android sink buffer to the nominal three-second queue, and converts sink/lifecycle failures into playback state errors with cleanup.
+- Round 1 focused tests and `:app:assembleDebug` pass; commit: `fix: harden editor preview scheduling`.

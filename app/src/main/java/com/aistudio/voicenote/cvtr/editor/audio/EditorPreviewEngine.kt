@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -69,29 +70,16 @@ internal class EditorPreviewEngine(
 
     fun load(newSession: EditorSession) {
         synchronized(lock) {
-            check(!released) { "EditorPreviewEngine is released" }
-            val wasPlaying = _state.value.playing
-            generation.incrementAndGet()
-            renderJob?.cancel()
-            renderJob = null
-            renderer.invalidate()
-            val nextSink = sink ?: sinkFactory.create().also { sink = it }
-            runCatching { nextSink.pause() }
-            runCatching { nextSink.flush() }
-            session = newSession
-            durationFrames = sessionDurationMs(newSession) * EDITOR_SAMPLE_RATE / 1_000L
-            baseFrame = newSession.playheadMs.coerceIn(0L, sessionDurationMs(newSession)) *
-                EDITOR_SAMPLE_RATE / 1_000L
-            renderCursorFrame = baseFrame
-            _state.value = EditorPlaybackState(
-                playing = wasPlaying,
-                positionMs = framesToMs(baseFrame),
-                durationMs = framesToMs(durationFrames),
-            )
-            if (wasPlaying) {
-                nextSink.play()
-                renderJob = scope.launch { renderLoop(generation.get()) }
-            }
+            if (released) return
+            installSessionLocked(newSession, preservePosition = false)
+        }
+    }
+
+    /** Replaces timeline audio while retaining the actual sink frame rather than a millisecond round-trip. */
+    fun updateSession(newSession: EditorSession) {
+        synchronized(lock) {
+            if (released) return
+            installSessionLocked(newSession, preservePosition = true)
         }
     }
 
@@ -99,8 +87,18 @@ internal class EditorPreviewEngine(
         synchronized(lock) {
             if (released || session == null || _state.value.playing) return
             if (durationFrames == 0L) return
-            val nextSink = sink ?: sinkFactory.create().also { sink = it }
-            nextSink.play()
+            val nextSink = createSinkLocked() ?: return
+            if (renderCursorFrame >= durationFrames) {
+                generation.incrementAndGet()
+                renderJob?.cancel()
+                renderJob = null
+                safePauseLocked()
+                safeFlushLocked()
+                safeInvalidateLocked()
+                baseFrame = 0L
+                renderCursorFrame = 0L
+            }
+            if (!safePlayLocked(nextSink)) return
             _state.value = _state.value.copy(playing = true, error = null)
             renderJob?.cancel()
             renderJob = scope.launch { renderLoop(generation.get()) }
@@ -112,7 +110,7 @@ internal class EditorPreviewEngine(
             if (released) return
             updatePositionFromSink()
             _state.value = _state.value.copy(playing = false)
-            runCatching { sink?.pause() }
+            safePauseLocked()
             renderJob?.cancel()
             renderJob = null
         }
@@ -125,9 +123,9 @@ internal class EditorPreviewEngine(
             generation.incrementAndGet()
             renderJob?.cancel()
             renderJob = null
-            runCatching { sink?.pause() }
-            runCatching { sink?.flush() }
-            renderer.invalidate()
+            safePauseLocked()
+            safeFlushLocked()
+            safeInvalidateLocked()
             val targetMs = positionMs.coerceIn(0L, framesToMs(durationFrames))
             baseFrame = targetMs * EDITOR_SAMPLE_RATE / 1_000L
             renderCursorFrame = baseFrame
@@ -137,7 +135,8 @@ internal class EditorPreviewEngine(
                 error = null,
             )
             if (wasPlaying) {
-                sink?.play()
+                val nextSink = sink ?: createSinkLocked()
+                if (nextSink == null || !safePlayLocked(nextSink)) return
                 renderJob = scope.launch { renderLoop(generation.get()) }
             }
         }
@@ -153,12 +152,13 @@ internal class EditorPreviewEngine(
             renderJob = null
             updatePositionFromSink()
             baseFrame = _state.value.positionMs * EDITOR_SAMPLE_RATE / 1_000L
-            runCatching { sink?.pause() }
-            runCatching { sink?.flush() }
-            renderer.invalidate(sourceIds)
+            safePauseLocked()
+            safeFlushLocked()
+            safeInvalidateLocked(sourceIds)
             renderCursorFrame = baseFrame
             if (wasPlaying) {
-                sink?.play()
+                val nextSink = sink ?: createSinkLocked()
+                if (nextSink == null || !safePlayLocked(nextSink)) return
                 renderJob = scope.launch { renderLoop(generation.get()) }
             }
         }
@@ -177,6 +177,7 @@ internal class EditorPreviewEngine(
             runCatching { sink?.close() }
             sink = null
             runCatching { renderer.close() }
+            scope.coroutineContext.cancelChildren()
             scope.cancel()
             _state.value = _state.value.copy(playing = false)
         }
@@ -190,10 +191,16 @@ internal class EditorPreviewEngine(
                         return
                     }
                     if (renderCursorFrame >= durationFrames) {
-                        updatePositionFromSink()
-                        _state.value = _state.value.copy(playing = false)
-                        sink?.pause()
-                        return
+                        val currentSink = sink ?: return
+                        val playedThrough = baseFrame + currentSink.playedFrames().coerceAtLeast(0L)
+                        val drained = currentSink.queuedFrames() <= 0L &&
+                            playedThrough >= renderCursorFrame
+                        if (!drained) null else {
+                            updatePositionFromSink()
+                            _state.value = _state.value.copy(playing = false)
+                            currentSink.pause()
+                            return
+                        }
                     }
                     val currentSink = sink ?: return
                     val queued = currentSink.queuedFrames()
@@ -227,16 +234,125 @@ internal class EditorPreviewEngine(
         } catch (error: Throwable) {
             synchronized(lock) {
                 if (localGeneration == generation.get() && !released) {
-                    _state.value = _state.value.copy(playing = false, error = error.message)
+                    failSinkLocked(error)
+                    _state.value = _state.value.copy(
+                        playing = false,
+                        error = error.message ?: error::class.simpleName ?: "Audio preview failed",
+                    )
                 }
             }
         }
     }
 
     private fun updatePositionFromSink() {
-        val playedFrame = sink?.playedFrames()?.coerceAtLeast(0L) ?: 0L
+        val playedFrame = runCatching { sink?.playedFrames()?.coerceAtLeast(0L) ?: 0L }
+            .getOrElse {
+                reportErrorLocked(it)
+                0L
+            }
         val positionFrame = (baseFrame + playedFrame).coerceAtMost(durationFrames)
         _state.value = _state.value.copy(positionMs = framesToMs(positionFrame))
+    }
+
+    private fun installSessionLocked(newSession: EditorSession, preservePosition: Boolean) {
+        val wasPlaying = _state.value.playing
+        val preservedFrame = if (preservePosition) currentPositionFrameLocked() else 0L
+        generation.incrementAndGet()
+        renderJob?.cancel()
+        renderJob = null
+        safePauseLocked()
+        safeFlushLocked()
+        safeInvalidateLocked()
+        session = newSession
+        val durationMs = sessionDurationMs(newSession)
+        durationFrames = durationMs * EDITOR_SAMPLE_RATE / 1_000L
+        baseFrame = if (preservePosition) {
+            preservedFrame.coerceIn(0L, durationFrames)
+        } else {
+            newSession.playheadMs.coerceIn(0L, durationMs) * EDITOR_SAMPLE_RATE / 1_000L
+        }
+        renderCursorFrame = baseFrame
+        val setupError = _state.value.error
+        _state.value = EditorPlaybackState(
+            playing = false,
+            positionMs = framesToMs(baseFrame),
+            durationMs = framesToMs(durationFrames),
+            error = setupError,
+        )
+        if (!wasPlaying) return
+        val nextSink = sink ?: createSinkLocked() ?: return
+        if (!safePlayLocked(nextSink)) return
+        _state.value = _state.value.copy(playing = true)
+        renderJob = scope.launch { renderLoop(generation.get()) }
+    }
+
+    private fun currentPositionFrameLocked(): Long {
+        val playedFrame = runCatching { sink?.playedFrames()?.coerceAtLeast(0L) ?: 0L }
+            .getOrElse {
+                reportErrorLocked(it)
+                0L
+            }
+        return (baseFrame + playedFrame).coerceIn(0L, durationFrames)
+    }
+
+    private fun createSinkLocked(): PreviewAudioSink? {
+        sink?.let { return it }
+        return try {
+            sinkFactory.create().also { sink = it }
+        } catch (error: Throwable) {
+            reportErrorLocked(error)
+            null
+        }
+    }
+
+    private fun safePlayLocked(target: PreviewAudioSink): Boolean = try {
+        target.play()
+        true
+    } catch (error: Throwable) {
+        failSinkLocked(error)
+        false
+    }
+
+    private fun safePauseLocked(): Boolean = sink?.let { target ->
+        try {
+            target.pause()
+            true
+        } catch (error: Throwable) {
+            failSinkLocked(error)
+            false
+        }
+    } ?: true
+
+    private fun safeFlushLocked(): Boolean = sink?.let { target ->
+        try {
+            target.flush()
+            true
+        } catch (error: Throwable) {
+            failSinkLocked(error)
+            false
+        }
+    } ?: true
+
+    private fun safeInvalidateLocked(sourceIds: Set<String> = emptySet()) {
+        try {
+            renderer.invalidate(sourceIds)
+        } catch (error: Throwable) {
+            reportErrorLocked(error)
+        }
+    }
+
+    private fun failSinkLocked(error: Throwable) {
+        runCatching { sink?.stop() }
+        runCatching { sink?.close() }
+        sink = null
+        reportErrorLocked(error)
+    }
+
+    private fun reportErrorLocked(error: Throwable) {
+        _state.value = _state.value.copy(
+            playing = false,
+            error = error.message ?: error::class.simpleName ?: "Audio preview failed",
+        )
     }
 
     private fun framesToMs(frames: Long): Long = frames * 1_000L / EDITOR_SAMPLE_RATE
@@ -257,7 +373,7 @@ internal class EditorPreviewEngine(
 
 /** Android sink kept behind the small [PreviewAudioSink] contract. */
 private class AndroidPreviewAudioSink : PreviewAudioSink {
-    private val track: AudioTrack
+    private var track: AudioTrack? = null
     private var acceptedFrames = 0L
     private var closed = false
 
@@ -269,48 +385,55 @@ private class AndroidPreviewAudioSink : PreviewAudioSink {
         )
         require(minBuffer > 0) { "AudioTrack returned an invalid minimum buffer size: $minBuffer" }
         val bufferSize = max(minBuffer, RENDER_BUFFER_BYTES)
-        track = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setSampleRate(EDITOR_SAMPLE_RATE)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build()
-            )
-            .setBufferSizeInBytes(bufferSize)
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
-        check(track.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack failed to initialize" }
+        try {
+            val created = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(EDITOR_SAMPLE_RATE)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(bufferSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+            track = created
+            check(created.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack failed to initialize" }
+        } catch (error: Throwable) {
+            runCatching { track?.release() }
+            track = null
+            throw error
+        }
     }
 
-    override fun play() = track.play()
+    override fun play() = checkNotNull(track).play()
 
-    override fun pause() = track.pause()
+    override fun pause() = checkNotNull(track).pause()
 
     override fun stop() {
-        if (!closed) runCatching { track.stop() }
+        if (!closed) checkNotNull(track).stop()
     }
 
     override fun flush() {
         if (!closed) {
-            runCatching { track.flush() }
+            checkNotNull(track).flush()
             acceptedFrames = 0L
         }
     }
 
     override fun queuedFrames(): Long = (acceptedFrames - playedFrames()).coerceAtLeast(0L)
 
-    override fun playedFrames(): Long = track.playbackHeadPosition.toLong() and 0xFFFF_FFFFL
+    override fun playedFrames(): Long = checkNotNull(track).playbackHeadPosition.toLong() and 0xFFFF_FFFFL
 
     override fun write(samples: ShortArray, offset: Int, size: Int): Int {
         check(!closed) { "Audio preview sink is closed" }
-        val written = track.write(samples, offset, size, AudioTrack.WRITE_BLOCKING)
+        val written = checkNotNull(track).write(samples, offset, size, AudioTrack.WRITE_BLOCKING)
         if (written < 0) throw IllegalStateException("AudioTrack.write failed: $written")
         acceptedFrames += written.toLong()
         return written
@@ -319,12 +442,12 @@ private class AndroidPreviewAudioSink : PreviewAudioSink {
     override fun close() {
         if (closed) return
         closed = true
-        runCatching { track.stop() }
-        runCatching { track.release() }
+        runCatching { track?.stop() }
+        runCatching { track?.release() }
+        track = null
     }
 
     private companion object {
-        const val RENDER_CHUNK_FRAMES = 960
-        const val RENDER_BUFFER_BYTES = RENDER_CHUNK_FRAMES * 2 * 8
+        const val RENDER_BUFFER_BYTES = EDITOR_SAMPLE_RATE * 3 * 2
     }
 }

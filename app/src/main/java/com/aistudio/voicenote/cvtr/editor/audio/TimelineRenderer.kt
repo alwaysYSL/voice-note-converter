@@ -23,35 +23,38 @@ internal class DefaultTimelineRenderer(
     private val trackMixer: TrackMixer = TrackMixer(),
 ) : TimelineRenderer {
     private val readers = LinkedHashMap<AudioSourceRef, PcmSourceReader>()
+    private val renderLock = Any()
     private var sessionId: String? = null
     private var closed = false
 
     override fun render(session: EditorSession, startFrame: Long, frameCount: Int): ShortArray {
-        check(!closed) { "TimelineRenderer is closed" }
-        require(startFrame >= 0L) { "startFrame must be non-negative" }
-        require(frameCount >= 0) { "frameCount must be non-negative" }
-        if (sessionId != null && sessionId != session.id) invalidate()
-        sessionId = session.id
-        if (frameCount == 0) return ShortArray(0)
+        synchronized(renderLock) {
+            check(!closed) { "TimelineRenderer is closed" }
+            require(startFrame >= 0L) { "startFrame must be non-negative" }
+            require(frameCount >= 0) { "frameCount must be non-negative" }
+            if (sessionId != null && sessionId != session.id) invalidate()
+            sessionId = session.id
+            if (frameCount == 0) return ShortArray(0)
 
-        val output = ShortArray(frameCount)
-        val endFrame = startFrame + frameCount.toLong()
-        val limiter = MasterLimiter()
-        var chunkStart = startFrame
-        var outputOffset = 0
-        // The smallest task-2 source read can be doubled by a 2x speed clip. 960 keeps every
-        // source read within PcmSourceReader's 1,920-frame bound while remaining efficient.
-        while (chunkStart < endFrame) {
-            val chunkFrames = minOf(RENDER_CHUNK_FRAMES.toLong(), endFrame - chunkStart).toInt()
-            val chunkEnd = chunkStart + chunkFrames
-            val trackChunks = buildTrackChunks(session, chunkStart, chunkEnd)
-            val mixed = trackMixer.mix(trackChunks, chunkFrames)
-            val pcm = limiter.process(mixed)
-            pcm.copyInto(output, outputOffset)
-            chunkStart = chunkEnd
-            outputOffset += chunkFrames
+            val output = ShortArray(frameCount)
+            val endFrame = startFrame + frameCount.toLong()
+            val limiter = MasterLimiter()
+            var chunkStart = startFrame
+            var outputOffset = 0
+            // The smallest task-2 source read can be doubled by a 2x speed clip. 960 keeps every
+            // source read within PcmSourceReader's 1,920-frame bound while remaining efficient.
+            while (chunkStart < endFrame) {
+                val chunkFrames = minOf(RENDER_CHUNK_FRAMES.toLong(), endFrame - chunkStart).toInt()
+                val chunkEnd = chunkStart + chunkFrames
+                val trackChunks = buildTrackChunks(session, chunkStart, chunkEnd)
+                val mixed = trackMixer.mix(trackChunks, chunkFrames)
+                val pcm = limiter.process(mixed)
+                pcm.copyInto(output, outputOffset)
+                chunkStart = chunkEnd
+                outputOffset += chunkFrames
+            }
+            return output
         }
-        return output
     }
 
     private fun buildTrackChunks(
@@ -64,10 +67,24 @@ internal class DefaultTimelineRenderer(
             for (clip in track.clips) {
                 val mapper = mapperFor(clip)
                 val activeRange = mapper.activeOutputRange
-                if (activeRange.isEmpty()) continue
-                val activeStart = maxOf(chunkStart, activeRange.first)
-                val activeEnd = minOf(chunkEnd, activeRange.last + 1L)
-                if (activeStart >= activeEnd) continue
+                val modelStart = clip.timelineStartMs * EDITOR_SAMPLE_RATE / 1_000L
+                val modelEnd = clip.timelineEndMs * EDITOR_SAMPLE_RATE / 1_000L
+                val activeStart = if (activeRange.isEmpty()) 0L else maxOf(
+                    chunkStart,
+                    modelStart,
+                    activeRange.first,
+                )
+                val activeEnd = if (activeRange.isEmpty()) 0L else minOf(
+                    chunkEnd,
+                    modelEnd,
+                    activeRange.last + 1L,
+                )
+                if (activeStart >= activeEnd) {
+                    if (chunkEnd >= modelEnd) {
+                        clipProcessor.flush(clip, modelEnd, outputFrameCount = 0)
+                    }
+                    continue
+                }
 
                 val outputFrames = (activeEnd - activeStart).toInt()
                 val sourceFrame = mapper.sourceFrameForTimelineFrame(activeStart)
@@ -93,6 +110,11 @@ internal class DefaultTimelineRenderer(
                 val chunkSamples = FloatArray((chunkEnd - chunkStart).toInt())
                 processed.copyInto(chunkSamples, (activeStart - chunkStart).toInt())
                 chunks += TrackChunk(chunkSamples, track.volume, track.muted)
+                if (chunkEnd >= modelEnd) {
+                    // The model boundary is authoritative. Flush only to release any state;
+                    // native latency beyond the clip is intentionally trimmed from the timeline.
+                    clipProcessor.flush(clip, modelEnd, outputFrameCount = 0)
+                }
             }
         }
         return chunks
@@ -119,25 +141,29 @@ internal class DefaultTimelineRenderer(
     }
 
     override fun invalidate(sourceIds: Set<String>) {
-        if (closed) return
-        clipProcessor.close()
-        if (sourceIds.isEmpty()) {
-            readers.values.forEach { runCatching { it.close() } }
-            readers.clear()
-        } else {
-            val removed = readers.keys.filter { it.uri in sourceIds }
-            removed.forEach { source ->
-                readers.remove(source)?.let { runCatching { it.close() } }
+        synchronized(renderLock) {
+            if (closed) return
+            clipProcessor.close()
+            if (sourceIds.isEmpty()) {
+                readers.values.forEach { runCatching { it.close() } }
+                readers.clear()
+            } else {
+                val removed = readers.keys.filter { it.uri in sourceIds }
+                removed.forEach { source ->
+                    readers.remove(source)?.let { runCatching { it.close() } }
+                }
             }
         }
     }
 
     override fun close() {
-        if (closed) return
-        closed = true
-        clipProcessor.close()
-        readers.values.forEach { runCatching { it.close() } }
-        readers.clear()
+        synchronized(renderLock) {
+            if (closed) return
+            closed = true
+            clipProcessor.close()
+            readers.values.forEach { runCatching { it.close() } }
+            readers.clear()
+        }
     }
 
     private companion object {

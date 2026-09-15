@@ -52,6 +52,38 @@ class TimelineRendererTest {
         assertTrue(pcm.take(960).all { it.toInt() == 12_000 })
         assertTrue(pcm.drop(960).all { it.toInt() == 0 })
         renderer.close()
+
+        val fractionalClip = AudioClip(
+            id = "fractional-clip",
+            source = AudioSourceRef("fractional", durationMs = 100L),
+            sourceStartMs = 0L,
+            sourceEndMs = 100L,
+            timelineStartMs = 0L,
+            effects = com.aistudio.voicenote.cvtr.editor.model.ClipEffects(speed = 1.3f),
+        )
+        val fractionalRenderer = DefaultTimelineRenderer(
+            sourceFactory = factory,
+            clipProcessor = ClipProcessor(ClipEffectProcessorFactory { _, _ ->
+                object : ClipEffectProcessor {
+                    override fun process(input: ShortArray, outputFrames: Int): ShortArray =
+                        ShortArray(outputFrames) { input.getOrElse(it) { 0 } }
+
+                    override fun close() = Unit
+                }
+            }),
+        )
+        val fractional = fractionalRenderer.render(
+            EditorSession(
+                id = "fractional-session",
+                tracks = listOf(EditorTrack("fractional-track", "Fractional", clips = listOf(fractionalClip))),
+            ),
+            startFrame = 0L,
+            frameCount = 4_000,
+        )
+        val modelFrames = fractionalClip.timelineEndMs * EDITOR_SAMPLE_RATE / 1_000L
+        assertTrue(fractional.take(modelFrames.toInt()).any { it.toInt() != 0 })
+        assertTrue(fractional.drop(modelFrames.toInt()).all { it.toInt() == 0 })
+        fractionalRenderer.close()
     }
 
     private fun clip(id: String, source: String, timelineStartMs: Long): AudioClip = AudioClip(
