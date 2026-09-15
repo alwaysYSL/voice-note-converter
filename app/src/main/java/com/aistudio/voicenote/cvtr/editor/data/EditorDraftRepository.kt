@@ -57,12 +57,16 @@ internal class EditorDraftRepository(
     }
 
     suspend fun save(session: EditorSession, name: String = session.id): String =
+        saveResult(session, name).session.draftId
+            ?: error("Committed draft has no durable id")
+
+    suspend fun saveResult(session: EditorSession, name: String = session.id): EditorDraftLoad =
         withDraftLock(session.draftId ?: session.id) {
             ensureReconciled()
             saveLocked(session, name)
         }
 
-    private suspend fun saveLocked(session: EditorSession, name: String): String {
+    private suspend fun saveLocked(session: EditorSession, name: String): EditorDraftLoad {
         require(session.id.isNotBlank()) { "Draft id must not be blank" }
         val draftId = session.draftId ?: session.id
         val old = dao.loadSnapshot(draftId)
@@ -137,6 +141,9 @@ internal class EditorDraftRepository(
                         pitchSemitones = clip.effects.pitchSemitones,
                         speed = clip.effects.speed,
                         processedCacheKey = clip.effects.processedCacheKey,
+                        cleanupStrength = clip.effects.cleanupStrength,
+                        cleanupNormalized = clip.effects.cleanupNormalized,
+                        cleanupAlgorithmVersion = clip.effects.cleanupAlgorithmVersion,
                         sortOrder = index,
                     )
                 }
@@ -186,7 +193,8 @@ internal class EditorDraftRepository(
                 runCatching { sourceStorage.deleteVersion(draftId, previousVersion) }
                     .onFailure { reconciled = false }
             }
-            draftId
+            loadResultLocked(draftId)
+                ?: error("Committed draft could not be loaded")
         }
     }
 
@@ -312,6 +320,9 @@ internal class EditorDraftRepository(
             pitchSemitones = entity.pitchSemitones,
             speed = entity.speed,
             processedCacheKey = entity.processedCacheKey,
+            cleanupStrength = entity.cleanupStrength,
+            cleanupNormalized = entity.cleanupNormalized,
+            cleanupAlgorithmVersion = entity.cleanupAlgorithmVersion,
         ),
     )
 

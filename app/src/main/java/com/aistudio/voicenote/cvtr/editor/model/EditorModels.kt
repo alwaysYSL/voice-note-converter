@@ -19,6 +19,9 @@ internal class ClipEffects(
     pitchSemitones: Float = 0f,
     speed: Float = 1f,
     val processedCacheKey: String? = null,
+    val cleanupStrength: String? = null,
+    val cleanupNormalized: Boolean = false,
+    val cleanupAlgorithmVersion: String? = null,
 ) {
     init {
         require(gain.isFinite()) { "gain must be finite" }
@@ -45,7 +48,20 @@ internal class ClipEffects(
         pitchSemitones: Float = this.pitchSemitones,
         speed: Float = this.speed,
         processedCacheKey: String? = this.processedCacheKey,
-    ): ClipEffects = ClipEffects(fadeInMs, fadeOutMs, gain, pitchSemitones, speed, processedCacheKey)
+        cleanupStrength: String? = this.cleanupStrength,
+        cleanupNormalized: Boolean = this.cleanupNormalized,
+        cleanupAlgorithmVersion: String? = this.cleanupAlgorithmVersion,
+    ): ClipEffects = ClipEffects(
+        fadeInMs,
+        fadeOutMs,
+        gain,
+        pitchSemitones,
+        speed,
+        processedCacheKey,
+        cleanupStrength,
+        cleanupNormalized,
+        cleanupAlgorithmVersion,
+    )
 
     operator fun component1(): Long = fadeInMs
     operator fun component2(): Long = fadeOutMs
@@ -53,6 +69,9 @@ internal class ClipEffects(
     operator fun component4(): Float = pitchSemitones
     operator fun component5(): Float = speed
     operator fun component6(): String? = processedCacheKey
+    operator fun component7(): String? = cleanupStrength
+    operator fun component8(): Boolean = cleanupNormalized
+    operator fun component9(): String? = cleanupAlgorithmVersion
 
     override fun equals(other: Any?): Boolean = other is ClipEffects &&
         fadeInMs == other.fadeInMs &&
@@ -60,7 +79,10 @@ internal class ClipEffects(
         gain == other.gain &&
         pitchSemitones == other.pitchSemitones &&
         speed == other.speed &&
-        processedCacheKey == other.processedCacheKey
+        processedCacheKey == other.processedCacheKey &&
+        cleanupStrength == other.cleanupStrength &&
+        cleanupNormalized == other.cleanupNormalized &&
+        cleanupAlgorithmVersion == other.cleanupAlgorithmVersion
 
     override fun hashCode(): Int {
         var result = fadeInMs.hashCode()
@@ -69,12 +91,17 @@ internal class ClipEffects(
         result = 31 * result + pitchSemitones.hashCode()
         result = 31 * result + speed.hashCode()
         result = 31 * result + (processedCacheKey?.hashCode() ?: 0)
+        result = 31 * result + (cleanupStrength?.hashCode() ?: 0)
+        result = 31 * result + cleanupNormalized.hashCode()
+        result = 31 * result + (cleanupAlgorithmVersion?.hashCode() ?: 0)
         return result
     }
 
     override fun toString(): String =
         "ClipEffects(fadeInMs=$fadeInMs, fadeOutMs=$fadeOutMs, gain=$gain, " +
-            "pitchSemitones=$pitchSemitones, speed=$speed, processedCacheKey=$processedCacheKey)"
+            "pitchSemitones=$pitchSemitones, speed=$speed, processedCacheKey=$processedCacheKey, " +
+            "cleanupStrength=$cleanupStrength, cleanupNormalized=$cleanupNormalized, " +
+            "cleanupAlgorithmVersion=$cleanupAlgorithmVersion)"
 
     companion object {
         const val MAX_FADE_MS = 5_000L
@@ -86,6 +113,19 @@ internal class ClipEffects(
     val normalizedSpeed: Float
         get() = speed
 }
+
+internal data class CleanupEffectConfig(
+    val strength: String,
+    val normalized: Boolean,
+    val algorithmVersion: String,
+)
+
+internal fun ClipEffects.clearCleanup(): ClipEffects = copy(
+    processedCacheKey = null,
+    cleanupStrength = null,
+    cleanupNormalized = false,
+    cleanupAlgorithmVersion = null,
+)
 
 internal fun ClipEffects.clampedForDuration(durationMs: Long): ClipEffects {
     val halfDuration = durationMs.coerceAtLeast(0L) / 2L

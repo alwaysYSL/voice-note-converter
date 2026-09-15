@@ -16,6 +16,18 @@
 - `:app:assembleDebug` — BUILD SUCCESSFUL for arm64-v8a, armeabi-v7a, and x86_64.
 - `git diff --check` — clean.
 
+## Final review Fix Round 1
+
+- Export preset changes now go through command history, participate in dirty-baseline comparisons, and initialize the export UI from the loaded/undone/redone session. Save now publishes the repository's committed normalized session with private source paths and intentionally rebases history at that boundary.
+- Cleanup effects persist strength, normalized mode, and algorithm version in draft rows and render manifests. Missing or corrupt cache output is surfaced as `Efek perlu diterapkan ulang`, blocks export, and can be explicitly rebuilt from the persisted configuration.
+- Added focused regressions for 64 kbps save/reopen, private-source promotion after external deletion, cache recovery/reapply, and the v6 draft cleanup columns.
+
+Verification:
+
+- `EditorFinalReviewStateTest` — **3 tests, 0 failures**.
+- Focused draft/ViewModel/command/manifest/export/UI/migration suite — **65 tests, 0 failures**.
+- `:app:assembleDebug` — BUILD SUCCESSFUL for arm64-v8a, armeabi-v7a, and x86_64.
+
 ## Risks (max 5)
 
 1. Valid export manifests are conservatively retained until a later maintenance pass; malformed/temporary orphan manifests and unowned aged partials are removed.

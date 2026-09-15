@@ -127,6 +127,24 @@ internal fun EditorScreen(
                     }
                 }
             }
+            if (state.effectRecoveryClipIds.isNotEmpty()) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+                    Text(
+                        "Efek perlu diterapkan ulang",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.testTag("editor_effect_recovery"),
+                    )
+                    state.effectRecoveryClipIds.forEach { clipId ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Clip $clipId", modifier = Modifier.weight(1f))
+                            Button(onClick = { onIntent(EditorIntent.ReapplyCleanup(clipId)) }) {
+                                Text("Terapkan ulang")
+                            }
+                        }
+                    }
+                }
+            }
             state.activeSheet?.let { sheet ->
                 selectedClip?.let { clip ->
                     EditorToolSheet(
@@ -146,7 +164,7 @@ internal fun EditorScreen(
                     .testTag("editor_timeline"),
             )
             if (state.export.sheetOpen) {
-                EditorExportSheet(state.export, onIntent)
+                EditorExportSheet(state.export, state.effectRecoveryClipIds.isEmpty(), onIntent)
             }
             state.message?.let { message ->
                 Text(
@@ -208,6 +226,7 @@ internal fun EditorScreen(
 @Composable
 private fun EditorExportSheet(
     state: EditorExportUiState,
+    effectsReady: Boolean,
     onIntent: (EditorIntent) -> Unit,
 ) {
     ModalBottomSheet(onDismissRequest = { onIntent(EditorIntent.ShowExportSheet(false)) }) {
@@ -269,7 +288,7 @@ private fun EditorExportSheet(
                 EditorExportStatus.IDLE -> {
                     Button(
                         onClick = { onIntent(EditorIntent.StartExport) },
-                        enabled = state.outputName.isNotBlank(),
+                        enabled = state.outputName.isNotBlank() && effectsReady,
                         modifier = Modifier.fillMaxWidth().testTag("editor_export_start"),
                     ) { Text("Export") }
                 }

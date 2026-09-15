@@ -321,6 +321,9 @@ internal data class EditorRenderManifest(
             put("pitchSemitones", effects.pitchSemitones.toDouble())
             put("speed", effects.speed.toDouble())
             put("processedCacheKey", effects.processedCacheKey ?: JSONObject.NULL)
+            put("cleanupStrength", effects.cleanupStrength ?: JSONObject.NULL)
+            put("cleanupNormalized", effects.cleanupNormalized)
+            put("cleanupAlgorithmVersion", effects.cleanupAlgorithmVersion ?: JSONObject.NULL)
         }
 
         private fun JSONObject.toClip(): AudioClip = AudioClip(
@@ -339,6 +342,9 @@ internal data class EditorRenderManifest(
                 pitchSemitones = optDouble("pitchSemitones", 0.0).toFloat(),
                 speed = optDouble("speed", 1.0).toFloat(),
                 processedCacheKey = optionalString("processedCacheKey"),
+                cleanupStrength = optionalString("cleanupStrength"),
+                cleanupNormalized = optBoolean("cleanupNormalized", false),
+                cleanupAlgorithmVersion = optionalString("cleanupAlgorithmVersion"),
             ),
         )
     }

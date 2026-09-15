@@ -47,13 +47,13 @@ internal object TimelineOperations {
             id = firstId,
             sourceEndMs = sourceSplit,
             // The cached PCM was rendered for the unsplit range and cannot be reused safely.
-            effects = clip.effects.copy(fadeOutMs = 0L, processedCacheKey = null),
+            effects = clip.effects.copy(fadeOutMs = 0L).clearCleanup(),
         )
         val second = clip.copy(
             id = secondId,
             sourceStartMs = sourceSplit,
             timelineStartMs = splitTimelineMs,
-            effects = clip.effects.copy(fadeInMs = 0L, processedCacheKey = null),
+            effects = clip.effects.copy(fadeInMs = 0L).clearCleanup(),
         )
 
         val tracks = session.tracks.toMutableList()
@@ -76,7 +76,7 @@ internal object TimelineOperations {
             sourceStartMs = sourceStartMs,
             sourceEndMs = sourceEndMs,
             // A source-range mutation changes the cache identity even when the URI is unchanged.
-            effects = location.clip.effects.copy(processedCacheKey = null),
+            effects = location.clip.effects.clearCleanup(),
         )
         sourceRangeError(candidate)?.let { return TimelineResult.Rejected(it) }
         return commit(session.replaceClip(location, candidate))
@@ -95,7 +95,7 @@ internal object TimelineOperations {
             source = source,
             sourceStartMs = sourceStartMs,
             sourceEndMs = sourceEndMs,
-            effects = location.clip.effects.copy(processedCacheKey = null),
+            effects = location.clip.effects.clearCleanup(),
         )
         sourceRangeError(candidate)?.let { return TimelineResult.Rejected(it) }
         return commit(session.replaceClip(location, candidate))
@@ -188,15 +188,27 @@ internal object TimelineOperations {
     }
 
     /** Applies multiple verified cache outputs in one history entry. */
-    fun applyProcessedSources(session: EditorSession, processedCacheKeys: Map<String, String>): TimelineResult {
+    fun applyProcessedSources(
+        session: EditorSession,
+        processedCacheKeys: Map<String, String>,
+        cleanupConfigs: Map<String, CleanupEffectConfig> = emptyMap(),
+    ): TimelineResult {
         if (processedCacheKeys.isEmpty()) return TimelineResult.Rejected(TimelineError.MISSING_ID)
         var candidate = session
         for ((clipId, cacheKey) in processedCacheKeys) {
             val location = candidate.findClip(clipId) ?: return TimelineResult.Rejected(TimelineError.MISSING_ID)
             if (cacheKey.isBlank()) return TimelineResult.Rejected(TimelineError.INVALID_SOURCE_RANGE)
+            val config = cleanupConfigs[clipId]
             candidate = candidate.replaceClip(
                 location,
-                location.clip.copy(effects = location.clip.effects.copy(processedCacheKey = cacheKey)),
+                location.clip.copy(
+                    effects = location.clip.effects.copy(
+                        processedCacheKey = cacheKey,
+                        cleanupStrength = config?.strength ?: location.clip.effects.cleanupStrength,
+                        cleanupNormalized = config?.normalized ?: location.clip.effects.cleanupNormalized,
+                        cleanupAlgorithmVersion = config?.algorithmVersion ?: location.clip.effects.cleanupAlgorithmVersion,
+                    )
+                ),
             )
         }
         return commit(candidate)

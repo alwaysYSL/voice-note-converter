@@ -316,7 +316,7 @@
       },
       {
         "tableName": "editor_draft_clips",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`draftId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `clipId` TEXT NOT NULL, `sourcePath` TEXT NOT NULL, `originalSourceUri` TEXT NOT NULL, `sourceFileName` TEXT NOT NULL, `sourceDurationMs` INTEGER NOT NULL, `sourceStartMs` INTEGER NOT NULL, `sourceEndMs` INTEGER NOT NULL, `timelineStartMs` INTEGER NOT NULL, `fadeInMs` INTEGER NOT NULL, `fadeOutMs` INTEGER NOT NULL, `gain` REAL NOT NULL, `pitchSemitones` REAL NOT NULL, `speed` REAL NOT NULL, `processedCacheKey` TEXT, `sortOrder` INTEGER NOT NULL, PRIMARY KEY(`draftId`, `clipId`), FOREIGN KEY(`draftId`) REFERENCES `editor_drafts`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`draftId`, `trackId`) REFERENCES `editor_draft_tracks`(`draftId`, `trackId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`draftId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `clipId` TEXT NOT NULL, `sourcePath` TEXT NOT NULL, `originalSourceUri` TEXT NOT NULL, `sourceFileName` TEXT NOT NULL, `sourceDurationMs` INTEGER NOT NULL, `sourceStartMs` INTEGER NOT NULL, `sourceEndMs` INTEGER NOT NULL, `timelineStartMs` INTEGER NOT NULL, `fadeInMs` INTEGER NOT NULL, `fadeOutMs` INTEGER NOT NULL, `gain` REAL NOT NULL, `pitchSemitones` REAL NOT NULL, `speed` REAL NOT NULL, `processedCacheKey` TEXT, `cleanupStrength` TEXT, `cleanupNormalized` INTEGER NOT NULL, `cleanupAlgorithmVersion` TEXT, `sortOrder` INTEGER NOT NULL, PRIMARY KEY(`draftId`, `clipId`), FOREIGN KEY(`draftId`) REFERENCES `editor_drafts`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`draftId`, `trackId`) REFERENCES `editor_draft_tracks`(`draftId`, `trackId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
         "fields": [
           {
             "fieldPath": "draftId",
@@ -411,6 +411,22 @@
           {
             "fieldPath": "processedCacheKey",
             "columnName": "processedCacheKey",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "cleanupStrength",
+            "columnName": "cleanupStrength",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "cleanupNormalized",
+            "columnName": "cleanupNormalized",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cleanupAlgorithmVersion",
+            "columnName": "cleanupAlgorithmVersion",
             "affinity": "TEXT"
           },
           {

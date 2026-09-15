@@ -182,6 +182,13 @@ class AppDatabaseMigrationTest {
             assertEquals(true, tables.contains("editor_drafts"))
             assertEquals(true, tables.contains("editor_draft_tracks"))
             assertEquals(true, tables.contains("editor_draft_clips"))
+            val clipColumns = mutableSetOf<String>()
+            migrated.openHelper.writableDatabase.query("PRAGMA table_info(editor_draft_clips)").use { cursor ->
+                while (cursor.moveToNext()) clipColumns += cursor.getString(1)
+            }
+            assertEquals(true, clipColumns.contains("cleanupStrength"))
+            assertEquals(true, clipColumns.contains("cleanupNormalized"))
+            assertEquals(true, clipColumns.contains("cleanupAlgorithmVersion"))
         } finally {
             migrated.close()
         }

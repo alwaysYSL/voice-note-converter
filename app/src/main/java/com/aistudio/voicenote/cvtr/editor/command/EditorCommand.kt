@@ -2,6 +2,8 @@ package com.aistudio.voicenote.cvtr.editor.command
 
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
 import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
+import com.aistudio.voicenote.cvtr.editor.model.CleanupEffectConfig
+import com.aistudio.voicenote.cvtr.editor.model.ExportPreset
 import com.aistudio.voicenote.cvtr.editor.model.TimelineError
 import com.aistudio.voicenote.cvtr.editor.model.TimelineOperations
 import com.aistudio.voicenote.cvtr.editor.model.TimelineResult
@@ -116,6 +118,13 @@ internal data class SetClipSpeedCommand(
         TimelineOperations.setClipSpeed(session, clipId, speed)
 }
 
+internal data class SetExportPresetCommand(
+    val preset: ExportPreset,
+) : EditorCommand {
+    override fun applyTo(session: EditorSession): TimelineResult =
+        TimelineOperations.validate(session.copy(exportPreset = preset, dirty = true))
+}
+
 internal data class SetTrackVolumeCommand(
     val trackId: String,
     val volume: Float,
@@ -166,7 +175,8 @@ internal data class ApplyProcessedSourceCommand(
 /** Applies a completed cleanup batch as one undoable mutation. */
 internal data class ApplyProcessedSourcesCommand(
     val processedCacheKeys: Map<String, String>,
+    val cleanupConfigs: Map<String, CleanupEffectConfig> = emptyMap(),
 ) : EditorCommand {
     override fun applyTo(session: EditorSession): TimelineResult =
-        TimelineOperations.applyProcessedSources(session, processedCacheKeys)
+        TimelineOperations.applyProcessedSources(session, processedCacheKeys, cleanupConfigs)
 }

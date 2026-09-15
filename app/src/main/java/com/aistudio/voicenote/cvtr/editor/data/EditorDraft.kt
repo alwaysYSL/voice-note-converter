@@ -80,6 +80,9 @@ data class EditorDraftClipEntity(
     val pitchSemitones: Float,
     val speed: Float,
     val processedCacheKey: String?,
+    val cleanupStrength: String? = null,
+    val cleanupNormalized: Boolean = false,
+    val cleanupAlgorithmVersion: String? = null,
     val sortOrder: Int,
 )
 

@@ -26,6 +26,7 @@ import com.aistudio.voicenote.cvtr.editor.command.ReplaceClipSourceCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetClipFadeCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetClipPitchCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetClipSpeedCommand
+import com.aistudio.voicenote.cvtr.editor.command.SetExportPresetCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetTrackMutedCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetTrackVolumeCommand
 import com.aistudio.voicenote.cvtr.editor.command.SplitClipCommand
@@ -44,6 +45,7 @@ import com.aistudio.voicenote.cvtr.editor.work.StableSourceFingerprint
 import com.aistudio.voicenote.cvtr.editor.work.estimateRequiredBytes
 import com.aistudio.voicenote.cvtr.editor.model.AudioClip
 import com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef
+import com.aistudio.voicenote.cvtr.editor.model.CleanupEffectConfig
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
 import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
 import com.aistudio.voicenote.cvtr.editor.model.MAX_TIMELINE_MS
@@ -267,6 +269,7 @@ internal sealed interface EditorIntent {
     ) : EditorIntent
     data object CancelCleanup : EditorIntent
     data object RetryCleanup : EditorIntent
+    data class ReapplyCleanup(val clipId: String? = null) : EditorIntent
     data class SaveDraft(val exitAfterSave: Boolean = false) : EditorIntent
     data object RetrySaveDraft : EditorIntent
 }
@@ -286,6 +289,7 @@ internal data class EditorUiState(
     val draft: EditorDraftUiState = EditorDraftUiState(),
     val offlineClipIds: Set<String> = emptySet(),
     val sourceError: String? = null,
+    val effectRecoveryClipIds: Set<String> = emptySet(),
 )
 
 private data class CleanupTarget(
@@ -308,6 +312,7 @@ private data class DraftSourceAvailability(
     val sourceUris: Set<String>,
     val unavailableSourceUris: Set<String>,
     val unavailableClipIds: Set<String>,
+    val effectRecoveryClipIds: Set<String>,
 )
 
 private data class CleanupBatch(
@@ -338,8 +343,8 @@ internal class EditorViewModel(
         sourceStorage = DraftSourceStorage(application),
         processedAudioCache = ProcessedAudioCache(File(application.cacheDir, "processed_audio")),
     ),
-    private val persistDraft: suspend (EditorSession, String) -> String = { session, name ->
-        draftRepository.save(session, name)
+    private val persistDraft: suspend (EditorSession, String) -> EditorDraftLoad = { session, name ->
+        draftRepository.saveResult(session, name)
     },
     private val loadDraft: suspend (String) -> com.aistudio.voicenote.cvtr.editor.data.EditorDraftLoad? = { draftId ->
         draftRepository.loadResult(draftId)
@@ -491,11 +496,8 @@ internal class EditorViewModel(
             is EditorIntent.SetExportName -> _uiState.update {
                 it.copy(export = it.export.copy(outputName = intent.name))
             }
-            is EditorIntent.SetExportPreset -> _uiState.update {
-                it.copy(export = it.export.copy(
-                    preset = intent.preset,
-                    estimatedSizeBytes = estimateExportSize(it.session, intent.preset),
-                ))
+            is EditorIntent.SetExportPreset -> runSerializedMutation {
+                execute(SetExportPresetCommand(intent.preset))
             }
             EditorIntent.StartExport -> startExport()
             EditorIntent.CancelExport -> cancelExport()
@@ -508,6 +510,7 @@ internal class EditorViewModel(
             )
             EditorIntent.CancelCleanup -> cancelCleanup()
             EditorIntent.RetryCleanup -> retryCleanup()
+            is EditorIntent.ReapplyCleanup -> reapplyCleanup(intent.clipId)
             is EditorIntent.SaveDraft -> saveDraft(intent.exitAfterSave)
             EditorIntent.RetrySaveDraft -> saveDraft(_uiState.value.draft.exitAfterSave)
         }
@@ -534,15 +537,20 @@ internal class EditorViewModel(
                 mutationMutex.withLock {
                     val session = _uiState.value.session
                     val draftName = session.tracks.firstOrNull()?.name?.ifBlank { null } ?: "Audio editor"
-                    val id = persistDraft(session, draftName)
-                    val clean = commandHistory?.markClean(id) ?: session.copy(
-                        id = id,
-                        draftId = id,
-                        dirty = false,
+                    val persisted = persistDraft(session, draftName)
+                    // Saving promotes external URIs to private draft sources. Existing history
+                    // snapshots would retain those external references, so intentionally rebase
+                    // history to the committed normalized session at this boundary.
+                    commandHistory = CommandHistory(persisted.session)
+                    val clean = commandHistory!!.markClean(
+                        persisted.session.draftId ?: persisted.session.id,
                     )
+                    val id = clean.draftId ?: clean.id
+                    // Refresh the live preview engine as well as UI state; the renderer must use
+                    // the committed private source paths immediately after promotion.
+                    publishSession(clean)
                     _uiState.update {
                         it.copy(
-                            session = clean,
                             message = null,
                             draft = it.draft.copy(
                                 status = EditorDraftSaveStatus.SUCCEEDED,
@@ -606,15 +614,14 @@ internal class EditorViewModel(
                         changed
                     } else {
                         try {
-                            persistDraft(
+                            val persisted = persistDraft(
                                 changed,
                                 changed.tracks.firstOrNull()?.name ?: "Audio editor",
                             )
-                            commandHistory?.markClean(draftId) ?: changed.copy(
-                                id = draftId,
-                                draftId = draftId,
-                                dirty = false,
-                            )
+                            // Replacement save also normalizes the source URI; rebase history so
+                            // undo cannot resurrect the pre-save external source.
+                            commandHistory = CommandHistory(persisted.session)
+                            commandHistory!!.markClean(persisted.session.draftId ?: draftId)
                         } catch (error: Throwable) {
                             // A cache-lease/database error can happen after Room has committed.
                             // Reload the durable row and publish that truth instead of blindly
@@ -632,6 +639,7 @@ internal class EditorViewModel(
                                         } else {
                                             "Draft source is unavailable or unreadable"
                                         },
+                                        effectRecoveryClipIds = availability.effectRecoveryClipIds,
                                     )
                                 }
                                 publishSession(durable.session)
@@ -831,6 +839,7 @@ internal class EditorViewModel(
                     "Draft source is unavailable or unreadable"
                 },
                 draft = it.draft.copy(draftId = draftId),
+                effectRecoveryClipIds = availability.effectRecoveryClipIds,
             )
         }
         availability.sourceUris
@@ -859,11 +868,42 @@ internal class EditorViewModel(
             .filter { it.source.uri in unavailable }
             .map { it.id }
             .toSet()
+        val effectRecoveryClipIds = loaded.session.tracks.asSequence()
+            .flatMap { it.clips.asSequence() }
+            .filterNot { it.id in unavailableClipIds }
+            .filter { clip -> cleanupCacheNeedsRecovery(clip) }
+            .map { it.id }
+            .toSet()
         return DraftSourceAvailability(
             sourceUris = sourceUris.keys,
             unavailableSourceUris = unavailable,
             unavailableClipIds = unavailableClipIds,
+            effectRecoveryClipIds = effectRecoveryClipIds,
         )
+    }
+
+    private fun cleanupCacheNeedsRecovery(clip: AudioClip): Boolean {
+        val effects = clip.effects
+        val key = effects.processedCacheKey ?: return false
+        val strength = runCatching { CleanupStrength.valueOf(effects.cleanupStrength ?: return true) }
+            .getOrNull() ?: return true
+        val algorithm = effects.cleanupAlgorithmVersion ?: return true
+        val fingerprint = runCatching {
+            StableSourceFingerprint.compute(getApplication(), clip.source.uri, clip.source.uri)
+        }.getOrNull() ?: return true
+        val expectedKey = ProcessedAudioKey(
+            sourceFingerprint = fingerprint,
+            sourceStartMs = clip.sourceStartMs,
+            sourceEndMs = clip.sourceEndMs,
+            cleanup = strength,
+            normalized = effects.cleanupNormalized,
+            algorithmVersion = algorithm,
+        ).toFilename()
+        if (key != expectedKey) return true
+        val expectedFrames = (clip.sourceEndMs - clip.sourceStartMs).coerceAtLeast(0L) * 48L / 1_000L
+        return runCatching {
+            readValidatedCachedWav(File(processedCacheDir(), "$key.pcm"), expectedFrames)
+        }.isFailure
     }
 
     private fun sessionFor(uri: Uri, displayName: String, durationMs: Long): EditorSession {
@@ -901,7 +941,8 @@ internal class EditorViewModel(
                 canRedo = false,
                 export = it.export.copy(
                     outputName = defaultExportName(session),
-                    estimatedSizeBytes = estimateExportSize(session, it.export.preset),
+                    preset = session.exportPreset,
+                    estimatedSizeBytes = estimateExportSize(session, session.exportPreset),
                 ),
                 draft = it.draft.copy(
                     status = EditorDraftSaveStatus.IDLE,
@@ -912,6 +953,7 @@ internal class EditorViewModel(
                 ),
                 offlineClipIds = emptySet(),
                 sourceError = null,
+                effectRecoveryClipIds = emptySet(),
             )
         }
     }
@@ -933,6 +975,17 @@ internal class EditorViewModel(
                     it.copy(export = it.export.copy(
                         status = EditorExportStatus.FAILED,
                         error = "Editor timeline contains no rendered audio",
+                        canRetry = false,
+                        progress = 0f,
+                    ))
+                }
+                return
+            }
+            if (current.effectRecoveryClipIds.isNotEmpty()) {
+                _uiState.update {
+                    it.copy(export = it.export.copy(
+                        status = EditorExportStatus.FAILED,
+                        error = "Efek perlu diterapkan ulang",
                         canRetry = false,
                         progress = 0f,
                     ))
@@ -1229,10 +1282,22 @@ internal class EditorViewModel(
                 return@withLock
             }
             val result = commandHistory?.execute(
-                com.aistudio.voicenote.cvtr.editor.command.ApplyProcessedSourcesCommand(completed)
+                com.aistudio.voicenote.cvtr.editor.command.ApplyProcessedSourcesCommand(
+                    processedCacheKeys = completed,
+                    cleanupConfigs = batch.clips.associate { target ->
+                        target.clipId to CleanupEffectConfig(
+                            strength = batch.preset.name,
+                            normalized = batch.normalize,
+                            algorithmVersion = ProcessedAudioCache.CACHE_ALGORITHM_VERSION,
+                        )
+                    },
+                )
             )
             if (result is TimelineResult.Accepted) {
                 publishSession(result.value)
+                _uiState.update { state ->
+                    state.copy(effectRecoveryClipIds = state.effectRecoveryClipIds - completed.keys)
+                }
                 syncCacheReferences()
                 synchronized(cleanupOwnershipLock) {
                     if (cleanupBatch?.id == batch.id) {
@@ -1293,6 +1358,20 @@ internal class EditorViewModel(
         val state = _uiState.value.cleanup
         if (!state.canRetry) return
         startCleanup(state.targetClipId, state.normalize, state.preset, state.wholeTrack)
+    }
+
+    private fun reapplyCleanup(clipId: String?) {
+        val state = _uiState.value
+        val targetId = clipId ?: state.effectRecoveryClipIds.firstOrNull() ?: return
+        val clip = state.session.findClipForCleanup(targetId) ?: return
+        val strength = runCatching {
+            CleanupStrength.valueOf(clip.effects.cleanupStrength ?: "")
+        }.getOrNull()
+        if (strength == null) {
+            _uiState.update { it.copy(message = EditorMessage.PROCESSED_AUDIO_UNAVAILABLE) }
+            return
+        }
+        startCleanup(targetId, clip.effects.cleanupNormalized, strength, wholeTrack = false)
     }
 
     private fun observeExport(id: UUID) {
@@ -1489,8 +1568,17 @@ internal class EditorViewModel(
             it.copy(
                 session = session,
                 message = null,
+                export = it.export.copy(
+                    preset = session.exportPreset,
+                    estimatedSizeBytes = estimateExportSize(session, session.exportPreset),
+                ),
                 canUndo = history?.canUndo == true,
                 canRedo = history?.canRedo == true,
+                effectRecoveryClipIds = it.effectRecoveryClipIds.filter { clipId ->
+                    session.tracks.any { track ->
+                        track.clips.any { clip -> clip.id == clipId && clip.effects.processedCacheKey != null }
+                    }
+                }.toSet(),
             )
         }
         syncCacheReferences()
