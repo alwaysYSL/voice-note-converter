@@ -12,6 +12,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.runCurrent
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -49,18 +50,26 @@ class EditorPreviewEngineTest {
         )
 
         engine.load(session)
-        engine.play()
-        runCurrent()
-        assertTrue(engine.state.value.playing)
-        assertEquals(20L, engine.state.value.positionMs)
+        try {
+            engine.play()
+            runCurrent()
+            assertTrue(engine.state.value.playing)
+            assertEquals(20L, engine.state.value.positionMs)
 
-        engine.seekTo(120_000L)
-        assertEquals(120_000L, engine.state.value.positionMs)
-        runCurrent()
+            engine.seekTo(120_000L)
+            assertEquals(120_000L, engine.state.value.positionMs)
+            runCurrent()
 
-        assertTrue(renderer.renderStarts.contains(120_000L * EDITOR_SAMPLE_RATE / 1_000L))
-        assertEquals(1, sink.flushCount)
-        engine.release()
+            assertTrue(renderer.renderStarts.contains(120_000L * EDITOR_SAMPLE_RATE / 1_000L))
+            sink.setPlayedFrames(12_345L)
+            engine.invalidateFrom()
+            runCurrent()
+            assertEquals(120_000L * EDITOR_SAMPLE_RATE / 1_000L + 12_345L, renderer.renderStarts.last())
+            assertEquals(2, sink.flushCount)
+        } finally {
+            engine.release()
+            runCurrent()
+        }
     }
 
     @Test
@@ -83,6 +92,28 @@ class EditorPreviewEngineTest {
         assertTrue(sink.markers.none { it == 1 })
         assertTrue(sink.markers.any { it == 2 })
         engine.release()
+
+        val pauseRenderer = BlockingRenderer()
+        val pauseSink = RecordingSink()
+        val pauseEngine = EditorPreviewEngine(
+            renderer = pauseRenderer,
+            sinkFactory = PreviewAudioSinkFactory { pauseSink },
+            renderDispatcher = Dispatchers.Default,
+        )
+        try {
+            pauseEngine.load(sessionWithDuration(200_000L))
+            pauseEngine.play()
+            assertTrue(pauseRenderer.started.await(5, TimeUnit.SECONDS))
+            pauseEngine.pause()
+            pauseEngine.play()
+            pauseRenderer.release.countDown()
+            assertTrue(pauseSink.wrote.await(5, TimeUnit.SECONDS))
+
+            assertTrue(pauseSink.markers.none { it == 1 })
+            assertTrue(pauseSink.markers.any { it == 2 })
+        } finally {
+            pauseEngine.release()
+        }
     }
 
     @Test
@@ -145,13 +176,15 @@ class EditorPreviewEngineTest {
     private class BlockingRenderer : TimelineRenderer {
         val started = CountDownLatch(1)
         val release = CountDownLatch(1)
+        private val firstRender = AtomicBoolean(true)
 
         override fun render(session: EditorSession, startFrame: Long, frameCount: Int): ShortArray {
-            if (startFrame == 0L) {
+            val blocked = firstRender.compareAndSet(true, false)
+            if (blocked) {
                 started.countDown()
                 check(release.await(5, TimeUnit.SECONDS)) { "blocked render was not released" }
             }
-            val marker = if (startFrame == 0L) 1 else 2
+            val marker = if (blocked) 1 else 2
             return ShortArray(frameCount) { marker.toShort() }
         }
 
@@ -175,6 +208,9 @@ class EditorPreviewEngineTest {
 
         override fun queuedFrames(): Long = if (accepted == 0L) 0L else 144_000L
         override fun playedFrames(): Long = played
+        fun setPlayedFrames(value: Long) {
+            played = value
+        }
         override fun write(samples: ShortArray, offset: Int, size: Int): Int {
             accepted += size
             played += size

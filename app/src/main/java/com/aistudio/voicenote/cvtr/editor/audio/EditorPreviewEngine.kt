@@ -108,11 +108,14 @@ internal class EditorPreviewEngine(
     fun pause() {
         synchronized(lock) {
             if (released) return
+            // Invalidate before cancelling/lifecycle calls: a render blocked outside this lock
+            // must fail its generation check when it returns, even across pause -> play.
+            generation.incrementAndGet()
+            renderJob?.cancel()
+            renderJob = null
             updatePositionFromSink()
             _state.value = _state.value.copy(playing = false)
             safePauseLocked()
-            renderJob?.cancel()
-            renderJob = null
         }
     }
 
@@ -147,20 +150,7 @@ internal class EditorPreviewEngine(
         synchronized(lock) {
             if (released) return
             val wasPlaying = _state.value.playing
-            generation.incrementAndGet()
-            renderJob?.cancel()
-            renderJob = null
-            updatePositionFromSink()
-            baseFrame = _state.value.positionMs * EDITOR_SAMPLE_RATE / 1_000L
-            safePauseLocked()
-            safeFlushLocked()
-            safeInvalidateLocked(sourceIds)
-            renderCursorFrame = baseFrame
-            if (wasPlaying) {
-                val nextSink = sink ?: createSinkLocked()
-                if (nextSink == null || !safePlayLocked(nextSink)) return
-                renderJob = scope.launch { renderLoop(generation.get()) }
-            }
+            invalidateFromFrameLocked(currentPositionFrameLocked(), sourceIds, wasPlaying)
         }
     }
 
@@ -293,6 +283,31 @@ internal class EditorPreviewEngine(
                 0L
             }
         return (baseFrame + playedFrame).coerceIn(0L, durationFrames)
+    }
+
+    private fun invalidateFromFrameLocked(
+        preservedFrame: Long,
+        sourceIds: Set<String>,
+        wasPlaying: Boolean,
+    ) {
+        generation.incrementAndGet()
+        renderJob?.cancel()
+        renderJob = null
+        safePauseLocked()
+        safeFlushLocked()
+        safeInvalidateLocked(sourceIds)
+        baseFrame = preservedFrame.coerceIn(0L, durationFrames)
+        renderCursorFrame = baseFrame
+        _state.value = _state.value.copy(
+            playing = false,
+            positionMs = framesToMs(baseFrame),
+            error = null,
+        )
+        if (!wasPlaying) return
+        val nextSink = sink ?: createSinkLocked()
+        if (nextSink == null || !safePlayLocked(nextSink)) return
+        _state.value = _state.value.copy(playing = true, error = null)
+        renderJob = scope.launch { renderLoop(generation.get()) }
     }
 
     private fun createSinkLocked(): PreviewAudioSink? {
