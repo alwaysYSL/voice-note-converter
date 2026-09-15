@@ -20,6 +20,7 @@ import androidx.compose.material.icons.filled.Undo
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -93,6 +94,12 @@ internal fun ContextualEditorToolbar(
             enabled = hasSelection,
             onClick = { onIntent(EditorIntent.ShowSheet(EditorSheet.SPEED)) },
         )
+        EditorToolButton(
+            label = "Cleanup",
+            enabled = hasSelection,
+            onClick = { onIntent(EditorIntent.ShowSheet(EditorSheet.CLEANUP)) },
+            modifier = Modifier.testTag("cleanup_toolbar"),
+        )
         androidx.compose.foundation.layout.Box {
             OutlinedButton(
                 onClick = { deleteMenuExpanded = true },
@@ -130,11 +137,12 @@ private fun EditorToolButton(
     label: String,
     enabled: Boolean,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     OutlinedButton(
         onClick = onClick,
         enabled = enabled,
-        modifier = Modifier.heightIn(min = 48.dp),
+        modifier = modifier.heightIn(min = 48.dp),
     ) {
         Text(label)
     }
@@ -145,6 +153,7 @@ internal fun EditorToolSheet(
     sheet: EditorSheet,
     clip: AudioClip,
     onIntent: (EditorIntent) -> Unit,
+    cleanupState: EditorCleanupUiState = EditorCleanupUiState(),
 ) {
     Surface(
         modifier = Modifier
@@ -168,7 +177,7 @@ internal fun EditorToolSheet(
                         EditorSheet.FADE -> "Fade"
                         EditorSheet.PITCH -> "Pitch"
                         EditorSheet.SPEED -> "Speed"
-                        EditorSheet.CLEANUP -> "Delete mode"
+                        EditorSheet.CLEANUP -> "Cleanup / Normalize"
                     },
                     style = MaterialTheme.typography.titleSmall,
                     color = DeepNavyDisplay,
@@ -232,7 +241,7 @@ internal fun EditorToolSheet(
                 EditorSheet.CLEANUP -> {
                     var normalize by remember { mutableStateOf(false) }
                     var strength by remember { mutableStateOf(com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.OFF) }
-                    var applyToTrack by remember { mutableStateOf(false) } // true for track, false for clip
+                    var applyToTrack by remember { mutableStateOf(false) }
 
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         androidx.compose.material3.Checkbox(
@@ -250,30 +259,56 @@ internal fun EditorToolSheet(
                         Text("Normalize (-1 dBFS)", color = LightSlateCaption)
                     }
 
-                    Text("Noise Reduction: ${strength.name}", color = LightSlateCaption)
-                    Slider(
-                        value = strength.ordinal.toFloat(),
-                        onValueChange = { strength = com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.values()[it.toInt()] },
-                        valueRange = 0f..(com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.values().size - 1).toFloat(),
-                        steps = com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.values().size - 2,
-                        modifier = Modifier.heightIn(min = 48.dp),
-                    )
-
-                    Button(
-                        onClick = {
-                            val targetId = if (applyToTrack) null else clip.id // wait, entire track logic was: targetClipId null means entire track in startCleanup?
-                            // In my startCleanup implementation, if targetClipId is null, it uses session.selectedClipId. That's not applying to entire track!
-                            // Oh wait, my startCleanup just processes one clip. If I need to process an entire track, I should map all clips in track.
-                            onIntent(EditorIntent.StartCleanup(clip.id, normalize, strength))
-                        },
-                        modifier = Modifier.fillMaxWidth()
+                    Text("Noise Reduction: ${cleanupStrengthLabel(strength)}", color = LightSlateCaption)
+                    Row(
+                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        Text("Terapkan")
+                        com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.values().forEach { option ->
+                            FilterChip(
+                                selected = strength == option,
+                                onClick = { strength = option },
+                                label = { Text(cleanupStrengthLabel(option)) },
+                                modifier = Modifier.testTag("cleanup_${option.name.lowercase()}"),
+                            )
+                        }
+                    }
+
+                    when (cleanupState.status) {
+                        EditorCleanupStatus.QUEUED, EditorCleanupStatus.RUNNING -> {
+                            Text("Processing ${(cleanupState.progress * 100f).toInt().coerceIn(0, 100)}%", modifier = Modifier.testTag("cleanup_progress"))
+                            androidx.compose.material3.LinearProgressIndicator(
+                                progress = { cleanupState.progress.coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            Button(onClick = { onIntent(EditorIntent.CancelCleanup) }, modifier = Modifier.fillMaxWidth()) {
+                                Text("Cancel")
+                            }
+                        }
+                        EditorCleanupStatus.FAILED, EditorCleanupStatus.CANCELLED -> {
+                            cleanupState.error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("cleanup_error")) }
+                            Button(onClick = { onIntent(EditorIntent.RetryCleanup) }, modifier = Modifier.fillMaxWidth()) { Text("Retry") }
+                        }
+                        else -> {
+                            Button(
+                                onClick = {
+                                    onIntent(EditorIntent.StartCleanup(clip.id, normalize, strength, applyToTrack))
+                                },
+                                modifier = Modifier.fillMaxWidth().testTag("cleanup_apply"),
+                            ) { Text("Terapkan") }
+                        }
                     }
                 }
             }
         }
     }
+}
+
+private fun cleanupStrengthLabel(strength: com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength): String = when (strength) {
+    com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.OFF -> "OFF"
+    com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.LIGHT -> "Ringan"
+    com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.MEDIUM -> "Sedang"
+    com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength.STRONG -> "Kuat"
 }
 
 @Composable

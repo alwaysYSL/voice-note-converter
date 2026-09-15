@@ -152,6 +152,28 @@ class CommandHistoryTest {
         assertEquals(1.5f, updated.effects.speed)
     }
 
+    @Test
+    fun `trim and split invalidate a processed source key`() {
+        val source = AudioSourceRef("content://source", durationMs = 60_000)
+        val clip = AudioClip(
+            "clip-a",
+            source,
+            0,
+            10_000,
+            0,
+            com.aistudio.voicenote.cvtr.editor.model.ClipEffects(processedCacheKey = "cached"),
+        )
+        val history = CommandHistory(
+            EditorSession("session", listOf(EditorTrack("track-1", "Track 1", clips = listOf(clip))))
+        )
+
+        history.execute(TrimClipCommand("clip-a", 1_000, 9_000))
+        assertEquals(null, history.session.tracks.single().clips.single().effects.processedCacheKey)
+        history.undo()
+        history.execute(SplitClipCommand("clip-a", 4_000))
+        assertTrue(history.session.tracks.single().clips.all { it.effects.processedCacheKey == null })
+    }
+
     private fun initialSession(): EditorSession {
         val source = AudioSourceRef("content://source", durationMs = 60_000)
         val first = AudioClip("clip-a", source, 0, 1_000, 0)

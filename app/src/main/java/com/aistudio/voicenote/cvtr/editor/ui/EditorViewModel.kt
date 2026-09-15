@@ -4,12 +4,12 @@ import android.app.Application
 import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.Observer
 import androidx.lifecycle.viewModelScope
 import androidx.work.OneTimeWorkRequest
 import androidx.work.ExistingWorkPolicy
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
+import androidx.work.getWorkInfoByIdFlow
 import com.aistudio.voicenote.cvtr.audio.VoiceNoteConverter
 import com.aistudio.voicenote.cvtr.audio.WaveformCodec
 import com.aistudio.voicenote.cvtr.data.local.AppDatabase
@@ -32,6 +32,13 @@ import com.aistudio.voicenote.cvtr.editor.audio.EditorPlaybackState
 import com.aistudio.voicenote.cvtr.editor.audio.EditorPreviewEngine
 import com.aistudio.voicenote.cvtr.editor.audio.MediaCodecPcmSourceReaderFactory
 import com.aistudio.voicenote.cvtr.editor.audio.EditorRenderManifest
+import com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength
+import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioKey
+import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioCache
+import com.aistudio.voicenote.cvtr.editor.cache.readValidatedCachedWav
+import com.aistudio.voicenote.cvtr.editor.work.CleanupEffectWork
+import com.aistudio.voicenote.cvtr.editor.work.StableSourceFingerprint
+import com.aistudio.voicenote.cvtr.editor.work.estimateRequiredBytes
 import com.aistudio.voicenote.cvtr.editor.model.AudioClip
 import com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
@@ -57,9 +64,9 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.flowOn
 
 /** Metadata extracted before a source is added to the timeline. */
 internal data class AudioSourceInfo(
@@ -82,6 +89,7 @@ internal enum class EditorMessage {
     TRACK_LIMIT,
     HISTORY_NOT_FOUND,
     IMPORT_FAILED,
+    PROCESSED_AUDIO_UNAVAILABLE,
 }
 
 internal enum class EditorSheet {
@@ -99,6 +107,26 @@ internal enum class EditorExportStatus {
     FAILED,
     CANCELLED,
 }
+
+internal enum class EditorCleanupStatus {
+    IDLE,
+    QUEUED,
+    RUNNING,
+    SUCCEEDED,
+    FAILED,
+    CANCELLED,
+}
+
+internal data class EditorCleanupUiState(
+    val status: EditorCleanupStatus = EditorCleanupStatus.IDLE,
+    val progress: Float = 0f,
+    val error: String? = null,
+    val canRetry: Boolean = false,
+    val targetClipId: String? = null,
+    val wholeTrack: Boolean = false,
+    val normalize: Boolean = false,
+    val preset: CleanupStrength = CleanupStrength.OFF,
+)
 
 internal data class EditorExportUiState(
     val sheetOpen: Boolean = false,
@@ -131,9 +159,16 @@ internal interface EditorExportScheduler {
     fun observe(id: UUID): Flow<WorkInfo?>
 }
 
+/** Small WorkManager seam used by cleanup tests and by the all-or-nothing track workflow. */
+internal interface EditorCleanupScheduler {
+    fun enqueueUnique(uniqueName: String, request: OneTimeWorkRequest, replaceExisting: Boolean = false): UUID
+    fun cancel(id: UUID)
+    fun observe(id: UUID): Flow<WorkInfo?>
+}
+
 private class WorkManagerEditorExportScheduler(
     private val workManager: WorkManager,
-) : EditorExportScheduler {
+) : EditorExportScheduler, EditorCleanupScheduler {
     override fun enqueue(request: OneTimeWorkRequest): UUID {
         workManager.enqueue(request)
         return request.id
@@ -153,12 +188,8 @@ private class WorkManagerEditorExportScheduler(
     override fun cancel(id: UUID) {
         workManager.cancelWorkById(id)
     }
-    override fun observe(id: UUID): Flow<WorkInfo?> = callbackFlow {
-        val liveData = workManager.getWorkInfoByIdLiveData(id)
-        val observer = Observer<WorkInfo?> { trySend(it) }
-        liveData.observeForever(observer)
-        awaitClose { liveData.removeObserver(observer) }
-    }
+    override fun observe(id: UUID): Flow<WorkInfo?> =
+        workManager.getWorkInfoByIdFlow(id).map { it }.flowOn(Dispatchers.IO)
 }
 
 /** Intents shared by the editor shell and its timeline controls. */
@@ -193,8 +224,11 @@ internal sealed interface EditorIntent {
     data class StartCleanup(
         val targetClipId: String?,
         val normalize: Boolean,
-        val preset: com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength
+        val preset: CleanupStrength,
+        val wholeTrack: Boolean = false,
     ) : EditorIntent
+    data object CancelCleanup : EditorIntent
+    data object RetryCleanup : EditorIntent
 }
 
 internal data class EditorUiState(
@@ -208,7 +242,37 @@ internal data class EditorUiState(
     val importInFlight: Boolean = false,
     val playback: EditorPlaybackState = EditorPlaybackState(),
     val export: EditorExportUiState = EditorExportUiState(),
+    val cleanup: EditorCleanupUiState = EditorCleanupUiState(),
 )
+
+private data class CleanupTarget(
+    val clipId: String,
+    val sourceUri: String,
+    val sourceStartMs: Long,
+    val sourceEndMs: Long,
+    val fingerprint: String = "",
+    var workId: UUID? = null,
+) {
+    constructor(clip: AudioClip) : this(
+        clipId = clip.id,
+        sourceUri = clip.source.uri,
+        sourceStartMs = clip.sourceStartMs,
+        sourceEndMs = clip.sourceEndMs,
+    )
+}
+
+private data class CleanupBatch(
+    val id: String,
+    val targetClipId: String,
+    val wholeTrack: Boolean,
+    val normalize: Boolean,
+    val preset: CleanupStrength,
+    val clips: List<CleanupTarget>,
+    val completed: MutableMap<String, String> = LinkedHashMap(),
+)
+
+private fun EditorSession.findClipForCleanup(clipId: String): AudioClip? =
+    tracks.asSequence().flatMap { it.clips.asSequence() }.firstOrNull { it.id == clipId }
 
 /**
  * Owns one transient editor session. Sources remain URI-backed for this phase; no source is
@@ -228,9 +292,15 @@ internal class EditorViewModel(
         VoiceNoteConverter.extractWaveform(application, uri)
     },
     private val previewEngine: EditorPreviewEngine = EditorPreviewEngine(
-        renderer = DefaultTimelineRenderer(MediaCodecPcmSourceReaderFactory(application)),
+        renderer = DefaultTimelineRenderer(
+            MediaCodecPcmSourceReaderFactory(application),
+            cacheDir = File(application.cacheDir, "processed_audio"),
+        ),
     ),
     private val exportScheduler: EditorExportScheduler = WorkManagerEditorExportScheduler(
+        WorkManager.getInstance(application)
+    ),
+    private val cleanupScheduler: EditorCleanupScheduler = WorkManagerEditorExportScheduler(
         WorkManager.getInstance(application)
     ),
 ) : AndroidViewModel(application) {
@@ -250,6 +320,11 @@ internal class EditorViewModel(
     private val exportGate = Any()
     private var exportEnqueueInFlight = false
     private var exportCancelRequested = false
+    private val exportRetainedKeys = mutableMapOf<String, Int>()
+    private var cleanupObservationJobs: List<Job> = emptyList()
+    private var cleanupPreparationJob: Job? = null
+    private var cleanupBatch: CleanupBatch? = null
+    private val processedCache = ProcessedAudioCache(File(application.cacheDir, "processed_audio"))
 
     init {
         viewModelScope.launch {
@@ -258,6 +333,9 @@ internal class EditorViewModel(
                     state.copy(
                         playback = playback,
                         session = state.session.copy(playheadMs = playback.positionMs),
+                        message = playback.error?.takeIf { it.startsWith("Processed audio cache") }
+                            ?.let { EditorMessage.PROCESSED_AUDIO_UNAVAILABLE }
+                            ?: state.message,
                     )
                 }
             }
@@ -348,7 +426,14 @@ internal class EditorViewModel(
             EditorIntent.StartExport -> startExport()
             EditorIntent.CancelExport -> cancelExport()
             EditorIntent.RetryExport -> retryExport()
-            is EditorIntent.StartCleanup -> startCleanup(intent.targetClipId, intent.normalize, intent.preset)
+            is EditorIntent.StartCleanup -> startCleanup(
+                intent.targetClipId,
+                intent.normalize,
+                intent.preset,
+                intent.wholeTrack,
+            )
+            EditorIntent.CancelCleanup -> cancelCleanup()
+            EditorIntent.RetryCleanup -> retryCleanup()
         }
     }
 
@@ -507,6 +592,7 @@ internal class EditorViewModel(
 
     private fun finishLoading(session: EditorSession) {
         commandHistory = CommandHistory(session)
+        syncCacheReferences()
         previewEngine.load(session)
         _uiState.update {
             it.copy(
@@ -549,6 +635,7 @@ internal class EditorViewModel(
             exportCancelRequested = false
             exportWorkerStarted = false
             exportAttemptId = requestedAttemptId ?: UUID.randomUUID().toString()
+            retainExportReferences(current.session)
         }
         viewModelScope.launch(Dispatchers.IO) {
             var manifest: File? = null
@@ -608,9 +695,11 @@ internal class EditorViewModel(
                 observeExport(id)
             } catch (error: CancellationException) {
                 manifest?.delete()
+                releaseExportReferences()
                 throw error
             } catch (error: Throwable) {
                 manifest?.delete()
+                releaseExportReferences()
                 error.rethrowIfFatal()
                 _uiState.update {
                     it.copy(export = it.export.copy(status = EditorExportStatus.FAILED, error = error.message ?: "Export failed", canRetry = true))
@@ -621,53 +710,217 @@ internal class EditorViewModel(
         }
     }
 
-    private fun startCleanup(targetClipId: String?, normalize: Boolean, preset: com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength) {
+    private fun startCleanup(
+        targetClipId: String?,
+        normalize: Boolean,
+        preset: CleanupStrength,
+        wholeTrack: Boolean,
+    ) {
         val session = _uiState.value.session
         val clipId = targetClipId ?: session.selectedClipId ?: return
-        val track = session.tracks.firstOrNull { t -> t.clips.any { it.id == clipId } } ?: return
-        
-        val clipsToProcess = if (targetClipId == null) {
-            track.clips // process all clips in track
-        } else {
+        val track = session.tracks.firstOrNull { track -> track.clips.any { it.id == clipId } } ?: return
+        val clipsToProcess = if (wholeTrack) track.clips else {
             listOf(track.clips.first { it.id == clipId })
         }
-        
-        val workManager = androidx.work.WorkManager.getInstance(getApplication())
-        val requests = mutableListOf<androidx.work.OneTimeWorkRequest>()
-        
-        for (clip in clipsToProcess) {
-            val fingerprint = clip.source.uri
-            val request = com.aistudio.voicenote.cvtr.editor.work.CleanupEffectWork.request(
-                sourceUri = clip.source.uri,
-                sourceFingerprint = fingerprint,
-                sourceStartMs = clip.sourceStartMs,
-                sourceEndMs = clip.sourceEndMs,
-                cleanupStrength = preset,
-                normalized = normalize
-            )
-            val uniqueName = com.aistudio.voicenote.cvtr.editor.work.CleanupEffectWork.uniqueWorkName(fingerprint, clip.sourceStartMs, clip.sourceEndMs)
-            
-            workManager.beginUniqueWork(
-                uniqueName,
-                androidx.work.ExistingWorkPolicy.REPLACE,
-                request
-            ).enqueue()
-            
-            requests.add(request)
-            
-            viewModelScope.launch {
-                workManager.getWorkInfoByIdLiveData(request.id).observeForever { info ->
-                    if (info != null && info.state == androidx.work.WorkInfo.State.SUCCEEDED) {
-                        val cacheKey = info.outputData.getString(com.aistudio.voicenote.cvtr.editor.work.CleanupEffectWork.RESULT_CACHE_KEY_FILENAME)
-                        if (cacheKey != null) {
-                            runSerializedMutation {
-                                execute(com.aistudio.voicenote.cvtr.editor.command.ApplyProcessedSourceCommand(clip.id, cacheKey))
-                            }
-                        }
-                    }
+        if (clipsToProcess.isEmpty()) return
+
+        cancelCleanup(publishCancelled = false)
+        val batchId = UUID.randomUUID().toString()
+        val batch = CleanupBatch(
+            id = batchId,
+            targetClipId = clipId,
+            wholeTrack = wholeTrack,
+            normalize = normalize,
+            preset = preset,
+            clips = clipsToProcess.map { clip -> CleanupTarget(clip) },
+        )
+        cleanupBatch = batch
+        _uiState.update {
+            it.copy(cleanup = EditorCleanupUiState(
+                status = EditorCleanupStatus.QUEUED,
+                targetClipId = clipId,
+                wholeTrack = wholeTrack,
+                normalize = normalize,
+                preset = preset,
+            ))
+        }
+        cleanupPreparationJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val requiredBytes = batch.clips.sumOf { target ->
+                    val frames = (target.sourceEndMs - target.sourceStartMs).coerceAtLeast(0L) * 48L / 1_000L
+                    estimateRequiredBytes(frames, normalize)
                 }
+                if (processedCacheDir().usableSpace < requiredBytes) {
+                    completeCleanupFailure(batch, "Insufficient storage for cleanup render", cancelled = false)
+                    return@launch
+                }
+                if (cleanupBatch?.id != batch.id) return@launch
+                val prepared = batch.clips.map { target ->
+                    target.copy(
+                        fingerprint = StableSourceFingerprint.compute(
+                            getApplication(), target.sourceUri, target.sourceUri,
+                        )
+                    )
+                }
+                if (cleanupBatch?.id != batch.id) return@launch
+                val preparedBatch = batch.copy(clips = prepared)
+                cleanupBatch = preparedBatch
+                preparedBatch.clips.forEach { target ->
+                    if (cleanupBatch?.id != batch.id) return@launch
+                    val request = CleanupEffectWork.request(
+                        sourceUri = target.sourceUri,
+                        sourceFingerprint = target.fingerprint,
+                        sourceStartMs = target.sourceStartMs,
+                        sourceEndMs = target.sourceEndMs,
+                        cleanupStrength = preset,
+                        normalized = normalize,
+                    )
+                    val uniqueName = CleanupEffectWork.uniqueWorkName(
+                        sourceFingerprint = target.fingerprint,
+                        start = target.sourceStartMs,
+                        end = target.sourceEndMs,
+                        cleanupStrength = preset,
+                        normalized = normalize,
+                        attemptIdentity = "${batch.id}-${target.clipId}",
+                    )
+                    val workId = cleanupScheduler.enqueueUnique(uniqueName, request, replaceExisting = true)
+                    target.workId = workId
+                }
+                _uiState.update { it.copy(cleanup = it.cleanup.copy(status = EditorCleanupStatus.RUNNING)) }
+                cleanupObservationJobs = preparedBatch.clips.map { target ->
+                    viewModelScope.launch(Dispatchers.IO) { observeCleanup(preparedBatch, target) }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                completeCleanupFailure(prepared = cleanupBatch, message = error.message ?: "Cleanup could not start", cancelled = false)
             }
         }
+    }
+
+    private suspend fun observeCleanup(batch: CleanupBatch, target: CleanupTarget) {
+        cleanupScheduler.observe(target.workId ?: return).filterNotNull().collect { info ->
+            if (cleanupBatch?.id != batch.id) return@collect
+            val progress = info.progress.getFloat(CleanupEffectWork.PROGRESS, 0f)
+            val done = synchronized(batch.completed) { batch.completed.size }
+            val total = batch.clips.size.coerceAtLeast(1)
+            _uiState.update { it.copy(cleanup = it.cleanup.copy(progress = ((done + progress) / total).coerceIn(0f, 1f))) }
+            when (info.state) {
+                WorkInfo.State.SUCCEEDED -> {
+                    val key = info.outputData.getString(CleanupEffectWork.RESULT_CACHE_KEY_FILENAME)
+                    val resultFingerprint = info.outputData.getString(CleanupEffectWork.RESULT_CACHE_KEY_FINGERPRINT)
+                    val resultStart = info.outputData.getLong(CleanupEffectWork.RESULT_SOURCE_START_MS, Long.MIN_VALUE)
+                    val resultEnd = info.outputData.getLong(CleanupEffectWork.RESULT_SOURCE_END_MS, Long.MIN_VALUE)
+                    val resultStrength = info.outputData.getString(CleanupEffectWork.RESULT_CLEANUP_STRENGTH)
+                    val resultNormalized = info.outputData.getBoolean(CleanupEffectWork.RESULT_NORMALIZED, false)
+                    val hasNormalized = info.outputData.keyValueMap.containsKey(CleanupEffectWork.RESULT_NORMALIZED)
+                    val resultAlgorithm = info.outputData.getString(CleanupEffectWork.RESULT_ALGORITHM_VERSION)
+                    val expectedKey = ProcessedAudioKey(
+                        sourceFingerprint = target.fingerprint,
+                        sourceStartMs = target.sourceStartMs,
+                        sourceEndMs = target.sourceEndMs,
+                        cleanup = batch.preset,
+                        normalized = batch.normalize,
+                        algorithmVersion = ProcessedAudioCache.CACHE_ALGORITHM_VERSION,
+                    ).toFilename()
+                    if (key.isNullOrBlank() || key != expectedKey || resultFingerprint != target.fingerprint ||
+                        resultStart != target.sourceStartMs || resultEnd != target.sourceEndMs ||
+                        resultStrength != batch.preset.name || !hasNormalized || resultNormalized != batch.normalize ||
+                        resultAlgorithm != ProcessedAudioCache.CACHE_ALGORITHM_VERSION
+                    ) {
+                        completeCleanupFailure(batch, "Cleanup result is missing", cancelled = false)
+                    } else {
+                        val complete = synchronized(batch.completed) {
+                            batch.completed[target.clipId] = key
+                            batch.completed.size == batch.clips.size
+                        }
+                        if (complete) applyCompletedCleanup(batch)
+                    }
+                }
+                WorkInfo.State.FAILED -> completeCleanupFailure(
+                    prepared = batch,
+                    message = info.outputData.getString(CleanupEffectWork.ERROR_MESSAGE) ?: "Cleanup failed",
+                    cancelled = false,
+                )
+                WorkInfo.State.CANCELLED -> completeCleanupFailure(batch, "Cleanup cancelled", cancelled = true)
+                else -> Unit
+            }
+        }
+    }
+
+    private suspend fun applyCompletedCleanup(batch: CleanupBatch) {
+        mutationMutex.withLock {
+            if (cleanupBatch?.id != batch.id) return@withLock
+            val current = _uiState.value.session
+            val completed = synchronized(batch.completed) { batch.completed.toMap() }
+            val valid = batch.clips.all { target ->
+                val clip = current.findClipForCleanup(target.clipId)
+                clip != null && clip.source.uri == target.sourceUri &&
+                    clip.sourceStartMs == target.sourceStartMs && clip.sourceEndMs == target.sourceEndMs &&
+                    StableSourceFingerprint.compute(getApplication(), target.sourceUri, target.fingerprint) == target.fingerprint &&
+                    completed[target.clipId]?.let { key ->
+                        val expected = (target.sourceEndMs - target.sourceStartMs).coerceAtLeast(0L) * 48L / 1_000L
+                        runCatching {
+                            readValidatedCachedWav(File(processedCacheDir(), "$key.pcm"), expected)
+                        }.isSuccess
+                    } == true
+            }
+            if (!valid) {
+                completeCleanupFailure(batch, "Cleanup result is no longer current", cancelled = false)
+                return@withLock
+            }
+            val result = commandHistory?.execute(
+                com.aistudio.voicenote.cvtr.editor.command.ApplyProcessedSourcesCommand(completed)
+            )
+            if (result is TimelineResult.Accepted) {
+                publishSession(result.value)
+                syncCacheReferences()
+                cleanupBatch = null
+                cleanupObservationJobs.forEach { it.cancel() }
+                cleanupObservationJobs = emptyList()
+                _uiState.update { it.copy(cleanup = it.cleanup.copy(status = EditorCleanupStatus.SUCCEEDED, progress = 1f, error = null, canRetry = false)) }
+            } else {
+                completeCleanupFailure(batch, "Cleanup result could not be applied", cancelled = false)
+            }
+        }
+    }
+
+    private fun completeCleanupFailure(prepared: CleanupBatch?, message: String, cancelled: Boolean) {
+        if (prepared == null || cleanupBatch?.id != prepared.id) return
+        prepared.clips.mapNotNull { it.workId }.forEach(cleanupScheduler::cancel)
+        synchronized(prepared.completed) { prepared.completed.values.toList() }
+            .forEach(processedCache::deleteIfUnreferenced)
+        cleanupObservationJobs.forEach { it.cancel() }
+        cleanupObservationJobs = emptyList()
+        cleanupBatch = null
+        _uiState.update {
+            it.copy(cleanup = it.cleanup.copy(
+                status = if (cancelled) EditorCleanupStatus.CANCELLED else EditorCleanupStatus.FAILED,
+                error = message,
+                canRetry = true,
+            ))
+        }
+    }
+
+    private fun cancelCleanup(publishCancelled: Boolean = true) {
+        cleanupPreparationJob?.cancel()
+        cleanupPreparationJob = null
+        val batch = cleanupBatch ?: return
+        batch.clips.mapNotNull { it.workId }.forEach(cleanupScheduler::cancel)
+        cleanupObservationJobs.forEach { it.cancel() }
+        cleanupObservationJobs = emptyList()
+        synchronized(batch.completed) { batch.completed.values.toList() }
+            .forEach(processedCache::deleteIfUnreferenced)
+        cleanupBatch = null
+        if (publishCancelled) {
+            _uiState.update { it.copy(cleanup = it.cleanup.copy(status = EditorCleanupStatus.CANCELLED, canRetry = true, error = "Cleanup cancelled")) }
+        }
+    }
+
+    private fun retryCleanup() {
+        val state = _uiState.value.cleanup
+        if (!state.canRetry) return
+        startCleanup(state.targetClipId, state.normalize, state.preset, state.wholeTrack)
     }
 
     private fun observeExport(id: UUID) {
@@ -697,6 +950,7 @@ internal class EditorViewModel(
                             exportManifestPath = null
                             exportWorkId = null
                         }
+                        releaseExportReferences()
                         exportObservationJob?.cancel()
                     }
                     WorkInfo.State.FAILED -> {
@@ -712,6 +966,7 @@ internal class EditorViewModel(
                             exportManifestPath = null
                             exportWorkId = null
                         }
+                        releaseExportReferences()
                         exportObservationJob?.cancel()
                     }
                     WorkInfo.State.CANCELLED -> {
@@ -720,6 +975,7 @@ internal class EditorViewModel(
                             exportManifestPath = null
                             exportWorkId = null
                         }
+                        releaseExportReferences()
                         exportObservationJob?.cancel()
                     }
                     WorkInfo.State.BLOCKED -> Unit
@@ -740,6 +996,9 @@ internal class EditorViewModel(
         }
         workId?.let(exportScheduler::cancel)
         manifestPath?.let { File(it).delete() }
+        // Cancellation is the terminal ownership transition for the queued export. The worker
+        // still performs its own best-effort file cleanup, but cache eviction may proceed now.
+        releaseExportReferences()
         _uiState.update { it.copy(export = it.export.copy(
             status = EditorExportStatus.CANCELLED,
             canRetry = true,
@@ -840,7 +1099,40 @@ internal class EditorViewModel(
                 canRedo = history?.canRedo == true,
             )
         }
+        syncCacheReferences()
     }
+
+    private fun syncCacheReferences() {
+        val history = commandHistory ?: return
+        val counts = history.referencedSessions()
+            .asSequence()
+            .flatMap { session -> session.tracks.asSequence() }
+            .flatMap { track -> track.clips.asSequence() }
+            .mapNotNull { it.effects.processedCacheKey }
+            .groupingBy { it }
+            .eachCount()
+        processedCache.replaceSessionReferences(counts)
+    }
+
+    private fun retainExportReferences(session: EditorSession) {
+        releaseExportReferences()
+        session.tracks.asSequence()
+            .flatMap { it.clips.asSequence() }
+            .mapNotNull { it.effects.processedCacheKey }
+            .groupingBy { it }
+            .eachCount()
+            .forEach { (key, count) ->
+                repeat(count) { processedCache.retainFilename(key) }
+                exportRetainedKeys[key] = count
+            }
+    }
+
+    private fun releaseExportReferences() {
+        exportRetainedKeys.forEach { (key, count) -> repeat(count) { processedCache.releaseFilename(key) } }
+        exportRetainedKeys.clear()
+    }
+
+    private fun processedCacheDir(): File = File(getApplication<Application>().cacheDir, "processed_audio")
 
     private fun selectedClip(): String? = _uiState.value.session.selectedClipId
 
@@ -909,6 +1201,8 @@ internal class EditorViewModel(
 
     override fun onCleared() {
         launchJob.cancel()
+        cancelCleanup(publishCancelled = false)
+        processedCache.clearSessionReferences()
         previewEngine.release()
         super.onCleared()
     }

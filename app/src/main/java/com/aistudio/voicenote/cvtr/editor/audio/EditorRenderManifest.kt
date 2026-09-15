@@ -129,7 +129,8 @@ internal data class EditorRenderManifest(
     }
 
     companion object {
-        private const val FORMAT_VERSION = 1
+        private const val LEGACY_FORMAT_VERSION = 1
+        private const val FORMAT_VERSION = 2
         private const val KEY_VERSION = "version"
         private const val KEY_SESSION_ID = "sessionId"
         private const val KEY_PRESET = "preset"
@@ -188,7 +189,10 @@ internal data class EditorRenderManifest(
             val json = FileInputStream(file).use { input ->
                 InputStreamReader(input, StandardCharsets.UTF_8).use { it.readText() }
             }.let(::JSONObject)
-            require(json.optInt(KEY_VERSION, -1) == FORMAT_VERSION) { "Unsupported editor manifest version" }
+            val manifestVersion = json.optInt(KEY_VERSION, -1)
+            require(manifestVersion == LEGACY_FORMAT_VERSION || manifestVersion == FORMAT_VERSION) {
+                "Unsupported editor manifest version"
+            }
             val sessionId = json.requiredString(KEY_SESSION_ID)
             val preset = try {
                 ExportPreset.valueOf(json.requiredString(KEY_PRESET))
@@ -316,6 +320,7 @@ internal data class EditorRenderManifest(
             put("gain", effects.gain.toDouble())
             put("pitchSemitones", effects.pitchSemitones.toDouble())
             put("speed", effects.speed.toDouble())
+            put("processedCacheKey", effects.processedCacheKey ?: JSONObject.NULL)
         }
 
         private fun JSONObject.toClip(): AudioClip = AudioClip(
@@ -333,6 +338,7 @@ internal data class EditorRenderManifest(
                 gain = optDouble("gain", 1.0).toFloat(),
                 pitchSemitones = optDouble("pitchSemitones", 0.0).toFloat(),
                 speed = optDouble("speed", 1.0).toFloat(),
+                processedCacheKey = optionalString("processedCacheKey"),
             ),
         )
     }

@@ -11,6 +11,7 @@ import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.UUID
 
 /** Versioned cache identity. Every field that can change rendered samples belongs in the key. */
 internal data class ProcessedAudioKey(
@@ -103,6 +104,7 @@ internal fun readValidatedCachedWav(
 internal class ProcessedAudioCache(private val cacheDir: File) {
     private val accessClock = AtomicLong(System.currentTimeMillis())
     private val rootState: SharedRootState
+    private val sessionOwner = "session-${UUID.randomUUID()}"
 
     init {
         check(cacheDir.exists() || cacheDir.mkdirs()) { "Unable to create cache directory" }
@@ -162,23 +164,67 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
     }
 
     fun retain(key: ProcessedAudioKey) {
-        synchronized(rootState.lock) {
-            rootState.references[key.toFilename()] =
-                (rootState.references[key.toFilename()] ?: 0) + 1
-        }
+        retainFilename(key.toFilename())
     }
 
     fun release(key: ProcessedAudioKey) {
+        releaseFilename(key.toFilename())
+    }
+
+    /** Retains a result when only the worker's canonical filename is available. */
+    fun retainFilename(filename: String) {
         synchronized(rootState.lock) {
-            val filename = key.toFilename()
+            rootState.references[filename] = (rootState.references[filename] ?: 0) + 1
+        }
+    }
+
+    fun releaseFilename(filename: String) {
+        synchronized(rootState.lock) {
             val newCount = (rootState.references[filename] ?: 0) - 1
-            if (newCount <= 0) rootState.references.remove(filename)
-            else rootState.references[filename] = newCount
+            if (newCount <= 0) rootState.references.remove(filename) else rootState.references[filename] = newCount
+        }
+    }
+
+    /**
+     * Reconciles this editor session's multiset of processed keys. Replacing the owner set rather
+     * than incrementing blindly makes execute/undo/redo/apply idempotent and preserves references
+     * held by other sessions or an in-flight export.
+     */
+    fun replaceSessionReferences(filenames: Map<String, Int>) {
+        synchronized(rootState.lock) {
+            rootState.ownerReferences.remove(sessionOwner)?.forEach { (name, count) ->
+                decrementReferenceLocked(name, count)
+            }
+            val normalized = filenames.filterValues { it > 0 }
+            rootState.ownerReferences[sessionOwner] = normalized
+            normalized.forEach { (name, count) ->
+                rootState.references[name] = (rootState.references[name] ?: 0) + count
+            }
+        }
+    }
+
+    fun clearSessionReferences() {
+        synchronized(rootState.lock) {
+            rootState.ownerReferences.remove(sessionOwner)?.forEach { (name, count) ->
+                decrementReferenceLocked(name, count)
+            }
         }
     }
 
     fun isRetained(key: ProcessedAudioKey): Boolean = synchronized(rootState.lock) {
         rootState.references.containsKey(key.toFilename())
+    }
+
+    /** Removes a newly built output only when no active/history/export owner references it. */
+    fun deleteIfUnreferenced(filename: String): Boolean {
+        // Worker output is a SHA-256 filename. Reject anything else before resolving a path so a
+        // malformed/stale result can never turn cleanup rollback into path traversal.
+        if (filename.length != 64 || filename.any { it !in '0'..'9' && it !in 'a'..'f' }) return false
+        synchronized(rootState.lock) {
+            if (rootState.references.containsKey(filename)) return false
+            val file = File(cacheDir, "$filename.pcm")
+            return !file.exists() || file.delete()
+        }
     }
 
     fun evictToSize(maxBytes: Long) {
@@ -273,6 +319,11 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
         }
     }
 
+    private fun decrementReferenceLocked(name: String, count: Int) {
+        val remaining = (rootState.references[name] ?: 0) - count
+        if (remaining <= 0) rootState.references.remove(name) else rootState.references[name] = remaining
+    }
+
     companion object {
         const val KEY_FORMAT_VERSION = "processed-audio-key-v2"
         const val CACHE_ALGORITHM_VERSION = "cleanup-rnnoise-peak-v1"
@@ -285,6 +336,7 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
     private class SharedRootState {
         val lock = Any()
         val references = mutableMapOf<String, Int>()
+        val ownerReferences = mutableMapOf<String, Map<String, Int>>()
         val activeTemps = mutableSetOf<String>()
     }
 }

@@ -108,7 +108,12 @@ internal fun EditorScreen(
             )
             state.activeSheet?.let { sheet ->
                 selectedClip?.let { clip ->
-                    EditorToolSheet(sheet = sheet, clip = clip, onIntent = onIntent)
+                     EditorToolSheet(
+                         sheet = sheet,
+                         clip = clip,
+                         onIntent = onIntent,
+                         cleanupState = state.cleanup,
+                     )
                 }
             }
             if (state.export.sheetOpen) {
@@ -220,4 +225,5 @@ private fun editorMessageText(message: EditorMessage): String = when (message) {
     EditorMessage.TRACK_LIMIT -> "The editor supports up to five tracks."
     EditorMessage.HISTORY_NOT_FOUND -> "This history item is no longer available."
     EditorMessage.IMPORT_FAILED -> "The track could not be imported."
+    EditorMessage.PROCESSED_AUDIO_UNAVAILABLE -> "Processed cleanup audio is unavailable; the original source is playing."
 }

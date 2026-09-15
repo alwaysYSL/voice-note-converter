@@ -46,13 +46,14 @@ internal object TimelineOperations {
         val first = clip.copy(
             id = firstId,
             sourceEndMs = sourceSplit,
-            effects = clip.effects.copy(fadeOutMs = 0L),
+            // The cached PCM was rendered for the unsplit range and cannot be reused safely.
+            effects = clip.effects.copy(fadeOutMs = 0L, processedCacheKey = null),
         )
         val second = clip.copy(
             id = secondId,
             sourceStartMs = sourceSplit,
             timelineStartMs = splitTimelineMs,
-            effects = clip.effects.copy(fadeInMs = 0L),
+            effects = clip.effects.copy(fadeInMs = 0L, processedCacheKey = null),
         )
 
         val tracks = session.tracks.toMutableList()
@@ -71,7 +72,31 @@ internal object TimelineOperations {
         sourceEndMs: Long,
     ): TimelineResult {
         val location = session.findClip(clipId) ?: return TimelineResult.Rejected(TimelineError.MISSING_ID)
-        val candidate = location.clip.copy(sourceStartMs = sourceStartMs, sourceEndMs = sourceEndMs)
+        val candidate = location.clip.copy(
+            sourceStartMs = sourceStartMs,
+            sourceEndMs = sourceEndMs,
+            // A source-range mutation changes the cache identity even when the URI is unchanged.
+            effects = location.clip.effects.copy(processedCacheKey = null),
+        )
+        sourceRangeError(candidate)?.let { return TimelineResult.Rejected(it) }
+        return commit(session.replaceClip(location, candidate))
+    }
+
+    /** Replaces a clip's source/range; any processed PCM belongs to the old source identity. */
+    fun replaceClipSource(
+        session: EditorSession,
+        clipId: String,
+        source: AudioSourceRef,
+        sourceStartMs: Long = 0L,
+        sourceEndMs: Long = source.durationMs,
+    ): TimelineResult {
+        val location = session.findClip(clipId) ?: return TimelineResult.Rejected(TimelineError.MISSING_ID)
+        val candidate = location.clip.copy(
+            source = source,
+            sourceStartMs = sourceStartMs,
+            sourceEndMs = sourceEndMs,
+            effects = location.clip.effects.copy(processedCacheKey = null),
+        )
         sourceRangeError(candidate)?.let { return TimelineResult.Rejected(it) }
         return commit(session.replaceClip(location, candidate))
     }
@@ -160,6 +185,21 @@ internal object TimelineOperations {
     fun applyProcessedSource(session: EditorSession, clipId: String, processedCacheKey: String): TimelineResult {
         val location = session.findClip(clipId) ?: return TimelineResult.Rejected(TimelineError.MISSING_ID)
         return setClipEffects(session, clipId, location.clip.effects.copy(processedCacheKey = processedCacheKey))
+    }
+
+    /** Applies multiple verified cache outputs in one history entry. */
+    fun applyProcessedSources(session: EditorSession, processedCacheKeys: Map<String, String>): TimelineResult {
+        if (processedCacheKeys.isEmpty()) return TimelineResult.Rejected(TimelineError.MISSING_ID)
+        var candidate = session
+        for ((clipId, cacheKey) in processedCacheKeys) {
+            val location = candidate.findClip(clipId) ?: return TimelineResult.Rejected(TimelineError.MISSING_ID)
+            if (cacheKey.isBlank()) return TimelineResult.Rejected(TimelineError.INVALID_SOURCE_RANGE)
+            candidate = candidate.replaceClip(
+                location,
+                location.clip.copy(effects = location.clip.effects.copy(processedCacheKey = cacheKey)),
+            )
+        }
+        return commit(candidate)
     }
 
     /** Validates and canonicalizes one immutable session without mutating the caller's lists. */

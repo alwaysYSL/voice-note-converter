@@ -326,7 +326,7 @@ class EditorExportWorkerTest {
                         sourceStartMs = 0L,
                         sourceEndMs = 1_000L,
                         timelineStartMs = 0L,
-                        effects = ClipEffects(),
+                        effects = ClipEffects(processedCacheKey = "cached-key"),
                     )
                 ),
             )

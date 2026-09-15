@@ -255,6 +255,9 @@ internal class EditorExportRunner(
                             val count = minOf(RENDER_CHUNK_FRAMES.toLong(), total - completed).toInt()
                             val pcm = renderer?.render(manifest.renderSession, completed, count)
                                 ?: error("Editor renderer is unavailable")
+                            renderer?.consumeWarning()?.let { warning ->
+                                throw IllegalStateException(warning)
+                            }
                             check(pcm.size == count) { "Renderer returned ${pcm.size} frames for $count" }
                             currentCoroutineContext().ensureActive()
                             encoder?.write(pcm)
@@ -651,7 +654,10 @@ internal class EditorExportWorker(
         companion object {
             fun production(context: Context): Dependencies = Dependencies(
                 rendererFactory = { manifest ->
-                    DefaultTimelineRenderer(MediaCodecPcmSourceReaderFactory(context))
+                    DefaultTimelineRenderer(
+                        sourceFactory = MediaCodecPcmSourceReaderFactory(context),
+                        cacheDir = File(context.cacheDir, "processed_audio"),
+                    )
                 },
                 encoderFactory = EditorExportEncoderFactory { output, preset, checkActive ->
                     val writer = OggOpusWriter(output)

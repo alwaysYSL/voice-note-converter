@@ -18,7 +18,15 @@ internal object CleanupEffectWork {
     
     const val RESULT_CACHE_KEY_FILENAME = "cleanup.resultCacheKeyFilename"
     const val RESULT_CACHE_KEY_FINGERPRINT = "cleanup.resultCacheKeyFingerprint"
+    const val RESULT_SOURCE_START_MS = "cleanup.resultSourceStartMs"
+    const val RESULT_SOURCE_END_MS = "cleanup.resultSourceEndMs"
+    const val RESULT_CLEANUP_STRENGTH = "cleanup.resultStrength"
+    const val RESULT_NORMALIZED = "cleanup.resultNormalized"
+    const val RESULT_ALGORITHM_VERSION = "cleanup.resultAlgorithmVersion"
     const val ERROR_MESSAGE = "cleanup.errorMessage"
+    const val PROGRESS = "cleanup.progress"
+    const val PROGRESS_FRAMES = "cleanup.progressFrames"
+    const val TOTAL_FRAMES = "cleanup.totalFrames"
 
     fun request(
         sourceUri: String,
@@ -56,7 +64,8 @@ internal object CleanupEffectWork {
         cleanupStrength: CleanupStrength = CleanupStrength.OFF,
         normalized: Boolean = false,
         algorithmVersion: String = ProcessedAudioCache.CACHE_ALGORITHM_VERSION,
+        attemptIdentity: String = "shared",
     ): String {
-        return "cleanup.$sourceFingerprint.$start.$end.${cleanupStrength.name}.$normalized.$algorithmVersion"
+        return "cleanup.$sourceFingerprint.$start.$end.${cleanupStrength.name}.$normalized.$algorithmVersion.$attemptIdentity"
     }
 }

@@ -34,3 +34,31 @@ Risks:
 
 1. Native waveform quality remains covered by assembly/API checks rather than a device fixture.
 2. Timeline callers must provide exact output frame counts when their mapping is authoritative; fallback carries fractional remainder.
+
+## End-to-end integration
+
+Phase 3 cleanup is now connected through the selected-clip toolbar, lifecycle-scoped WorkManager
+Flow observation, atomic selected/whole-track apply, and retry/cancel/error progress states. Cleanup
+requests use a verified content fingerprint, exact source range, cleanup strength, normalize flag,
+algorithm version, and per-attempt temporary files; stale results are rejected before they can enter
+the session. Trim, split, and source replacement clear processed keys.
+
+Preview and export both resolve processed PCM from the shared `cacheDir/processed_audio` root;
+preview falls back with an editor message when a cached file is missing/corrupt, while export fails
+the render clearly. Render manifests round-trip `processedCacheKey`, and export retains referenced
+keys until its WorkManager attempt reaches a terminal state. Session/history cache references are
+reconciled as multisets across execute, undo, redo, load, apply, export, and teardown.
+
+Verification:
+
+- `git diff --check`: passed.
+- `rg observeForever app/src/main/java/com/aistudio/voicenote/cvtr/editor`: no matches.
+- Focused Gradle tests and `:app:assembleDebug`: blocked in this shell by the unavailable Android
+  SDK/NDK setup (`NdkLocatorKt.getNdkVersionedFolders` project-configuration failure); rerun in a
+  provisioned Android environment.
+
+Residual device risks:
+
+1. Real WorkManager cancellation/retry timing and whole-track progress need device validation.
+2. Media-provider fingerprinting and cache fallback need fixtures for revoked or changing URIs.
+3. Long-running cleanup/export cache retention needs observation under process death and low storage.

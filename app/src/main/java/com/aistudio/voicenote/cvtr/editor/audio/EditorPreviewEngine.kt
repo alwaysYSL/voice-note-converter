@@ -206,6 +206,13 @@ internal class EditorPreviewEngine(
 
                 val (startFrame, frameCount) = next
                 val pcm = renderer.render(checkNotNull(session), startFrame, frameCount)
+                renderer.consumeWarning()?.let { warning ->
+                    synchronized(lock) {
+                        if (!released && localGeneration == generation.get()) {
+                            _state.value = _state.value.copy(error = warning)
+                        }
+                    }
+                }
                 val accepted = synchronized(lock) {
                     if (released || localGeneration != generation.get() || !_state.value.playing) {
                         return

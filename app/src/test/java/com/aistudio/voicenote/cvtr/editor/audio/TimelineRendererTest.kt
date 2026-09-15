@@ -5,6 +5,7 @@ import com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef
 import com.aistudio.voicenote.cvtr.editor.model.ClipEffects
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
 import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
+import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioKey
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -151,6 +152,35 @@ class TimelineRendererTest {
         renderer.close()
     }
 
+    @Test
+    fun `renderer resolves a valid processed cache before opening the source`() {
+        val cacheDir = tempFolder.newFolder("processed-valid")
+        val key = ProcessedAudioKey("content-fingerprint", 0L, 20L, CleanupStrength.MEDIUM, false)
+        val cached = File(cacheDir, "${key.toFilename()}.pcm")
+        writeWav(cached, 960, sample = 321)
+        val renderer = DefaultTimelineRenderer(
+            sourceFactory = PcmSourceReaderFactory { error("source must not be opened") },
+            cacheDir = cacheDir,
+        )
+        val clip = AudioClip(
+            id = "cached",
+            source = AudioSourceRef("content://source", 20L),
+            sourceStartMs = 0L,
+            sourceEndMs = 20L,
+            timelineStartMs = 0L,
+            effects = ClipEffects(processedCacheKey = key.toFilename()),
+        )
+
+        val pcm = renderer.render(
+            EditorSession("cached-session", listOf(EditorTrack("track", "Track", clips = listOf(clip)))),
+            0L,
+            960,
+        )
+
+        assertTrue(pcm.all { it.toInt() == 321 })
+        renderer.close()
+    }
+
     private fun clip(id: String, source: String, timelineStartMs: Long): AudioClip = AudioClip(
         id = id,
         source = AudioSourceRef(source, durationMs = 20L),
@@ -159,7 +189,7 @@ class TimelineRendererTest {
         timelineStartMs = timelineStartMs,
     )
 
-    private fun writeWav(file: File, sampleCount: Int) {
+    private fun writeWav(file: File, sampleCount: Int, sample: Int = 1) {
         val bytes = ByteBuffer.allocate(44 + sampleCount * 2).order(ByteOrder.LITTLE_ENDIAN)
         bytes.put("RIFF".toByteArray())
         bytes.putInt(36 + sampleCount * 2)
@@ -174,7 +204,7 @@ class TimelineRendererTest {
         bytes.putShort(16)
         bytes.put("data".toByteArray())
         bytes.putInt(sampleCount * 2)
-        repeat(sampleCount) { bytes.putShort(1) }
+        repeat(sampleCount) { bytes.putShort(sample.toShort()) }
         file.writeBytes(bytes.array())
     }
 }

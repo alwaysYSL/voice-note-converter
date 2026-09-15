@@ -36,6 +36,14 @@ internal class CommandHistory(
     val redoDepth: Int
         get() = redo.size
 
+    /** All snapshots that can still become audible through the current history branch. */
+    @Synchronized
+    fun referencedSessions(): List<EditorSession> = buildList {
+        add(session)
+        addAll(undo)
+        addAll(redo)
+    }
+
     /** Applies a command and records the prior immutable snapshot only when accepted. */
     @Synchronized
     fun execute(command: EditorCommand): TimelineResult {

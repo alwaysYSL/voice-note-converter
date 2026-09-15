@@ -58,6 +58,16 @@ internal data class TrimClipCommand(
         TimelineOperations.trimClip(session, clipId, sourceStartMs, sourceEndMs)
 }
 
+internal data class ReplaceClipSourceCommand(
+    val clipId: String,
+    val source: com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef,
+    val sourceStartMs: Long = 0L,
+    val sourceEndMs: Long = source.durationMs,
+) : EditorCommand {
+    override fun applyTo(session: EditorSession): TimelineResult =
+        TimelineOperations.replaceClipSource(session, clipId, source, sourceStartMs, sourceEndMs)
+}
+
 internal data class MoveClipCommand(
     val clipId: String,
     val timelineStartMs: Long,
@@ -151,4 +161,12 @@ internal data class ApplyProcessedSourceCommand(
     override fun applyTo(session: EditorSession): TimelineResult {
         return TimelineOperations.applyProcessedSource(session, clipId, processedCacheKey)
     }
+}
+
+/** Applies a completed cleanup batch as one undoable mutation. */
+internal data class ApplyProcessedSourcesCommand(
+    val processedCacheKeys: Map<String, String>,
+) : EditorCommand {
+    override fun applyTo(session: EditorSession): TimelineResult =
+        TimelineOperations.applyProcessedSources(session, processedCacheKeys)
 }

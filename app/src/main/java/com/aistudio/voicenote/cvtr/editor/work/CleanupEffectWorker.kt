@@ -6,6 +6,7 @@ import android.provider.OpenableColumns
 import androidx.work.CoroutineWorker
 import androidx.work.Data
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength
 import com.aistudio.voicenote.cvtr.editor.audio.EDITOR_SAMPLE_RATE
 import com.aistudio.voicenote.cvtr.editor.audio.MediaCodecPcmSourceReaderFactory
@@ -55,6 +56,13 @@ internal class CleanupEffectWorker(
             sourceUri,
             requestedFingerprint,
         )
+        // A verified caller fingerprint is an optimistic concurrency token, never the cache-key
+        // source. Recompute from bytes and reject a changed source before rendering.
+        if (requestedFingerprint.startsWith("source-fingerprint-v2:") &&
+            requestedFingerprint != sourceFingerprint
+        ) {
+            return@withContext failure("Source changed before cleanup started")
+        }
         val key = ProcessedAudioKey(
             sourceFingerprint = sourceFingerprint,
             sourceStartMs = startMs,
@@ -85,7 +93,7 @@ internal class CleanupEffectWorker(
             // Every worker attempt gets its own namespaced temporary files. A retry or a second
             // clip can never write into another attempt's in-progress output.
             renderFile = cache.createActiveTemp(
-                "cleanup-${key.toFilename()}-${id}-",
+                "cleanup-${key.toFilename()}-${id}-attempt$runAttemptCount-",
             )
             renderPass(
                 output = renderFile,
@@ -97,7 +105,7 @@ internal class CleanupEffectWorker(
 
             val finalFile = if (normalized) {
                 normalizedFile = cache.createActiveTemp(
-                    "cleanup-normalized-${key.toFilename()}-${id}-",
+                    "cleanup-normalized-${key.toFilename()}-${id}-attempt$runAttemptCount-",
                 )
                 normalizePass(renderFile, normalizedFile!!, totalFrames)
                 normalizedFile!!
@@ -157,6 +165,12 @@ internal class CleanupEffectWorker(
                         val processed = noiseProcessor?.process(chunk, cleanupStrength) ?: chunk
                         framesRead += chunk.size
                         framesWritten += writeSamples(stream, processed, totalFrames - framesWritten)
+                        setProgress(workDataOf(
+                            CleanupEffectWork.PROGRESS to
+                                (framesWritten.toDouble() / totalFrames.toDouble()).toFloat().coerceIn(0f, 1f),
+                            CleanupEffectWork.PROGRESS_FRAMES to framesWritten,
+                            CleanupEffectWork.TOTAL_FRAMES to totalFrames,
+                        ))
                     }
 
                     // Flush emits only the real buffered tail; zero padding is never published.
@@ -242,6 +256,11 @@ internal class CleanupEffectWorker(
     private fun createResultData(key: ProcessedAudioKey): Data = Data.Builder()
         .putString(CleanupEffectWork.RESULT_CACHE_KEY_FILENAME, key.toFilename())
         .putString(CleanupEffectWork.RESULT_CACHE_KEY_FINGERPRINT, key.sourceFingerprint)
+        .putLong(CleanupEffectWork.RESULT_SOURCE_START_MS, key.sourceStartMs)
+        .putLong(CleanupEffectWork.RESULT_SOURCE_END_MS, key.sourceEndMs)
+        .putString(CleanupEffectWork.RESULT_CLEANUP_STRENGTH, key.cleanup.name)
+        .putBoolean(CleanupEffectWork.RESULT_NORMALIZED, key.normalized)
+        .putString(CleanupEffectWork.RESULT_ALGORITHM_VERSION, key.algorithmVersion)
         .build()
 
     private fun failure(message: String): Result =

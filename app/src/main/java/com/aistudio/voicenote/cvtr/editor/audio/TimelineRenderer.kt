@@ -15,6 +15,9 @@ import kotlin.math.ceil
 internal interface TimelineRenderer : AutoCloseable {
     fun render(session: EditorSession, startFrame: Long, frameCount: Int): ShortArray
 
+    /** Returns and clears a non-fatal warning raised while falling back to an original source. */
+    fun consumeWarning(): String? = null
+
     /** Invalidates decoder/effect state after a source or timeline mutation. */
     fun invalidate(sourceIds: Set<String> = emptySet())
 }
@@ -35,6 +38,7 @@ internal class DefaultTimelineRenderer(
     private val renderLock = Any()
     private var sessionId: String? = null
     private var closed = false
+    private var pendingWarning: String? = null
 
     override fun render(session: EditorSession, startFrame: Long, frameCount: Int): ShortArray {
         synchronized(renderLock) {
@@ -156,6 +160,7 @@ internal class DefaultTimelineRenderer(
                 val cacheStartFrame = clip.sourceStartMs * EDITOR_SAMPLE_RATE / 1_000L
                 return reader.read(sourceFrame - cacheStartFrame, frameCount)
             } catch (_: Throwable) {
+                pendingWarning = "Processed audio cache $cacheKey is unavailable; using the original source."
                 cacheReaders.remove(cacheKey)?.let { runCatching { it.close() } }
                 cacheReaderSources.remove(cacheKey)
             }
@@ -168,6 +173,10 @@ internal class DefaultTimelineRenderer(
             readers.remove(clip.source)?.let { runCatching { it.close() } }
             throw error
         }
+    }
+
+    override fun consumeWarning(): String? = synchronized(renderLock) {
+        pendingWarning.also { pendingWarning = null }
     }
 
     private fun cachedRangeFrames(clip: AudioClip): Long =

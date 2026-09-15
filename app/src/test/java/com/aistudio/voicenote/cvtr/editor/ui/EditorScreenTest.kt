@@ -29,6 +29,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -90,6 +92,32 @@ class EditorScreenTest {
 
         compose.onNodeWithTag("editor_export").assertIsEnabled().performClick()
         compose.onNodeWithTag("editor_export_name").assertIsDisplayed()
+    }
+
+    @Test
+    fun `cleanup toolbar opens sheet and dispatches selected clip target`() {
+        var editorState by mutableStateOf(stateWithTwoClips())
+        val intents = mutableListOf<EditorIntent>()
+        compose.setContent {
+            MyApplicationTheme {
+                EditorScreen(
+                    state = editorState,
+                    onIntent = { intent ->
+                        intents += intent
+                        if (intent is EditorIntent.ShowSheet) {
+                            editorState = editorState.copy(activeSheet = intent.sheet)
+                        }
+                    },
+                )
+            }
+        }
+
+        compose.onNodeWithTag("cleanup_toolbar").performClick()
+        compose.onNodeWithTag("cleanup_apply").performClick()
+
+        val cleanup = intents.filterIsInstance<EditorIntent.StartCleanup>().single()
+        assertEquals("clip-a", cleanup.targetClipId)
+        assertFalse(cleanup.wholeTrack)
     }
 
     @Test
