@@ -57,6 +57,7 @@ class ProcessedAudioCacheTest {
         // Simulating a failed worker by writing to a partial file and failing
         val partialFile = File(cacheDir, "${key.toFilename()}.partial")
         partialFile.writeText("corrupted data")
+        partialFile.setLastModified(System.currentTimeMillis() - ProcessedAudioCache.PARTIAL_RETENTION_MS - 1L)
         
         // The active cache should still be the original
         assertEquals(File(cacheDir, "${key.toFilename()}.pcm").absolutePath, cache.find(key)?.absolutePath)
@@ -65,6 +66,22 @@ class ProcessedAudioCacheTest {
         cache.clearPartials()
         assertTrue(cache.partialFiles().isEmpty())
         assertFalse(partialFile.exists())
+    }
+
+    @Test
+    fun `active partial survives cleanup and aged orphan is removed`() {
+        val active = File(cacheDir, "active.partial").apply {
+            writeText("worker output")
+            setLastModified(System.currentTimeMillis() - ProcessedAudioCache.PARTIAL_RETENTION_MS - 1L)
+        }
+
+        cache.registerActiveTemp(active)
+        cache.clearPartials()
+        assertTrue(active.exists())
+
+        cache.unregisterActiveTemp(active)
+        cache.clearPartials()
+        assertFalse(active.exists())
     }
 
     @Test
@@ -78,6 +95,20 @@ class ProcessedAudioCacheTest {
         
         assertNotNull(cache.find(referencedKey))
         assertNull(cache.find(unreferencedKey))
+    }
+
+    @Test
+    fun `retain count is shared across cache instances`() {
+        cache.commit(referencedKey, validFixture)
+        val secondCache = ProcessedAudioCache(cacheDir)
+        secondCache.retain(referencedKey)
+
+        cache.evictToSize(0)
+
+        assertNotNull(cache.find(referencedKey))
+        secondCache.release(referencedKey)
+        cache.evictToSize(0)
+        assertNull(cache.find(referencedKey))
     }
 
     @Test

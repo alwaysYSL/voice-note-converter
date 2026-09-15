@@ -13,15 +13,22 @@ import androidx.work.impl.utils.taskexecutor.TaskExecutor
 import com.google.common.util.concurrent.Futures
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertNotEquals
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import java.io.RandomAccessFile
 import java.util.UUID
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 
 @RunWith(RobolectricTestRunner::class)
 class CleanupEffectWorkerTest {
+    @get:Rule
+    val tempFolder = TemporaryFolder()
+
     @Test
     fun `worker fails if source uri is missing`() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
@@ -30,6 +37,23 @@ class CleanupEffectWorkerTest {
         val worker = CleanupEffectWorker(context, workerParameters(input))
         val result = worker.doWork()
         assertTrue(result is ListenableWorker.Result.Failure)
+    }
+
+    @Test
+    fun `source fingerprint hashes the full stream and ignores caller value`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val source = tempFolder.newFile("source.raw")
+        source.writeBytes(ByteArray(256 * 1024) { (it * 31).toByte() })
+
+        val sourceUri = source.toURI().toString()
+        val before = StableSourceFingerprint.compute(context, sourceUri, "source-fingerprint-v2:unverified")
+        RandomAccessFile(source, "rw").use { file ->
+            file.seek(source.length() / 2L)
+            file.writeByte(0x7f)
+        }
+        val after = StableSourceFingerprint.compute(context, sourceUri, "source-fingerprint-v2:unverified")
+
+        assertNotEquals(before, after)
     }
 
     private fun workerParameters(input: Data): WorkerParameters {

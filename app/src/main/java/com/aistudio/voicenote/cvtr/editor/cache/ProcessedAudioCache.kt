@@ -101,11 +101,12 @@ internal fun readValidatedCachedWav(
 }
 
 internal class ProcessedAudioCache(private val cacheDir: File) {
-    private val references = ConcurrentHashMap<String, Int>()
     private val accessClock = AtomicLong(System.currentTimeMillis())
+    private val rootState: SharedRootState
 
     init {
         check(cacheDir.exists() || cacheDir.mkdirs()) { "Unable to create cache directory" }
+        rootState = roots.computeIfAbsent(cacheDir.canonicalFile.path) { SharedRootState() }
     }
 
     /** Finds only a valid cache file and updates its persisted access time for LRU eviction. */
@@ -136,7 +137,7 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
         val metadata = readValidatedCachedWav(sourceFile, expectedSampleCount)
         require(metadata.sampleRate == EDITOR_SAMPLE_RATE)
         val active = activeFile(key)
-        val staging = File.createTempFile("${key.toFilename()}-", ".partial", cacheDir)
+        val staging = createActiveTemp("${key.toFilename()}-")
         try {
             sourceFile.inputStream().use { input ->
                 java.io.FileOutputStream(staging).use { output ->
@@ -155,22 +156,30 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
             runCatching { staging.delete() }
             throw error
         } finally {
+            unregisterActiveTemp(staging)
             runCatching { staging.delete() }
         }
     }
 
     fun retain(key: ProcessedAudioKey) {
-        references.compute(key.toFilename()) { _, count -> (count ?: 0) + 1 }
-    }
-
-    fun release(key: ProcessedAudioKey) {
-        references.compute(key.toFilename()) { _, count ->
-            val newCount = (count ?: 0) - 1
-            if (newCount <= 0) null else newCount
+        synchronized(rootState.lock) {
+            rootState.references[key.toFilename()] =
+                (rootState.references[key.toFilename()] ?: 0) + 1
         }
     }
 
-    fun isRetained(key: ProcessedAudioKey): Boolean = references.containsKey(key.toFilename())
+    fun release(key: ProcessedAudioKey) {
+        synchronized(rootState.lock) {
+            val filename = key.toFilename()
+            val newCount = (rootState.references[filename] ?: 0) - 1
+            if (newCount <= 0) rootState.references.remove(filename)
+            else rootState.references[filename] = newCount
+        }
+    }
+
+    fun isRetained(key: ProcessedAudioKey): Boolean = synchronized(rootState.lock) {
+        rootState.references.containsKey(key.toFilename())
+    }
 
     fun evictToSize(maxBytes: Long) {
         val files = cacheDir.listFiles { _, name -> name.endsWith(".pcm") }?.toList() ?: emptyList()
@@ -178,7 +187,10 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
         var currentSize = files.sumOf { it.length() }
         for (file in sortedFiles) {
             if (currentSize <= maxBytes) break
-            if (!references.containsKey(file.name.removeSuffix(".pcm"))) {
+            val retained = synchronized(rootState.lock) {
+                rootState.references.containsKey(file.name.removeSuffix(".pcm"))
+            }
+            if (!retained) {
                 currentSize -= file.length()
                 runCatching { file.delete() }
             }
@@ -188,8 +200,39 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
     fun partialFiles(): List<File> =
         cacheDir.listFiles { _, name -> name.endsWith(".partial") }?.toList() ?: emptyList()
 
-    fun clearPartials() {
-        partialFiles().forEach { runCatching { it.delete() } }
+    /** Creates and registers a worker-owned partial while holding the same root lock as cleanup. */
+    fun createActiveTemp(prefix: String): File = synchronized(rootState.lock) {
+        File.createTempFile(prefix, ".partial", cacheDir).also {
+            rootState.activeTemps += it.canonicalFile.path
+        }
+    }
+
+    fun registerActiveTemp(file: File) {
+        synchronized(rootState.lock) {
+            rootState.activeTemps += file.canonicalFile.path
+        }
+    }
+
+    fun unregisterActiveTemp(file: File) {
+        synchronized(rootState.lock) {
+            rootState.activeTemps -= file.canonicalFile.path
+        }
+    }
+
+    fun clearPartials(
+        maxAgeMs: Long = PARTIAL_RETENTION_MS,
+        nowMs: Long = System.currentTimeMillis(),
+    ) {
+        require(maxAgeMs >= 0L) { "maxAgeMs must be non-negative" }
+        val cutoff = nowMs - maxAgeMs
+        partialFiles().forEach { file ->
+            val active = synchronized(rootState.lock) {
+                rootState.activeTemps.contains(file.canonicalFile.path)
+            }
+            if (!active && file.lastModified() <= cutoff) {
+                runCatching { file.delete() }
+            }
+        }
     }
 
     private fun activeFile(key: ProcessedAudioKey): File =
@@ -234,5 +277,14 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
         const val KEY_FORMAT_VERSION = "processed-audio-key-v2"
         const val CACHE_ALGORITHM_VERSION = "cleanup-rnnoise-peak-v1"
         const val WAV_HEADER_BYTES = 44L
+        const val PARTIAL_RETENTION_MS = 24L * 60L * 60L * 1_000L
+
+        private val roots = ConcurrentHashMap<String, SharedRootState>()
+    }
+
+    private class SharedRootState {
+        val lock = Any()
+        val references = mutableMapOf<String, Int>()
+        val activeTemps = mutableSetOf<String>()
     }
 }

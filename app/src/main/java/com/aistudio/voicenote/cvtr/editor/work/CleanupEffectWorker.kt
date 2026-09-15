@@ -84,10 +84,8 @@ internal class CleanupEffectWorker(
         try {
             // Every worker attempt gets its own namespaced temporary files. A retry or a second
             // clip can never write into another attempt's in-progress output.
-            renderFile = File.createTempFile(
+            renderFile = cache.createActiveTemp(
                 "cleanup-${key.toFilename()}-${id}-",
-                ".partial",
-                cacheDir,
             )
             renderPass(
                 output = renderFile,
@@ -98,10 +96,8 @@ internal class CleanupEffectWorker(
             )
 
             val finalFile = if (normalized) {
-                normalizedFile = File.createTempFile(
+                normalizedFile = cache.createActiveTemp(
                     "cleanup-normalized-${key.toFilename()}-${id}-",
-                    ".partial",
-                    cacheDir,
                 )
                 normalizePass(renderFile, normalizedFile!!, totalFrames)
                 normalizedFile!!
@@ -119,8 +115,14 @@ internal class CleanupEffectWorker(
         } catch (error: Throwable) {
             failure(error.message ?: "Cleanup render failed")
         } finally {
-            renderFile?.let { runCatching { it.delete() } }
-            normalizedFile?.let { runCatching { it.delete() } }
+            renderFile?.let {
+                cache.unregisterActiveTemp(it)
+                runCatching { it.delete() }
+            }
+            normalizedFile?.let {
+                cache.unregisterActiveTemp(it)
+                runCatching { it.delete() }
+            }
         }
     }
 
@@ -133,13 +135,13 @@ internal class CleanupEffectWorker(
     ) {
         val reader = MediaCodecPcmSourceReaderFactory(applicationContext)
             .open(AudioSourceRef(sourceUri))
-        val noiseProcessor = cleanupStrength
-            .takeUnless { it == CleanupStrength.OFF }
-            ?.let { RnNoiseProcessor() }
         var framesRead = 0L
         var framesWritten = 0L
-        try {
-            reader.use { source ->
+        reader.use { source ->
+            val noiseProcessor = cleanupStrength
+                .takeUnless { it == CleanupStrength.OFF }
+                ?.let { RnNoiseProcessor() }
+            try {
                 FileOutputStream(output).use { stream ->
                     stream.write(ByteArray(WAV_HEADER_BYTES))
                     while (framesRead < totalFrames) {
@@ -168,20 +170,22 @@ internal class CleanupEffectWorker(
                     stream.flush()
                     stream.fd.sync()
                 }
+            } finally {
+                noiseProcessor?.close()
             }
-            writeWavHeader(output, framesWritten)
-        } finally {
-            noiseProcessor?.close()
         }
+        writeWavHeader(output, framesWritten)
     }
 
-    private fun normalizePass(input: File, output: File, expectedFrames: Long): File {
+    private suspend fun normalizePass(input: File, output: File, expectedFrames: Long): File {
         val metadata = readValidatedCachedWav(input, expectedFrames)
+        checkActive()
         val stats = PeakNormalizer.analyze(readWavChunks(input, metadata.dataSize))
         var framesWritten = 0L
         FileOutputStream(output).use { stream ->
             stream.write(ByteArray(WAV_HEADER_BYTES))
             for (chunk in readWavChunks(input, metadata.dataSize)) {
+                checkActive()
                 val normalized = PeakNormalizer.apply(chunk, stats)
                 framesWritten += writeSamples(stream, normalized, expectedFrames - framesWritten)
             }
@@ -304,33 +308,36 @@ private fun Long.checkedAddForEstimate(value: Long): Long =
     if (value < 0L || this > Long.MAX_VALUE - value) Long.MAX_VALUE else this + value
 
 /** Stable content-aware fingerprint without retaining an entire media file in memory. */
-private object StableSourceFingerprint {
+internal object StableSourceFingerprint {
     private const val VERSION = "source-fingerprint-v2"
-    private const val SAMPLE_BYTES = 64 * 1024
+    private const val HASH_BUFFER_BYTES = 64 * 1024
 
+    @Suppress("UNUSED_PARAMETER")
     fun compute(context: Context, sourceUri: String, requested: String): String {
-        if (requested.startsWith("$VERSION:")) return requested
         val digest = MessageDigest.getInstance("SHA-256")
         val uri = Uri.parse(sourceUri)
         val metadata = queryMetadata(context, uri, sourceUri)
-        digest.update("$VERSION|$sourceUri|$metadata".toByteArray(Charsets.UTF_8))
+        val canonicalPrefix =
+            "$VERSION|${ProcessedAudioCache.KEY_FORMAT_VERSION}|" +
+                "${ProcessedAudioCache.CACHE_ALGORITHM_VERSION}|" +
+                "${canonicalField("uri", sourceUri)}|" +
+                "${canonicalField("metadata", metadata)}|content="
+        digest.update(canonicalPrefix.toByteArray(Charsets.UTF_8))
         runCatching {
-            openStream(context, uri, sourceUri)?.use { stream ->
-                val head = readAtMost(stream, SAMPLE_BYTES)
-                digest.update("|head|".toByteArray(Charsets.UTF_8))
-                digest.update(head)
-                val size = metadata.substringBefore('|').toLongOrNull()
-                if (size != null && size > SAMPLE_BYTES) {
-                    // The stream is positioned after the head sample. Skip to the start of the
-                    // tail, leaving one bounded sample at each end of the source.
-                    skipFully(stream, (size - 2L * SAMPLE_BYTES).coerceAtLeast(0L))
-                    val tail = readAtMost(stream, SAMPLE_BYTES)
-                    digest.update("|tail|".toByteArray(Charsets.UTF_8))
-                    digest.update(tail)
+            val stream = openStream(context, uri, sourceUri)
+                ?: throw IOException("Unable to open source for fingerprint")
+            stream.use { input ->
+                val buffer = ByteArray(HASH_BUFFER_BYTES)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    if (read == 0) continue
+                    digest.update(buffer, 0, read)
                 }
             }
         }.onFailure {
-            // Metadata remains a stable identity; decoder failure is reported by the render pass.
+            // The caller-supplied fingerprint is deliberately ignored. Decoder/render failure
+            // remains the source of truth when a source cannot be read for identity computation.
             digest.update("|unreadable|".toByteArray(Charsets.UTF_8))
         }
         return "$VERSION:" + digest.digest().toHex()
@@ -338,50 +345,46 @@ private object StableSourceFingerprint {
 
     private fun queryMetadata(context: Context, uri: Uri, fallback: String): String {
         val file = if (uri.scheme.isNullOrBlank()) File(fallback) else null
-        val size = file?.takeIf { it.isFile }?.length()
-            ?: runCatching {
-                context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
-                    ?.use { cursor ->
-                        if (cursor.moveToFirst()) cursor.getLong(0).takeIf { it >= 0L } else null
+        var size = file?.takeIf { it.isFile }?.length()
+        var displayName = file?.takeIf { it.isFile }?.name.orEmpty()
+        if (size == null || displayName.isEmpty()) {
+            runCatching {
+                context.contentResolver.query(
+                    uri,
+                    arrayOf(OpenableColumns.SIZE, OpenableColumns.DISPLAY_NAME),
+                    null,
+                    null,
+                    null,
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                        val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (size == null && sizeIndex >= 0) {
+                            size = cursor.getLong(sizeIndex).takeIf { it >= 0L }
+                        }
+                        if (displayName.isEmpty() && nameIndex >= 0 && !cursor.isNull(nameIndex)) {
+                            displayName = cursor.getString(nameIndex).orEmpty()
+                        }
                     }
-            }.getOrNull()
-            ?: -1L
+                }
+            }
+        }
         val modified = file?.takeIf { it.isFile }?.lastModified() ?: 0L
         val type = runCatching { context.contentResolver.getType(uri) }.getOrNull().orEmpty()
-        return "$size|$modified|$type"
+        return listOf(
+            "size=${size ?: -1L}",
+            "modified=$modified",
+            canonicalField("mime", type),
+            canonicalField("displayName", displayName),
+        ).joinToString("|")
     }
 
     private fun openStream(context: Context, uri: Uri, fallback: String): InputStream? =
         if (uri.scheme.isNullOrBlank()) File(fallback).inputStream() else
             context.contentResolver.openInputStream(uri)
 
-    private fun readAtMost(stream: InputStream, maxBytes: Int): ByteArray {
-        val output = java.io.ByteArrayOutputStream(maxBytes)
-        val buffer = ByteArray(8 * 1024)
-        var remaining = maxBytes
-        while (remaining > 0) {
-            val read = stream.read(buffer, 0, minOf(buffer.size, remaining))
-            if (read < 0) break
-            if (read == 0) continue
-            output.write(buffer, 0, read)
-            remaining -= read
-        }
-        return output.toByteArray()
-    }
-
-    private fun skipFully(stream: InputStream, count: Long) {
-        var remaining = count
-        while (remaining > 0L) {
-            val skipped = stream.skip(remaining)
-            if (skipped > 0L) {
-                remaining -= skipped
-            } else if (stream.read() < 0) {
-                return
-            } else {
-                remaining--
-            }
-        }
-    }
+    private fun canonicalField(name: String, value: String): String =
+        "$name=${value.length}:$value"
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 }

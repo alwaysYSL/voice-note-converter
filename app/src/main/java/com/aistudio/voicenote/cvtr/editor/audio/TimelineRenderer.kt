@@ -142,19 +142,22 @@ internal class DefaultTimelineRenderer(
     private fun read(clip: AudioClip, sourceFrame: Long, frameCount: Int): ShortArray {
         val cacheKey = clip.effects.processedCacheKey
         if (cacheKey != null && cacheDir != null) {
-            val reader = cacheReaders.getOrPut(cacheKey) {
-                CachedPcmSourceReader(File(cacheDir, "$cacheKey.pcm"))
-            }
-            cacheReaderSources.getOrPut(cacheKey) { LinkedHashSet() }.add(clip.source.uri)
             try {
+                // Construct and validate inside the fallback boundary. A cache can be evicted
+                // between timeline planning and this read; that must simply reopen the source.
+                val reader = cacheReaders.getOrPut(cacheKey) {
+                    CachedPcmSourceReader(
+                        File(cacheDir, "$cacheKey.pcm"),
+                        expectedRangeFrames = cachedRangeFrames(clip),
+                    )
+                }
+                cacheReaderSources.getOrPut(cacheKey) { LinkedHashSet() }.add(clip.source.uri)
                 // cache stores from sourceStartMs
                 val cacheStartFrame = clip.sourceStartMs * EDITOR_SAMPLE_RATE / 1_000L
                 return reader.read(sourceFrame - cacheStartFrame, frameCount)
-            } catch (error: Throwable) {
+            } catch (_: Throwable) {
                 cacheReaders.remove(cacheKey)?.let { runCatching { it.close() } }
                 cacheReaderSources.remove(cacheKey)
-                // fallback to source?
-                // we should probably just fallback if cache read fails
             }
         }
 
@@ -166,6 +169,11 @@ internal class DefaultTimelineRenderer(
             throw error
         }
     }
+
+    private fun cachedRangeFrames(clip: AudioClip): Long =
+        (clip.sourceEndMs - clip.sourceStartMs)
+            .coerceAtLeast(0L)
+            .let { durationMs -> durationMs * EDITOR_SAMPLE_RATE / 1_000L }
 
     override fun invalidate(sourceIds: Set<String>) {
         synchronized(renderLock) {
@@ -212,30 +220,34 @@ internal class DefaultTimelineRenderer(
     }
 }
 
-internal class CachedPcmSourceReader(private val file: File) : PcmSourceReader {
+internal class CachedPcmSourceReader(
+    private val file: File,
+    expectedRangeFrames: Long? = null,
+) : PcmSourceReader {
     override val sampleRate: Int = EDITOR_SAMPLE_RATE
     private var raf: java.io.RandomAccessFile? = null
     private var closed = false
-    private val metadata = readValidatedCachedWav(file)
+    private val metadata = readValidatedCachedWav(file, expectedRangeFrames)
 
     override fun read(sourceFrame: Long, frameCount: Int): ShortArray {
         if (closed) throw IllegalStateException("closed")
+        if (sourceFrame < 0L || frameCount < 0) throw IllegalArgumentException("Invalid cache read")
+        val requestedEnd = sourceFrame.checkedAdd(frameCount.toLong())
+        if (requestedEnd > metadata.sampleCount) {
+            throw IOException("Cached PCM ended before the requested range")
+        }
+        if (frameCount == 0) return ShortArray(0)
         if (raf == null) {
             raf = java.io.RandomAccessFile(file, "r")
         }
         val raf = this.raf!!
-        
-        if (sourceFrame < 0L || frameCount < 0) throw IllegalArgumentException("Invalid cache read")
-        val offset = 44L + sourceFrame * 2L
-        if (offset >= raf.length()) return ShortArray(0)
+        val offset = 44L + sourceFrame.checkedMultiply(2L)
 
         raf.seek(offset)
-        val availableFrames = ((metadata.dataSize - sourceFrame * 2L).coerceAtLeast(0L) / 2L)
-        val toRead = minOf(frameCount.toLong(), availableFrames).toInt()
-        if (toRead <= 0) return ShortArray(0)
+        val toRead = minOf(frameCount, MAX_PCM_READ_FRAMES)
 
         val output = ShortArray(toRead)
-        val bytes = ByteArray(minOf(MAX_PCM_READ_FRAMES, toRead) * 2)
+        val bytes = ByteArray(toRead * 2)
         var framesRead = 0
         while (framesRead < toRead) {
             val requestedBytes = minOf(bytes.size, (toRead - framesRead) * 2)
@@ -258,6 +270,14 @@ internal class CachedPcmSourceReader(private val file: File) : PcmSourceReader {
         }
         return output
     }
+
+    private fun Long.checkedAdd(value: Long): Long =
+        if (value < 0L || this > Long.MAX_VALUE - value) Long.MAX_VALUE else this + value
+
+    private fun Long.checkedMultiply(value: Long): Long =
+        if (value < 0L || this > Long.MAX_VALUE / value) {
+            throw IOException("Cached PCM offset overflow")
+        } else this * value
 
     override fun close() {
         if (closed) return

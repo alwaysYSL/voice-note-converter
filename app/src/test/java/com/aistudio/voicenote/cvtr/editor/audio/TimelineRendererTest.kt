@@ -2,13 +2,24 @@ package com.aistudio.voicenote.cvtr.editor.audio
 
 import com.aistudio.voicenote.cvtr.editor.model.AudioClip
 import com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef
+import com.aistudio.voicenote.cvtr.editor.model.ClipEffects
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
 import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.File
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class TimelineRendererTest {
+    @get:Rule
+    val tempFolder = TemporaryFolder()
+
     @Test
     fun `renderer mixes only clips active in requested window`() {
         val opened = mutableListOf<String>()
@@ -86,6 +97,60 @@ class TimelineRendererTest {
         fractionalRenderer.close()
     }
 
+    @Test
+    fun `cached reader caps reads rejects short data and renderer falls back`() {
+        val cacheDir = tempFolder.newFolder("processed")
+        val valid = tempFolder.newFile("valid.pcm")
+        writeWav(valid, MAX_PCM_READ_FRAMES + 100)
+        val reader = CachedPcmSourceReader(valid, expectedRangeFrames = (MAX_PCM_READ_FRAMES + 100).toLong())
+
+        assertEquals(MAX_PCM_READ_FRAMES, reader.read(0L, MAX_PCM_READ_FRAMES + 100).size)
+        assertThrows(IOException::class.java) { reader.read(MAX_PCM_READ_FRAMES + 99L, 2) }
+        reader.close()
+
+        val short = tempFolder.newFile("short.pcm")
+        writeWav(short, 4)
+        val shortBytes = short.readBytes()
+        ByteBuffer.wrap(shortBytes).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putInt(4, getInt(4) + 2)
+            putInt(40, getInt(40) + 2)
+        }
+        short.writeBytes(shortBytes)
+        assertThrows(IOException::class.java) { CachedPcmSourceReader(short, expectedRangeFrames = 5L) }
+
+        val brokenKey = "broken-cache"
+        File(cacheDir, "$brokenKey.pcm").writeBytes(ByteArray(44))
+        val opened = mutableListOf<String>()
+        val renderer = DefaultTimelineRenderer(
+            sourceFactory = PcmSourceReaderFactory { source ->
+                opened += source.uri
+                object : PcmSourceReader {
+                    override val sampleRate: Int = EDITOR_SAMPLE_RATE
+                    override fun read(sourceFrame: Long, frameCount: Int): ShortArray =
+                        ShortArray(frameCount) { 7 }
+                    override fun close() = Unit
+                }
+            },
+            cacheDir = cacheDir,
+        )
+        val clip = AudioClip(
+            id = "cached",
+            source = AudioSourceRef("voice", durationMs = 20L),
+            sourceStartMs = 0L,
+            sourceEndMs = 20L,
+            timelineStartMs = 0L,
+            effects = ClipEffects(processedCacheKey = brokenKey),
+        )
+        val pcm = renderer.render(
+            EditorSession("cache-fallback", listOf(EditorTrack("track", "Track", clips = listOf(clip)))),
+            0L,
+            960,
+        )
+        assertEquals(listOf("voice"), opened)
+        assertTrue(pcm.all { it.toInt() == 7 })
+        renderer.close()
+    }
+
     private fun clip(id: String, source: String, timelineStartMs: Long): AudioClip = AudioClip(
         id = id,
         source = AudioSourceRef(source, durationMs = 20L),
@@ -93,4 +158,23 @@ class TimelineRendererTest {
         sourceEndMs = 20L,
         timelineStartMs = timelineStartMs,
     )
+
+    private fun writeWav(file: File, sampleCount: Int) {
+        val bytes = ByteBuffer.allocate(44 + sampleCount * 2).order(ByteOrder.LITTLE_ENDIAN)
+        bytes.put("RIFF".toByteArray())
+        bytes.putInt(36 + sampleCount * 2)
+        bytes.put("WAVE".toByteArray())
+        bytes.put("fmt ".toByteArray())
+        bytes.putInt(16)
+        bytes.putShort(1)
+        bytes.putShort(1)
+        bytes.putInt(EDITOR_SAMPLE_RATE)
+        bytes.putInt(EDITOR_SAMPLE_RATE * 2)
+        bytes.putShort(2)
+        bytes.putShort(16)
+        bytes.put("data".toByteArray())
+        bytes.putInt(sampleCount * 2)
+        repeat(sampleCount) { bytes.putShort(1) }
+        file.writeBytes(bytes.array())
+    }
 }
