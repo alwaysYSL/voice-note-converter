@@ -78,3 +78,17 @@ Date: 2026-09-16 (Asia/Jakarta). No code or test sources were changed for this r
 | `git status --short --branch` | 0 | Clean `codex/audio-editor` worktree at HEAD `1ed3a84`. |
 
 Final rerun status remains **PARTIAL**: focused screenshot verification passes, but the broad gate is blocked by the cleanup/draft promotion timeout above. This rerun did not alter production or test code.
+
+## Final verification rerun at `20480b2`
+
+Date: 2026-09-16 (Asia/Jakarta). No production or test sources were changed for this verification.
+
+| Command | Exit | Evidence |
+|---|---:|---|
+| `gradlew.bat :app:testDebugUnitTest --tests "*.EditorFinalReviewStateTest.cleanup before save keeps cache key across private promotion and reopen" --no-daemon` | 0 | Isolated cleanup-cache regression test passed; 1 filtered test, `BUILD SUCCESSFUL` in 1m 18s. |
+| `gradlew.bat :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon` | 0 | `BUILD SUCCESSFUL in 1m 8s`; 217 tests, 0 failures, 1 skipped; 63 actionable tasks (18 executed, 45 up-to-date). Lint: 0 errors/72 warnings. Assemble completed. |
+| Focused Roborazzi editor/greeting verify | skipped | HEAD changes are limited to `EditorViewModel` and `EditorFinalReviewStateTest`; no screenshot-rendering code changed. The prior focused screenshot verify at `1ed3a84` passed. |
+| `git diff --check` | 0 | No whitespace errors before this report-only update. |
+| `git status --short --branch` | 0 | Clean worktree at HEAD `20480b2` before this report-only update. |
+
+Final status at `20480b2`: **PASS** for the isolated regression and full test/lint/assemble gate. Screenshot verification was intentionally skipped because the changed files cannot affect screenshot output.
