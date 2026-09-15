@@ -1,0 +1,167 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 5,
+    "identityHash": "5b65ad213cb3c793de23e0d155927459",
+    "entities": [
+      {
+        "tableName": "conversion_history",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `originalFileName` TEXT NOT NULL, `outputFileName` TEXT NOT NULL, `outputFilePath` TEXT NOT NULL, `durationSeconds` INTEGER NOT NULL, `fileSizeBytes` INTEGER NOT NULL, `waveform` TEXT NOT NULL, `bitrateKbps` INTEGER NOT NULL, `trimStartMs` INTEGER, `trimEndMs` INTEGER, `createdAt` INTEGER NOT NULL, `deliveryStatus` TEXT NOT NULL, `deliveryTarget` TEXT, `shareOpenedAt` INTEGER, `confirmedSentAt` INTEGER, `pitchSemitones` REAL, `editorSourceHistoryId` INTEGER)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "originalFileName",
+            "columnName": "originalFileName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outputFileName",
+            "columnName": "outputFileName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outputFilePath",
+            "columnName": "outputFilePath",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "durationSeconds",
+            "columnName": "durationSeconds",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fileSizeBytes",
+            "columnName": "fileSizeBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "waveform",
+            "columnName": "waveform",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bitrateKbps",
+            "columnName": "bitrateKbps",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "trimStartMs",
+            "columnName": "trimStartMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "trimEndMs",
+            "columnName": "trimEndMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliveryStatus",
+            "columnName": "deliveryStatus",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliveryTarget",
+            "columnName": "deliveryTarget",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "shareOpenedAt",
+            "columnName": "shareOpenedAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "confirmedSentAt",
+            "columnName": "confirmedSentAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "pitchSemitones",
+            "columnName": "pitchSemitones",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "editorSourceHistoryId",
+            "columnName": "editorSourceHistoryId",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_conversion_history_createdAt",
+            "unique": false,
+            "columnNames": [
+              "createdAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_conversion_history_createdAt` ON `${TABLE_NAME}` (`createdAt`)"
+          },
+          {
+            "name": "index_conversion_history_shareOpenedAt",
+            "unique": false,
+            "columnNames": [
+              "shareOpenedAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_conversion_history_shareOpenedAt` ON `${TABLE_NAME}` (`shareOpenedAt`)"
+          },
+          {
+            "name": "index_conversion_history_deliveryStatus",
+            "unique": false,
+            "columnNames": [
+              "deliveryStatus"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_conversion_history_deliveryStatus` ON `${TABLE_NAME}` (`deliveryStatus`)"
+          },
+          {
+            "name": "index_conversion_history_originalFileName",
+            "unique": false,
+            "columnNames": [
+              "originalFileName"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_conversion_history_originalFileName` ON `${TABLE_NAME}` (`originalFileName`)"
+          },
+          {
+            "name": "index_conversion_history_outputFileName",
+            "unique": false,
+            "columnNames": [
+              "outputFileName"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_conversion_history_outputFileName` ON `${TABLE_NAME}` (`outputFileName`)"
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '5b65ad213cb3c793de23e0d155927459')"
+    ]
+  }
+}

@@ -10,7 +10,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [ConversionHistory::class],
-    version = 4,
+    version = 5,
     exportSchema = true
 )
 @TypeConverters(DeliveryStatusConverter::class)
@@ -146,7 +146,35 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
-        val ALL_MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE `conversion_history` ADD COLUMN `editorSourceHistoryId` INTEGER"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_conversion_history_createdAt` " +
+                        "ON `conversion_history` (`createdAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_conversion_history_shareOpenedAt` " +
+                        "ON `conversion_history` (`shareOpenedAt`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_conversion_history_deliveryStatus` " +
+                        "ON `conversion_history` (`deliveryStatus`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_conversion_history_originalFileName` " +
+                        "ON `conversion_history` (`originalFileName`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_conversion_history_outputFileName` " +
+                        "ON `conversion_history` (`outputFileName`)"
+                )
+            }
+        }
+
+        val ALL_MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
 
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {

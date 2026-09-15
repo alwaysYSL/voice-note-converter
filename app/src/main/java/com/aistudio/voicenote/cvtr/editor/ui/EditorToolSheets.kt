@@ -292,6 +292,7 @@ internal fun EditorBottomActions(
     session: EditorSession,
     canUndo: Boolean,
     canRedo: Boolean,
+    exportState: EditorExportUiState = EditorExportUiState(),
     onIntent: (EditorIntent) -> Unit,
     onPickTrack: () -> Unit,
 ) {
@@ -332,15 +333,16 @@ internal fun EditorBottomActions(
             Text("Add track")
         }
         Button(
-            onClick = {},
-            enabled = false,
+            onClick = { onIntent(EditorIntent.ShowExportSheet(true)) },
+            enabled = session.tracks.isNotEmpty() &&
+                exportState.status != EditorExportStatus.QUEUED &&
+                exportState.status != EditorExportStatus.RUNNING,
             modifier = Modifier
                 .weight(1f)
                 .heightIn(min = 48.dp)
-                .testTag("editor_export_disabled")
+                .testTag("editor_export")
                 .semantics {
-                    contentDescription = "Export disabled until Phase 2 audio rendering is connected"
-                    stateDescription = "Disabled until Phase 2"
+                    contentDescription = "Export edited timeline"
                 },
         ) {
             Text("Export")

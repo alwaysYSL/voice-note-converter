@@ -73,12 +73,14 @@ internal object SoftwareOpusJni {
 
 internal class SoftwareOpusEncoder(
     private val oggWriter: OggOpusWriter,
-    private val checkActive: () -> Unit
+    private val checkActive: () -> Unit,
+    bitrateKbps: Int = 32,
 ) : StreamingAudioEncoder {
+    private val bitrate = bitrateKbps.coerceIn(32, 64) * 1_000
     private var handle = SoftwareOpusJni.nativeCreate(
         sampleRate = SAMPLE_RATE,
         channels = CHANNELS,
-        bitrate = BITRATE,
+        bitrate = bitrate,
         complexity = COMPLEXITY
     ).also { check(it != 0L) { "Encoder Opus software tidak dapat dibuat." } }
     private val frame = ShortArray(FRAME_SAMPLES)
@@ -150,7 +152,6 @@ internal class SoftwareOpusEncoder(
     private companion object {
         const val SAMPLE_RATE = 48_000
         const val CHANNELS = 1
-        const val BITRATE = 32_000
         const val COMPLEXITY = 5
         const val FRAME_SAMPLES = 960
         const val MAX_PACKET_BYTES = 4_000

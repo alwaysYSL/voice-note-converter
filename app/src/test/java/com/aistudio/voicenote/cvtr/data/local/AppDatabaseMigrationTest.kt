@@ -18,10 +18,12 @@ import org.robolectric.annotation.Config
 class AppDatabaseMigrationTest {
     private val context: Application = ApplicationProvider.getApplicationContext()
     private val databaseName = "migration_v3_test.db"
+    private val databaseV4Name = "migration_v4_test.db"
 
     @After
     fun tearDown() {
         context.deleteDatabase(databaseName)
+        context.deleteDatabase(databaseV4Name)
     }
 
     @Test
@@ -76,6 +78,57 @@ class AppDatabaseMigrationTest {
             assertEquals(5678L, row?.shareOpenedAt)
             assertNull(row?.confirmedSentAt)
             assertEquals(2.0f, row?.pitchSemitones)
+        } finally {
+            migrated.close()
+        }
+    }
+
+    @Test
+    fun `version four rows gain nullable editor source history`() {
+        context.deleteDatabase(databaseV4Name)
+        SQLiteDatabase.openOrCreateDatabase(context.getDatabasePath(databaseV4Name), null).use { database ->
+            database.execSQL(
+                """
+                CREATE TABLE `conversion_history` (
+                    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    `originalFileName` TEXT NOT NULL,
+                    `outputFileName` TEXT NOT NULL,
+                    `outputFilePath` TEXT NOT NULL,
+                    `durationSeconds` INTEGER NOT NULL,
+                    `fileSizeBytes` INTEGER NOT NULL,
+                    `waveform` TEXT NOT NULL,
+                    `bitrateKbps` INTEGER NOT NULL,
+                    `trimStartMs` INTEGER,
+                    `trimEndMs` INTEGER,
+                    `createdAt` INTEGER NOT NULL,
+                    `deliveryStatus` TEXT NOT NULL,
+                    `deliveryTarget` TEXT,
+                    `shareOpenedAt` INTEGER,
+                    `confirmedSentAt` INTEGER,
+                    `pitchSemitones` REAL
+                )
+                """.trimIndent()
+            )
+            database.execSQL(
+                """
+                INSERT INTO conversion_history (
+                    id, originalFileName, outputFileName, outputFilePath,
+                    durationSeconds, fileSizeBytes, waveform, bitrateKbps, createdAt,
+                    deliveryStatus
+                ) VALUES (9, 'source.ogg', 'edited.ogg', 'file:///edited.ogg', 1, 10, '[]', 64, 9, 'READY')
+                """.trimIndent()
+            )
+            database.version = 4
+        }
+
+        val migrated = Room.databaseBuilder(
+            context,
+            AppDatabase::class.java,
+            databaseV4Name
+        ).addMigrations(*AppDatabase.ALL_MIGRATIONS).build()
+        try {
+            val row = runBlocking { migrated.conversionHistoryDao().getById(9) }
+            assertNull(row?.editorSourceHistoryId)
         } finally {
             migrated.close()
         }

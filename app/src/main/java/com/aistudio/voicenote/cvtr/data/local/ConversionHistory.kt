@@ -46,5 +46,7 @@ data class ConversionHistory(
     val deliveryTarget: String? = null,
     val shareOpenedAt: Long? = null,
     val confirmedSentAt: Long? = null,
-    val pitchSemitones: Float? = null
+    val pitchSemitones: Float? = null,
+    /** Original history row when this item was produced by the editor. */
+    val editorSourceHistoryId: Long? = null
 )

@@ -71,14 +71,25 @@ class EditorScreenTest {
     }
 
     @Test
-    fun `export remains disabled until phase two renderer exists`() {
+    fun `export opens the export sheet when a timeline is available`() {
+        var editorState by mutableStateOf(stateWithTwoClips())
         compose.setContent {
             MyApplicationTheme {
-                EditorScreen(stateWithTwoClips(), {})
+                EditorScreen(state = editorState, onIntent = { intent ->
+                    if (intent == EditorIntent.ShowExportSheet(true)) {
+                        editorState = editorState.copy(
+                            export = editorState.export.copy(
+                                sheetOpen = true,
+                                outputName = "voice.ogg",
+                            )
+                        )
+                    }
+                })
             }
         }
 
-        compose.onNodeWithTag("editor_export_disabled").assertIsNotEnabled()
+        compose.onNodeWithTag("editor_export").assertIsEnabled().performClick()
+        compose.onNodeWithTag("editor_export_name").assertIsDisplayed()
     }
 
     @Test

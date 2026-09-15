@@ -4,7 +4,11 @@ import android.app.Application
 import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.Observer
 import androidx.lifecycle.viewModelScope
+import androidx.work.OneTimeWorkRequest
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import com.aistudio.voicenote.cvtr.audio.VoiceNoteConverter
 import com.aistudio.voicenote.cvtr.audio.WaveformCodec
 import com.aistudio.voicenote.cvtr.data.local.AppDatabase
@@ -26,6 +30,7 @@ import com.aistudio.voicenote.cvtr.editor.audio.DefaultTimelineRenderer
 import com.aistudio.voicenote.cvtr.editor.audio.EditorPlaybackState
 import com.aistudio.voicenote.cvtr.editor.audio.EditorPreviewEngine
 import com.aistudio.voicenote.cvtr.editor.audio.MediaCodecPcmSourceReaderFactory
+import com.aistudio.voicenote.cvtr.editor.audio.EditorRenderManifest
 import com.aistudio.voicenote.cvtr.editor.model.AudioClip
 import com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
@@ -34,6 +39,7 @@ import com.aistudio.voicenote.cvtr.editor.model.MAX_TIMELINE_MS
 import com.aistudio.voicenote.cvtr.editor.model.TimelineError
 import com.aistudio.voicenote.cvtr.editor.model.TimelineResult
 import com.aistudio.voicenote.cvtr.editor.model.value
+import com.aistudio.voicenote.cvtr.editor.work.EditorExportWork
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -49,6 +55,10 @@ import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.filterNotNull
 
 /** Metadata extracted before a source is added to the timeline. */
 internal data class AudioSourceInfo(
@@ -80,6 +90,54 @@ internal enum class EditorSheet {
     CLEANUP,
 }
 
+internal enum class EditorExportStatus {
+    IDLE,
+    QUEUED,
+    RUNNING,
+    SUCCEEDED,
+    FAILED,
+    CANCELLED,
+}
+
+internal data class EditorExportUiState(
+    val sheetOpen: Boolean = false,
+    val outputName: String = "",
+    val preset: com.aistudio.voicenote.cvtr.editor.model.ExportPreset =
+        com.aistudio.voicenote.cvtr.editor.model.ExportPreset.VOICE_NOTE_32,
+    val estimatedSizeBytes: Long = 0L,
+    val status: EditorExportStatus = EditorExportStatus.IDLE,
+    val progress: Float = 0f,
+    val resultUri: String? = null,
+    val resultHistoryId: Long? = null,
+    val error: String? = null,
+    val canRetry: Boolean = false,
+    val cleanupWarning: String? = null,
+)
+
+internal interface EditorExportScheduler {
+    fun enqueue(request: OneTimeWorkRequest): UUID
+    fun cancel(id: UUID)
+    fun observe(id: UUID): Flow<WorkInfo?>
+}
+
+private class WorkManagerEditorExportScheduler(
+    private val workManager: WorkManager,
+) : EditorExportScheduler {
+    override fun enqueue(request: OneTimeWorkRequest): UUID {
+        workManager.enqueue(request)
+        return request.id
+    }
+    override fun cancel(id: UUID) {
+        workManager.cancelWorkById(id)
+    }
+    override fun observe(id: UUID): Flow<WorkInfo?> = callbackFlow {
+        val liveData = workManager.getWorkInfoByIdLiveData(id)
+        val observer = Observer<WorkInfo?> { trySend(it) }
+        liveData.observeForever(observer)
+        awaitClose { liveData.removeObserver(observer) }
+    }
+}
+
 /** Intents shared by the editor shell and its timeline controls. */
 internal sealed interface EditorIntent {
     data object Play : EditorIntent
@@ -103,6 +161,12 @@ internal sealed interface EditorIntent {
     data object Redo : EditorIntent
     data object ClearMessage : EditorIntent
     data class ShowSheet(val sheet: EditorSheet?) : EditorIntent
+    data class ShowExportSheet(val open: Boolean) : EditorIntent
+    data class SetExportName(val name: String) : EditorIntent
+    data class SetExportPreset(val preset: com.aistudio.voicenote.cvtr.editor.model.ExportPreset) : EditorIntent
+    data object StartExport : EditorIntent
+    data object CancelExport : EditorIntent
+    data object RetryExport : EditorIntent
 }
 
 internal data class EditorUiState(
@@ -115,6 +179,7 @@ internal data class EditorUiState(
     val canRedo: Boolean = false,
     val importInFlight: Boolean = false,
     val playback: EditorPlaybackState = EditorPlaybackState(),
+    val export: EditorExportUiState = EditorExportUiState(),
 )
 
 /**
@@ -137,6 +202,9 @@ internal class EditorViewModel(
     private val previewEngine: EditorPreviewEngine = EditorPreviewEngine(
         renderer = DefaultTimelineRenderer(MediaCodecPcmSourceReaderFactory(application)),
     ),
+    private val exportScheduler: EditorExportScheduler = WorkManagerEditorExportScheduler(
+        WorkManager.getInstance(application)
+    ),
 ) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(EditorUiState())
     val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
@@ -146,6 +214,9 @@ internal class EditorViewModel(
     private val importsInFlight = AtomicInteger(0)
     private var commandHistory: CommandHistory? = null
     private var launchJob: Job
+    private var exportObservationJob: Job? = null
+    private var exportWorkId: UUID? = null
+    private var editorSourceHistoryId: Long? = null
 
     init {
         viewModelScope.launch {
@@ -229,6 +300,21 @@ internal class EditorViewModel(
             }
             EditorIntent.ClearMessage -> _uiState.update { it.copy(message = null) }
             is EditorIntent.ShowSheet -> _uiState.update { it.copy(activeSheet = intent.sheet) }
+            is EditorIntent.ShowExportSheet -> _uiState.update {
+                it.copy(export = it.export.copy(sheetOpen = intent.open))
+            }
+            is EditorIntent.SetExportName -> _uiState.update {
+                it.copy(export = it.export.copy(outputName = intent.name))
+            }
+            is EditorIntent.SetExportPreset -> _uiState.update {
+                it.copy(export = it.export.copy(
+                    preset = intent.preset,
+                    estimatedSizeBytes = estimateExportSize(it.session, intent.preset),
+                ))
+            }
+            EditorIntent.StartExport -> startExport()
+            EditorIntent.CancelExport -> cancelExport()
+            EditorIntent.RetryExport -> retryExport()
         }
     }
 
@@ -306,6 +392,7 @@ internal class EditorViewModel(
     }
 
     private suspend fun resolveConverted(source: EditorLaunchSource.Converted) {
+        editorSourceHistoryId = null
         val preferred = source.originalUri
         val resolved = if (preferred == null) {
             source.resultUri to sourceAnalyzer(source.resultUri)
@@ -334,6 +421,7 @@ internal class EditorViewModel(
     }
 
     private suspend fun resolveHistory(historyId: Long) {
+        editorSourceHistoryId = historyId
         val history = repository.getEditorSourceById(historyId)
         if (history == null) {
             showMessage(EditorMessage.HISTORY_NOT_FOUND)
@@ -392,8 +480,119 @@ internal class EditorViewModel(
                 session = session,
                 canUndo = false,
                 canRedo = false,
+                export = it.export.copy(
+                    outputName = defaultExportName(session),
+                    estimatedSizeBytes = estimateExportSize(session, it.export.preset),
+                ),
             )
         }
+    }
+
+    private fun startExport() {
+        val current = _uiState.value
+        if (current.export.status == EditorExportStatus.QUEUED ||
+            current.export.status == EditorExportStatus.RUNNING ||
+            current.session.tracks.isEmpty()
+        ) return
+        viewModelScope.launch(Dispatchers.IO) {
+            var manifest: File? = null
+            try {
+                val preset = current.export.preset
+                manifest = EditorRenderManifest.writePrivate(
+                    context = getApplication(),
+                    session = current.session,
+                    sourceHistoryId = editorSourceHistoryId,
+                    preset = preset,
+                )
+                val request = EditorExportWork.request(
+                    manifestPath = manifest.absolutePath,
+                    outputName = current.export.outputName.ifBlank { defaultExportName(current.session) },
+                    preset = preset,
+                )
+                val id = exportScheduler.enqueue(request)
+                exportWorkId = id
+                _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.QUEUED, error = null, canRetry = false, progress = 0f)) }
+                observeExport(id)
+            } catch (error: CancellationException) {
+                manifest?.delete()
+                throw error
+            } catch (error: Throwable) {
+                manifest?.delete()
+                _uiState.update {
+                    it.copy(export = it.export.copy(status = EditorExportStatus.FAILED, error = error.message ?: "Export failed", canRetry = true))
+                }
+            }
+        }
+    }
+
+    private fun observeExport(id: UUID) {
+        exportObservationJob?.cancel()
+        exportObservationJob = viewModelScope.launch {
+            exportScheduler.observe(id).filterNotNull().collect { info ->
+                val progress = info.progress.getFloat(EditorExportWork.PROGRESS, _uiState.value.export.progress)
+                when (info.state) {
+                    WorkInfo.State.ENQUEUED -> _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.QUEUED, progress = progress)) }
+                    WorkInfo.State.RUNNING -> _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.RUNNING, progress = progress)) }
+                    WorkInfo.State.SUCCEEDED -> {
+                        _uiState.update {
+                            it.copy(export = it.export.copy(
+                                status = EditorExportStatus.SUCCEEDED,
+                                progress = 1f,
+                                resultUri = info.outputData.getString(EditorExportWork.RESULT_URI),
+                                resultHistoryId = info.outputData.getLong(EditorExportWork.RESULT_HISTORY_ID, 0L).takeIf { id -> id > 0L },
+                                error = null,
+                                canRetry = false,
+                                cleanupWarning = info.outputData.getString(EditorExportWork.CLEANUP_WARNING),
+                            ))
+                        }
+                        exportObservationJob?.cancel()
+                    }
+                    WorkInfo.State.FAILED -> {
+                        _uiState.update {
+                            it.copy(export = it.export.copy(
+                                status = EditorExportStatus.FAILED,
+                                error = info.outputData.getString(EditorExportWork.ERROR_MESSAGE) ?: "Export failed",
+                                canRetry = info.outputData.getBoolean(EditorExportWork.CAN_RETRY, true),
+                                cleanupWarning = info.outputData.getString(EditorExportWork.CLEANUP_WARNING),
+                            ))
+                        }
+                        exportObservationJob?.cancel()
+                    }
+                    WorkInfo.State.CANCELLED -> {
+                        _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.CANCELLED)) }
+                        exportObservationJob?.cancel()
+                    }
+                    WorkInfo.State.BLOCKED -> Unit
+                }
+            }
+        }
+    }
+
+    private fun cancelExport() {
+        exportWorkId?.let(exportScheduler::cancel)
+    }
+
+    private fun retryExport() {
+        if (_uiState.value.export.canRetry || _uiState.value.export.status == EditorExportStatus.CANCELLED) {
+            _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.IDLE, error = null, progress = 0f)) }
+            startExport()
+        }
+    }
+
+    private fun defaultExportName(session: EditorSession): String {
+        val base = session.tracks.firstOrNull()?.name?.ifBlank { "voice_note" } ?: "voice_note"
+        return com.aistudio.voicenote.cvtr.audio.VoiceNoteStorage.sanitizeOutputFileName("${base}_edited.ogg")
+    }
+
+    private fun estimateExportSize(
+        session: EditorSession,
+        preset: com.aistudio.voicenote.cvtr.editor.model.ExportPreset,
+    ): Long {
+        val frames = session.tracks.asSequence().flatMap { it.clips.asSequence() }
+            .map { it.timelineEndMs.coerceAtLeast(0L) }
+            .maxOrNull()?.times(48L) ?: 0L
+        val bitrate = if (preset == com.aistudio.voicenote.cvtr.editor.model.ExportPreset.HIGH_QUALITY_64) 64_000L else 32_000L
+        return frames * bitrate / 48_000L / 8L + 512L
     }
 
     private fun seek(positionMs: Long) {
