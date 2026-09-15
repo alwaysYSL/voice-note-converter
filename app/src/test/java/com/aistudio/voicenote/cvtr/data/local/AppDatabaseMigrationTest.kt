@@ -12,6 +12,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import androidx.sqlite.db.SupportSQLiteDatabase
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -130,6 +131,57 @@ class AppDatabaseMigrationTest {
             val row = runBlocking { migrated.conversionHistoryDao().getById(9) }
             assertNull(row?.editorSourceHistoryId)
             assertNull(row?.editorExportAttemptId)
+        } finally {
+            migrated.close()
+        }
+    }
+
+    @Test
+    fun `version five gains normalized editor draft tables`() {
+        context.deleteDatabase(databaseName)
+        SQLiteDatabase.openOrCreateDatabase(context.getDatabasePath(databaseName), null).use { database ->
+            database.execSQL(
+                """
+                CREATE TABLE `conversion_history` (
+                    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    `originalFileName` TEXT NOT NULL,
+                    `outputFileName` TEXT NOT NULL,
+                    `outputFilePath` TEXT NOT NULL,
+                    `durationSeconds` INTEGER NOT NULL,
+                    `fileSizeBytes` INTEGER NOT NULL,
+                    `waveform` TEXT NOT NULL,
+                    `bitrateKbps` INTEGER NOT NULL,
+                    `trimStartMs` INTEGER,
+                    `trimEndMs` INTEGER,
+                    `createdAt` INTEGER NOT NULL,
+                    `deliveryStatus` TEXT NOT NULL,
+                    `deliveryTarget` TEXT,
+                    `shareOpenedAt` INTEGER,
+                    `confirmedSentAt` INTEGER,
+                    `pitchSemitones` REAL,
+                    `editorSourceHistoryId` INTEGER,
+                    `editorExportAttemptId` TEXT
+                )
+                """.trimIndent()
+            )
+            database.version = 5
+        }
+
+        val migrated = Room.databaseBuilder(
+            context,
+            AppDatabase::class.java,
+            databaseName
+        ).addMigrations(*AppDatabase.ALL_MIGRATIONS).build()
+        try {
+            val tables = mutableSetOf<String>()
+            migrated.openHelper.writableDatabase.query(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).use { cursor ->
+                while (cursor.moveToNext()) tables += cursor.getString(0)
+            }
+            assertEquals(true, tables.contains("editor_drafts"))
+            assertEquals(true, tables.contains("editor_draft_tracks"))
+            assertEquals(true, tables.contains("editor_draft_clips"))
         } finally {
             migrated.close()
         }

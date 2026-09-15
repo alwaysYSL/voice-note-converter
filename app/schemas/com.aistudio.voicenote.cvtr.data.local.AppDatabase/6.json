@@ -1,0 +1,484 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 6,
+    "identityHash": "fb9196522969cb175f8dd4eb4180a6d0",
+    "entities": [
+      {
+        "tableName": "conversion_history",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `originalFileName` TEXT NOT NULL, `outputFileName` TEXT NOT NULL, `outputFilePath` TEXT NOT NULL, `durationSeconds` INTEGER NOT NULL, `fileSizeBytes` INTEGER NOT NULL, `waveform` TEXT NOT NULL, `bitrateKbps` INTEGER NOT NULL, `trimStartMs` INTEGER, `trimEndMs` INTEGER, `createdAt` INTEGER NOT NULL, `deliveryStatus` TEXT NOT NULL, `deliveryTarget` TEXT, `shareOpenedAt` INTEGER, `confirmedSentAt` INTEGER, `pitchSemitones` REAL, `editorSourceHistoryId` INTEGER, `editorExportAttemptId` TEXT)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "originalFileName",
+            "columnName": "originalFileName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outputFileName",
+            "columnName": "outputFileName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outputFilePath",
+            "columnName": "outputFilePath",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "durationSeconds",
+            "columnName": "durationSeconds",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fileSizeBytes",
+            "columnName": "fileSizeBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "waveform",
+            "columnName": "waveform",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bitrateKbps",
+            "columnName": "bitrateKbps",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "trimStartMs",
+            "columnName": "trimStartMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "trimEndMs",
+            "columnName": "trimEndMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliveryStatus",
+            "columnName": "deliveryStatus",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliveryTarget",
+            "columnName": "deliveryTarget",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "shareOpenedAt",
+            "columnName": "shareOpenedAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "confirmedSentAt",
+            "columnName": "confirmedSentAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "pitchSemitones",
+            "columnName": "pitchSemitones",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "editorSourceHistoryId",
+            "columnName": "editorSourceHistoryId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "editorExportAttemptId",
+            "columnName": "editorExportAttemptId",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_conversion_history_createdAt",
+            "unique": false,
+            "columnNames": [
+              "createdAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_conversion_history_createdAt` ON `${TABLE_NAME}` (`createdAt`)"
+          },
+          {
+            "name": "index_conversion_history_shareOpenedAt",
+            "unique": false,
+            "columnNames": [
+              "shareOpenedAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_conversion_history_shareOpenedAt` ON `${TABLE_NAME}` (`shareOpenedAt`)"
+          },
+          {
+            "name": "index_conversion_history_deliveryStatus",
+            "unique": false,
+            "columnNames": [
+              "deliveryStatus"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_conversion_history_deliveryStatus` ON `${TABLE_NAME}` (`deliveryStatus`)"
+          },
+          {
+            "name": "index_conversion_history_originalFileName",
+            "unique": false,
+            "columnNames": [
+              "originalFileName"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_conversion_history_originalFileName` ON `${TABLE_NAME}` (`originalFileName`)"
+          },
+          {
+            "name": "index_conversion_history_outputFileName",
+            "unique": false,
+            "columnNames": [
+              "outputFileName"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_conversion_history_outputFileName` ON `${TABLE_NAME}` (`outputFileName`)"
+          },
+          {
+            "name": "index_conversion_history_editorExportAttemptId",
+            "unique": true,
+            "columnNames": [
+              "editorExportAttemptId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_conversion_history_editorExportAttemptId` ON `${TABLE_NAME}` (`editorExportAttemptId`)"
+          }
+        ]
+      },
+      {
+        "tableName": "editor_drafts",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `exportPreset` TEXT NOT NULL, `selectedClipId` TEXT, `playheadMs` INTEGER NOT NULL, `sourceVersion` TEXT NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "createdAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "updatedAt",
+            "columnName": "updatedAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "exportPreset",
+            "columnName": "exportPreset",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "selectedClipId",
+            "columnName": "selectedClipId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "playheadMs",
+            "columnName": "playheadMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceVersion",
+            "columnName": "sourceVersion",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "editor_draft_tracks",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`draftId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `sortOrder` INTEGER NOT NULL, `name` TEXT NOT NULL, `volume` REAL NOT NULL, `muted` INTEGER NOT NULL, PRIMARY KEY(`draftId`, `trackId`), FOREIGN KEY(`draftId`) REFERENCES `editor_drafts`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "draftId",
+            "columnName": "draftId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "trackId",
+            "columnName": "trackId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sortOrder",
+            "columnName": "sortOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "volume",
+            "columnName": "volume",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "muted",
+            "columnName": "muted",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "draftId",
+            "trackId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_editor_draft_tracks_draftId",
+            "unique": false,
+            "columnNames": [
+              "draftId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_editor_draft_tracks_draftId` ON `${TABLE_NAME}` (`draftId`)"
+          },
+          {
+            "name": "index_editor_draft_tracks_draftId_sortOrder",
+            "unique": false,
+            "columnNames": [
+              "draftId",
+              "sortOrder"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_editor_draft_tracks_draftId_sortOrder` ON `${TABLE_NAME}` (`draftId`, `sortOrder`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "editor_drafts",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "draftId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "editor_draft_clips",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`draftId` TEXT NOT NULL, `trackId` TEXT NOT NULL, `clipId` TEXT NOT NULL, `sourcePath` TEXT NOT NULL, `originalSourceUri` TEXT NOT NULL, `sourceFileName` TEXT NOT NULL, `sourceDurationMs` INTEGER NOT NULL, `sourceStartMs` INTEGER NOT NULL, `sourceEndMs` INTEGER NOT NULL, `timelineStartMs` INTEGER NOT NULL, `fadeInMs` INTEGER NOT NULL, `fadeOutMs` INTEGER NOT NULL, `gain` REAL NOT NULL, `pitchSemitones` REAL NOT NULL, `speed` REAL NOT NULL, `processedCacheKey` TEXT, `sortOrder` INTEGER NOT NULL, PRIMARY KEY(`draftId`, `clipId`), FOREIGN KEY(`draftId`) REFERENCES `editor_drafts`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`draftId`, `trackId`) REFERENCES `editor_draft_tracks`(`draftId`, `trackId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "draftId",
+            "columnName": "draftId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "trackId",
+            "columnName": "trackId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clipId",
+            "columnName": "clipId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourcePath",
+            "columnName": "sourcePath",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "originalSourceUri",
+            "columnName": "originalSourceUri",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceFileName",
+            "columnName": "sourceFileName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceDurationMs",
+            "columnName": "sourceDurationMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceStartMs",
+            "columnName": "sourceStartMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceEndMs",
+            "columnName": "sourceEndMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineStartMs",
+            "columnName": "timelineStartMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fadeInMs",
+            "columnName": "fadeInMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fadeOutMs",
+            "columnName": "fadeOutMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "gain",
+            "columnName": "gain",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pitchSemitones",
+            "columnName": "pitchSemitones",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "speed",
+            "columnName": "speed",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "processedCacheKey",
+            "columnName": "processedCacheKey",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "sortOrder",
+            "columnName": "sortOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "draftId",
+            "clipId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_editor_draft_clips_draftId",
+            "unique": false,
+            "columnNames": [
+              "draftId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_editor_draft_clips_draftId` ON `${TABLE_NAME}` (`draftId`)"
+          },
+          {
+            "name": "index_editor_draft_clips_draftId_trackId",
+            "unique": false,
+            "columnNames": [
+              "draftId",
+              "trackId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_editor_draft_clips_draftId_trackId` ON `${TABLE_NAME}` (`draftId`, `trackId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "editor_drafts",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "draftId"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          },
+          {
+            "table": "editor_draft_tracks",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "draftId",
+              "trackId"
+            ],
+            "referencedColumns": [
+              "draftId",
+              "trackId"
+            ]
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'fb9196522969cb175f8dd4eb4180a6d0')"
+    ]
+  }
+}
