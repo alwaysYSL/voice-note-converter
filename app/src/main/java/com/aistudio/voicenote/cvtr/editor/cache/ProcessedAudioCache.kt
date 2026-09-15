@@ -107,6 +107,9 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
     private val rootState: SharedRootState
     private val sessionOwner = "session-${UUID.randomUUID()}"
 
+    /** Test seam for deterministic lease-delete failures. */
+    internal var leaseDeleteOverride: ((File) -> Boolean)? = null
+
     init {
         check(cacheDir.exists() || cacheDir.mkdirs()) { "Unable to create cache directory" }
         rootState = roots.computeIfAbsent(cacheDir.canonicalFile.path) { SharedRootState() }
@@ -206,15 +209,21 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
     }
 
     /** Repairs all editor-draft leases from Room truth while preserving pending crash protection. */
-    fun reconcileDraftLeases(expectedByDraft: Map<String, Map<String, Int>>) {
+    fun reconcileDraftLeases(expectedByDraft: Map<String, Map<String, Int>>): Set<String> {
         synchronized(rootState.lock) {
+            val failures = linkedSetOf<String>()
             val normalizedExpected = expectedByDraft.mapValues { (_, values) ->
                 values.filterValues { it > 0 }
+            }
+            rootState.pendingLeaseDeletes.toList().forEach { leaseId ->
+                if (!removeLeaseLocked(leaseId)) failures += leaseId
             }
             val draftLeaseIds = rootState.leases.keys.filter { it.startsWith(DRAFT_LEASE_PREFIX) }
             draftLeaseIds.filter { leaseId ->
                 draftIdForLease(leaseId)?.let { it !in normalizedExpected } ?: false
-            }.forEach(::removeLeaseLocked)
+            }.forEach { leaseId ->
+                if (!removeLeaseLocked(leaseId)) failures += leaseId
+            }
             normalizedExpected.forEach { (draftId, filenames) ->
                 val canonical = "$DRAFT_LEASE_PREFIX$draftId"
                 try {
@@ -225,23 +234,24 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
                     rootState.leases.keys
                         .filter { it.startsWith("$canonical$DRAFT_PENDING_SUFFIX") }
                         .toList()
-                        .forEach(::removeLeaseLocked)
+                        .forEach { leaseId ->
+                            if (!removeLeaseLocked(leaseId)) failures += leaseId
+                        }
                 } catch (_: Throwable) {
                     // Keep the previous canonical and any pending lease. The draft remains
                     // protected and a later reconciliation can retry the exact transition.
+                    failures += canonical
                 }
             }
+            return failures
         }
     }
 
     /** Releases a durable export lease. Releasing twice is safe. */
-    fun releaseLease(attemptId: String) {
-        if (attemptId.isBlank()) return
+    fun releaseLease(attemptId: String): Boolean {
+        if (attemptId.isBlank()) return true
         synchronized(rootState.lock) {
-            rootState.leases.remove(attemptId)?.forEach { (name, count) ->
-                decrementReferenceLocked(name, count)
-            }
-            runCatching { leaseFile(attemptId).delete() }
+            return removeLeaseLocked(attemptId)
         }
     }
 
@@ -408,7 +418,10 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
             // Publish first. If this fails, old references and its lease file remain intact.
             writeLeaseLocked(attemptId, filenames)
         } else {
-            runCatching { leaseFile(attemptId).delete() }
+            if (!deleteLeaseFile(leaseFile(attemptId))) {
+                rootState.pendingLeaseDeletes += attemptId
+                throw IOException("Unable to delete cache lease $attemptId")
+            }
         }
         old?.forEach { (name, count) -> decrementReferenceLocked(name, count) }
         if (filenames.isEmpty()) {
@@ -419,13 +432,24 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
                 rootState.references[name] = (rootState.references[name] ?: 0) + count
             }
         }
+        rootState.pendingLeaseDeletes -= attemptId
     }
 
-    private fun removeLeaseLocked(attemptId: String) {
+    private fun removeLeaseLocked(attemptId: String): Boolean {
+        if (!deleteLeaseFile(leaseFile(attemptId))) {
+            rootState.pendingLeaseDeletes += attemptId
+            return false
+        }
         rootState.leases.remove(attemptId)?.forEach { (name, count) ->
             decrementReferenceLocked(name, count)
         }
-        runCatching { leaseFile(attemptId).delete() }
+        rootState.pendingLeaseDeletes -= attemptId
+        return true
+    }
+
+    private fun deleteLeaseFile(file: File): Boolean {
+        if (!file.exists()) return true
+        return runCatching { leaseDeleteOverride?.invoke(file) ?: file.delete() }.getOrDefault(false)
     }
 
     private fun draftIdForLease(leaseId: String): String? =
@@ -504,6 +528,7 @@ internal class ProcessedAudioCache(private val cacheDir: File) {
         val references = mutableMapOf<String, Int>()
         val ownerReferences = mutableMapOf<String, Map<String, Int>>()
         val leases = mutableMapOf<String, Map<String, Int>>()
+        val pendingLeaseDeletes = mutableSetOf<String>()
         var leasesLoaded = false
         val activeTemps = mutableSetOf<String>()
     }

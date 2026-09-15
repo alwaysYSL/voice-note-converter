@@ -126,6 +126,24 @@ class ProcessedAudioCacheTest {
     }
 
     @Test
+    fun `failed draft lease deletion stays protected until reconciliation retry`() {
+        val filename = referencedKey.toFilename()
+        cache.acquireLease("editor-draft:stale", mapOf(filename to 1))
+        var allowDelete = false
+        cache.leaseDeleteOverride = { if (allowDelete) it.delete() else false }
+
+        cache.releaseLease("editor-draft:stale")
+        assertTrue(cache.isRetained(referencedKey))
+        assertTrue(cache.reconcileDraftLeases(emptyMap()).contains("editor-draft:stale"))
+        assertTrue(cache.isRetained(referencedKey))
+
+        allowDelete = true
+        assertTrue(cache.reconcileDraftLeases(emptyMap()).isEmpty())
+        assertFalse(cache.isRetained(referencedKey))
+        cache.leaseDeleteOverride = null
+    }
+
+    @Test
     fun `startup removes aged orphan partials`() {
         val startupCacheDir = tempFolder.newFolder("startup-cache")
         val orphan = File(startupCacheDir, "orphan.partial").apply {

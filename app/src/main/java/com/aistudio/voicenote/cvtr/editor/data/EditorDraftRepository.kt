@@ -35,6 +35,11 @@ internal class CacheLeaseTransitionException(
     cause: Throwable,
 ) : IOException("Draft $draftId was committed with a pending cache lease repair", cause)
 
+internal class DraftReconciliationException(
+    val failedSourcePaths: List<String>,
+    val failedLeaseIds: Set<String>,
+) : IOException("Draft recovery is incomplete")
+
 /** Room snapshot plus private source versions. A save is the only operation that creates a row. */
 internal class EditorDraftRepository(
     private val database: AppDatabase,
@@ -74,105 +79,115 @@ internal class EditorDraftRepository(
             .distinctBy { it.uri }
             .toList()
         val stage = sourceStorage.stageSources(draftId, sourceInputs, version)
-        try {
-            sourceStorage.commitStage(stage)
-        } catch (error: Throwable) {
-            runCatching { stage.stagingDirectory.deleteRecursively() }
-            throw error
-        }
-        val createdAt = old?.draft?.createdAt ?: now()
-        val draftEntity = EditorDraftEntity(
-            id = draftId,
-            name = name.ifBlank { draftId },
-            createdAt = createdAt,
-            updatedAt = now(),
-            exportPreset = session.exportPreset.name,
-            selectedClipId = session.selectedClipId,
-            playheadMs = session.playheadMs.coerceAtLeast(0L),
-            sourceVersion = version,
-        )
-        val tracks = session.tracks.mapIndexed { index, track ->
-            EditorDraftTrackEntity(
-                draftId = draftId,
-                trackId = track.id,
-                sortOrder = index,
-                name = track.name,
-                volume = track.volume,
-                muted = track.muted,
+        return withDraftRootLock(sourceStorage.canonicalRootPath) {
+            try {
+                sourceStorage.commitStage(stage)
+            } catch (error: Throwable) {
+                reconciled = false
+                runCatching { stage.stagingDirectory.deleteRecursively() }
+                throw error
+            }
+            val createdAt = old?.draft?.createdAt ?: now()
+            val draftEntity = EditorDraftEntity(
+                id = draftId,
+                name = name.ifBlank { draftId },
+                createdAt = createdAt,
+                updatedAt = now(),
+                exportPreset = session.exportPreset.name,
+                selectedClipId = session.selectedClipId,
+                playheadMs = session.playheadMs.coerceAtLeast(0L),
+                sourceVersion = version,
             )
-        }
-        val clips = session.tracks.flatMap { track ->
-            track.clips.mapIndexed { index, clip ->
-                val previous = old?.clips?.firstOrNull { it.clipId == clip.id }
-                val unchangedSource = previous?.sourcePath == clip.source.uri
-                EditorDraftClipEntity(
+            val tracks = session.tracks.mapIndexed { index, track ->
+                EditorDraftTrackEntity(
                     draftId = draftId,
                     trackId = track.id,
-                    clipId = clip.id,
-                    sourcePath = stage.sourcePath(clip.source.uri),
-                    originalSourceUri = if (unchangedSource) {
-                        previous!!.originalSourceUri
-                    } else {
-                        clip.source.uri
-                    },
-                    sourceFileName = if (unchangedSource) {
-                        previous!!.sourceFileName
-                    } else {
-                        sourceName(clip.source.uri)
-                    },
-                    sourceDurationMs = clip.source.durationMs,
-                    sourceStartMs = clip.sourceStartMs,
-                    sourceEndMs = clip.sourceEndMs,
-                    timelineStartMs = clip.timelineStartMs,
-                    fadeInMs = clip.effects.fadeInMs,
-                    fadeOutMs = clip.effects.fadeOutMs,
-                    gain = clip.effects.gain,
-                    pitchSemitones = clip.effects.pitchSemitones,
-                    speed = clip.effects.speed,
-                    processedCacheKey = clip.effects.processedCacheKey,
                     sortOrder = index,
+                    name = track.name,
+                    volume = track.volume,
+                    muted = track.muted,
                 )
             }
-        }
-        val cacheReferences = clips.mapNotNull { it.processedCacheKey }
-            .groupingBy { it }
-            .eachCount()
-            .filterKeys(::isCacheFilename)
-        val provisionalLease = "${cacheLease(draftId)}:pending:$version"
-        var provisionalOwned = false
-        try {
-            processedAudioCache?.let {
-                it.acquireLease(provisionalLease, cacheReferences)
-                provisionalOwned = true
+            val clips = session.tracks.flatMap { track ->
+                track.clips.mapIndexed { index, clip ->
+                    val previous = old?.clips?.firstOrNull { it.clipId == clip.id }
+                    val unchangedSource = previous?.sourcePath == clip.source.uri
+                    EditorDraftClipEntity(
+                        draftId = draftId,
+                        trackId = track.id,
+                        clipId = clip.id,
+                        sourcePath = stage.sourcePath(clip.source.uri),
+                        originalSourceUri = if (unchangedSource) {
+                            previous!!.originalSourceUri
+                        } else {
+                            clip.source.uri
+                        },
+                        sourceFileName = if (unchangedSource) {
+                            previous!!.sourceFileName
+                        } else {
+                            sourceName(clip.source.uri)
+                        },
+                        sourceDurationMs = clip.source.durationMs,
+                        sourceStartMs = clip.sourceStartMs,
+                        sourceEndMs = clip.sourceEndMs,
+                        timelineStartMs = clip.timelineStartMs,
+                        fadeInMs = clip.effects.fadeInMs,
+                        fadeOutMs = clip.effects.fadeOutMs,
+                        gain = clip.effects.gain,
+                        pitchSemitones = clip.effects.pitchSemitones,
+                        speed = clip.effects.speed,
+                        processedCacheKey = clip.effects.processedCacheKey,
+                        sortOrder = index,
+                    )
+                }
             }
-            // The source version is already durable before this transaction can publish its path.
-            database.withTransaction {
-                dao.replaceSnapshot(draftEntity, tracks, clips)
+            val cacheReferences = clips.mapNotNull { it.processedCacheKey }
+                .groupingBy { it }
+                .eachCount()
+                .filterKeys(::isCacheFilename)
+            val provisionalLease = "${cacheLease(draftId)}:pending:$version"
+            var provisionalOwned = false
+            try {
+                processedAudioCache?.let {
+                    it.acquireLease(provisionalLease, cacheReferences)
+                    provisionalOwned = true
+                }
+                // The source version is already durable before this transaction can publish its path.
+                database.withTransaction {
+                    dao.replaceSnapshot(draftEntity, tracks, clips)
+                }
+            } catch (error: Throwable) {
+                // The old row and old version remain authoritative when Room rejects the update.
+                if (provisionalOwned && processedAudioCache?.releaseLease(provisionalLease) == false) {
+                    reconciled = false
+                }
+                runCatching { sourceStorage.deleteVersion(draftId, version) }
+                    .onFailure { reconciled = false }
+                throw error
             }
-        } catch (error: Throwable) {
-            // The old row and old version remain authoritative when Room rejects the update.
-            if (provisionalOwned) processedAudioCache?.releaseLease(provisionalLease)
-            runCatching { sourceStorage.deleteVersion(draftId, version) }
-            throw error
-        }
 
-        try {
-            processedAudioCache?.let { cache ->
-                // The provisional lease protects the new cache keys across the Room commit. The
-                // canonical lease replaces old keys only after the snapshot is durable.
-                cache.acquireLease(cacheLease(draftId), cacheReferences)
-                if (provisionalOwned) cache.releaseLease(provisionalLease)
+            try {
+                processedAudioCache?.let { cache ->
+                    // The provisional lease protects the new cache keys across the Room commit. The
+                    // canonical lease replaces old keys only after the snapshot is durable.
+                    cache.acquireLease(cacheLease(draftId), cacheReferences)
+                    if (provisionalOwned && !cache.releaseLease(provisionalLease)) {
+                        reconciled = false
+                        throw IOException("Unable to release provisional cache lease")
+                    }
+                }
+            } catch (error: Throwable) {
+                // Keep the provisional lease and surface repair-needed state; the new snapshot is
+                // never left without a durable cache protection lease.
+                reconciled = false
+                throw CacheLeaseTransitionException(draftId, error)
             }
-        } catch (error: Throwable) {
-            // Keep the provisional lease and surface repair-needed state; the new snapshot is
-            // never left without a durable cache protection lease.
-            reconciled = false
-            throw CacheLeaseTransitionException(draftId, error)
+            old?.draft?.sourceVersion?.takeIf { it != version }?.let { previousVersion ->
+                runCatching { sourceStorage.deleteVersion(draftId, previousVersion) }
+                    .onFailure { reconciled = false }
+            }
+            draftId
         }
-        old?.draft?.sourceVersion?.takeIf { it != version }?.let { previousVersion ->
-            runCatching { sourceStorage.deleteVersion(draftId, previousVersion) }
-        }
-        return draftId
     }
 
     suspend fun load(draftId: String): EditorSession? = withDraftLock(draftId) {
@@ -227,7 +242,7 @@ internal class EditorDraftRepository(
 
     suspend fun delete(draftId: String): Boolean = withDraftLock(draftId) {
         ensureReconciled()
-        deleteLocked(draftId)
+        withDraftRootLock(sourceStorage.canonicalRootPath) { deleteLocked(draftId) }
     }
 
     private suspend fun deleteLocked(draftId: String): Boolean {
@@ -235,11 +250,16 @@ internal class EditorDraftRepository(
         val snapshot = dao.loadSnapshot(draftId) ?: return false
         val deleted = database.withTransaction { dao.deleteSnapshot(draftId) }
         if (!deleted) return false
-        processedAudioCache?.releaseLease(cacheLease(draftId))
+        // Room is no longer authoritative for this draft; force the next operation to retry any
+        // source/lease cleanup that cannot complete in this process.
+        reconciled = false
+        val leaseReleased = processedAudioCache?.releaseLease(cacheLease(draftId)) ?: true
         // Database rows are gone before this exact canonical directory is removed. No path from
         // a row is ever used as a deletion target.
         sourceStorage.deleteDraftSources(snapshot.draft.id)
-        reconciled = false
+        if (!leaseReleased) {
+            throw DraftReconciliationException(emptyList(), setOf(cacheLease(draftId)))
+        }
         return true
     }
 
@@ -258,19 +278,24 @@ internal class EditorDraftRepository(
     }
 
     private suspend fun reconcileFromRoomTruth(): List<String> {
-        val drafts = dao.getAllDrafts()
-        val versions = drafts.associate { it.id to it.sourceVersion }
-        val deleted = sourceStorage.reconcileDraftSources(versions).toMutableList()
-        processedAudioCache?.reconcileDraftLeases(
-            drafts.associate { draft ->
-                draft.id to dao.getClips(draft.id)
-                    .mapNotNull { it.processedCacheKey }
-                    .groupingBy { it }
-                    .eachCount()
-                    .filterKeys(::isCacheFilename)
+        return withDraftRootLock(sourceStorage.canonicalRootPath) {
+            val drafts = dao.getAllDrafts()
+            val versions = drafts.associate { it.id to it.sourceVersion }
+            val sourceResult = sourceStorage.reconcileDraftSources(versions)
+            val leaseFailures = processedAudioCache?.reconcileDraftLeases(
+                drafts.associate { draft ->
+                    draft.id to dao.getClips(draft.id)
+                        .mapNotNull { it.processedCacheKey }
+                        .groupingBy { it }
+                        .eachCount()
+                        .filterKeys(::isCacheFilename)
+                }
+            ).orEmpty()
+            if (sourceResult.failedPaths.isNotEmpty() || leaseFailures.isNotEmpty()) {
+                throw DraftReconciliationException(sourceResult.failedPaths, leaseFailures)
             }
-        )
-        return deleted
+            sourceResult.deletedPaths
+        }
     }
 
     private fun toClip(entity: EditorDraftClipEntity): AudioClip = AudioClip(
@@ -302,6 +327,7 @@ private data class DraftLockEntry(val mutex: Mutex, var users: Int)
 
 private val draftLocks = ConcurrentHashMap<String, DraftLockEntry>()
 private val draftLocksGuard = Any()
+private val draftRootLocks = ConcurrentHashMap<String, Mutex>()
 
 private suspend fun <T> withDraftLock(draftId: String, block: suspend () -> T): T {
     require(draftId.isNotBlank()) { "Draft id must not be blank" }
@@ -319,6 +345,9 @@ private suspend fun <T> withDraftLock(draftId: String, block: suspend () -> T): 
         }
     }
 }
+
+private suspend fun <T> withDraftRootLock(rootPath: String, block: suspend () -> T): T =
+    draftRootLocks.computeIfAbsent(rootPath) { Mutex() }.withLock { block() }
 
 private fun String.toExportPreset(): ExportPreset =
     runCatching { ExportPreset.valueOf(this) }.getOrDefault(ExportPreset.VOICE_NOTE_32)

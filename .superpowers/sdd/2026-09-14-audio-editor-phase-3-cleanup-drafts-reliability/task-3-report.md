@@ -38,3 +38,21 @@
 1. Task 4 should invoke maintenance reconciliation on a lifecycle-safe cadence and surface any lease-repair failure for retry.
 2. UI should present explicit missing/corrupt private-source state and low-storage errors without substituting external paths.
 3. Process-death recovery is limited to filesystem/lease reconciliation; Task 4 still needs user-visible retry/repair flows for interrupted saves.
+
+## Fix Round 2: serialized recovery state
+
+- Added a canonical-source-root keyed shared mutex across repository instances. Staging is registered atomically with directory creation; commit publication, provisional/canonical lease transition, Room switch, cleanup, delete, and reconciliation are serialized under the shared root lock.
+- Replaced unchecked source-size accumulation with bounded checked addition and cumulative copied-byte accounting. Live free-space reserve now covers positive-size and unknown-size providers, with overflow/over-limit rejection before staging and cleanup on failure.
+- Lease deletion now retains the lease and in-memory references when filesystem deletion fails, records a retryable tombstone, and returns reconciliation failures. Repository reconciliation remains dirty and surfaces failure until source and canonical lease repairs complete.
+- Added deterministic cross-repository publish/reconcile race, checked-overflow/known-size reserve, and forced lease-delete retry coverage.
+
+### Fix Round 2 verification
+
+- `:app:testDebugUnitTest --tests "*.EditorDraftRepositoryTest" --tests "*.ProcessedAudioCacheTest" --tests "*.AppDatabaseMigrationTest"`: PASS (20 tests: 8 repository, 9 cache, 3 migration).
+- `:app:assembleDebug`: PASS (native debug libraries linked for configured ABIs).
+
+### Fix Round 2 residual Task 4 risks
+
+1. Task 4 should schedule reconciliation and surface `DraftReconciliationException` for user-visible retry.
+2. UI still owns presentation/replacement flows for missing or corrupt private sources.
+3. Process-death recovery remains filesystem/lease repair; interrupted-save recovery UX belongs to Task 4.

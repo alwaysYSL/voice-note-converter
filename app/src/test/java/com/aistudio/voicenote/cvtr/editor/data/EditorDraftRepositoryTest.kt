@@ -14,10 +14,14 @@ import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
 import java.io.File
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -136,6 +140,39 @@ class EditorDraftRepositoryTest {
     }
 
     @Test
+    fun `reconcile waits for publish across repository instances sharing source root`() = runBlocking {
+        val source = File(root, "race.ogg").apply {
+            parentFile!!.mkdirs()
+            writeBytes(byteArrayOf(1, 2, 3))
+        }
+        val sourceRoot = File(root, "files")
+        val storageOne = DraftSourceStorage(root = sourceRoot)
+        val storageTwo = DraftSourceStorage(root = sourceRoot)
+        val committed = CountDownLatch(1)
+        val releaseCommit = CountDownLatch(1)
+        storageOne.afterCommitStage = {
+            committed.countDown()
+            releaseCommit.await()
+        }
+        val db = Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).build()
+        val repositoryOne = EditorDraftRepository(db, storageOne)
+        val repositoryTwo = EditorDraftRepository(db, storageTwo)
+        try {
+            val saving = async(Dispatchers.Default) { repositoryOne.save(session(source)) }
+            assertTrue(committed.await(5L, TimeUnit.SECONDS))
+            val reconciling = async(Dispatchers.Default) { repositoryTwo.reconcileDraftStorage() }
+            assertEquals(null, withTimeoutOrNull(200L) { reconciling.await() })
+            releaseCommit.countDown()
+            saving.await()
+            reconciling.await()
+            assertTrue(repositoryTwo.load("draft-1") != null)
+        } finally {
+            releaseCommit.countDown()
+            db.close()
+        }
+    }
+
+    @Test
     fun `source limit rejects before staging and cleans temporary directory`() {
         val storage = DraftSourceStorage(
             root = File(root, "files"),
@@ -163,6 +200,50 @@ class EditorDraftRepositoryTest {
             )
         }
         assertTrue(File(root, "limited-files").listFiles().orEmpty().none { it.name.contains("staging") })
+    }
+
+    @Test
+    fun `checked source totals reject overflow and cumulative known-size overrun`() {
+        var overflowOpens = 0
+        val overflowStorage = DraftSourceStorage(
+            root = File(root, "overflow-files"),
+            sourceOpener = {
+                overflowOpens++
+                ByteArrayInputStream(byteArrayOf(1))
+            },
+            sourceSizer = { Long.MAX_VALUE },
+            freeSpace = { Long.MAX_VALUE },
+            safetyBytes = 0L,
+        )
+        assertThrows(IOException::class.java) {
+            overflowStorage.stageSources(
+                "draft-overflow",
+                listOf(
+                    DraftSourceInput("memory://overflow-a", 1L),
+                    DraftSourceInput("memory://overflow-b", 1L),
+                ),
+            )
+        }
+        assertEquals(0, overflowOpens)
+
+        var metadataCalls = 0
+        val knownSizeStorage = DraftSourceStorage(
+            root = File(root, "known-size-files"),
+            sourceOpener = { ByteArrayInputStream(ByteArray(1024)) },
+            sourceSizer = { if (metadataCalls++ < 2) 1L else 1024L },
+            freeSpace = { 1_500L },
+            safetyBytes = 0L,
+        )
+        assertThrows(IOException::class.java) {
+            knownSizeStorage.stageSources(
+                "draft-known-size",
+                listOf(
+                    DraftSourceInput("memory://known-a", 1L),
+                    DraftSourceInput("memory://known-b", 1L),
+                ),
+            )
+        }
+        assertTrue(File(root, "known-size-files").listFiles().orEmpty().none { it.name.contains("staging") })
     }
 
     @Test
