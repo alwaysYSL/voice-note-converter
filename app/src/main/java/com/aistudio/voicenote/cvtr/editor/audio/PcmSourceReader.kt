@@ -103,11 +103,13 @@ internal class MediaCodecPcmSourceReader(
             trackPcmEncoding = pcmEncoding(trackFormat)
             val mime = trackFormat.getString(MediaFormat.KEY_MIME)
                 ?: throw UnsupportedAudioFormatException("Track audio tidak memiliki MIME type.")
-            decoder = MediaCodec.createDecoderByType(mime).also { codec ->
-                codec.configure(trackFormat, null, null, 0)
-                codec.start()
-                decoderStarted = true
-            }
+            // Assign ownership before configure/start: either operation may throw, and the
+            // constructor catch block must still be able to release this native codec.
+            val createdDecoder = MediaCodec.createDecoderByType(mime)
+            decoder = createdDecoder
+            createdDecoder.configure(trackFormat, null, null, 0)
+            createdDecoder.start()
+            decoderStarted = true
         } catch (error: AudioConversionException) {
             close()
             throw error
