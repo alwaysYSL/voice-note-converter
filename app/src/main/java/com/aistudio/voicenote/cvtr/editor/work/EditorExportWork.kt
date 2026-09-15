@@ -11,6 +11,7 @@ import java.util.UUID
 internal object EditorExportWork {
     const val MANIFEST_PATH = "editor.manifestPath"
     const val OUTPUT_NAME = "editor.outputName"
+    const val OUTPUT_URI = "editor.outputUri"
     const val PRESET = "editor.preset"
     const val EXPORT_ATTEMPT_ID = "editor.exportAttemptId"
 
@@ -35,10 +36,12 @@ internal object EditorExportWork {
         outputName: String?,
         preset: ExportPreset,
         exportAttemptId: String = UUID.randomUUID().toString(),
+        outputUri: String? = null,
     ): OneTimeWorkRequest {
         val input = Data.Builder()
             .putString(MANIFEST_PATH, manifestPath)
             .putString(OUTPUT_NAME, outputName)
+            .putString(OUTPUT_URI, outputUri)
             .putString(PRESET, preset.name)
             .putString(EXPORT_ATTEMPT_ID, exportAttemptId)
             .build()

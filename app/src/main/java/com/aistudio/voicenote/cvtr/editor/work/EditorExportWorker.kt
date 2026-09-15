@@ -2,11 +2,13 @@ package com.aistudio.voicenote.cvtr.editor.work
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.ContentValues
 import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.provider.MediaStore
 import androidx.work.CoroutineWorker
 import androidx.work.Data
 import androidx.work.ForegroundInfo
@@ -57,6 +59,8 @@ internal fun interface EditorExportEncoderFactory {
 internal interface EditorExportStorage {
     fun createPartialFile(workId: String): File
     fun publish(partialFile: File, outputName: String): Uri
+    fun publishReserved(partialFile: File, outputName: String, outputUri: String?): Uri =
+        publish(partialFile, outputName)
     fun validatePublished(uri: Uri): Boolean
     fun sizeBytes(uri: Uri): Long = 0L
     fun deletePublished(uri: Uri): Boolean
@@ -64,6 +68,16 @@ internal interface EditorExportStorage {
 
     fun resolveOutputName(requestedName: String?, manifest: EditorRenderManifest): String =
         safeExportName(requestedName, manifest)
+}
+
+internal data class EditorExportOutputIdentity(
+    val name: String,
+    val uri: String,
+)
+
+internal interface EditorExportReservationStore {
+    fun reserve(manifest: EditorRenderManifest, requestedName: String?): EditorExportOutputIdentity
+    fun release(identity: EditorExportOutputIdentity): Boolean
 }
 
 internal interface EditorExportHistory {
@@ -150,13 +164,28 @@ internal class EditorExportRunner(
         if (existing != null) {
             return existingResult(existing)
         }
-        val renderer = try {
-            rendererFactory(manifest)
-        } catch (_: CancellationException) {
-            return EditorExportResult.Cancelled()
-        } catch (error: Throwable) {
-            error.rethrowIfFatal()
-            return EditorExportResult.Failure(error.message ?: "Could not prepare renderer")
+        val reservedUri = manifest.reservedOutputUri?.let(Uri::parse)
+        val recoveredUri = reservedUri?.takeIf {
+            try {
+                storage.validatePublished(it)
+            } catch (error: CancellationException) {
+                return EditorExportResult.Cancelled()
+            } catch (error: Throwable) {
+                error.rethrowIfFatal()
+                false
+            }
+        }
+        val renderer = if (recoveredUri == null) {
+            try {
+                rendererFactory(manifest)
+            } catch (_: CancellationException) {
+                return EditorExportResult.Cancelled()
+            } catch (error: Throwable) {
+                error.rethrowIfFatal()
+                return EditorExportResult.Failure(error.message ?: "Could not prepare renderer")
+            }
+        } else {
+            null
         }
         var partialFile: File? = null
         var publishedUri: Uri? = null
@@ -173,44 +202,63 @@ internal class EditorExportRunner(
 
         try {
             checkActive()
-            partialFile = storage.createPartialFile(workId)
-            val outputName = storage.resolveOutputName(requestedOutputName, manifest)
-            FileOutputStream(partialFile).use { output ->
-                encoder = encoderFactory.open(output, preset, ::checkActive)
-                try {
-                    var completed = 0L
-                    val total = manifest.timelineDurationFrames
-                    while (completed < total) {
+            val outputName = manifest.reservedOutputName
+                ?: storage.resolveOutputName(requestedOutputName, manifest)
+            if (recoveredUri != null) {
+                // A prior process published the reserved target but died before history commit.
+                // Recreate the deterministic partial handle only to remove any leftover cache.
+                partialFile = storage.createPartialFile(workId)
+                publishedUri = recoveredUri
+            } else {
+                partialFile = storage.createPartialFile(workId)
+                // Own the reserved identity throughout rendering, so cancellation or encoder
+                // failure can remove a pending MediaStore/file reservation as well.
+                publishedUri = reservedUri
+                FileOutputStream(partialFile).use { output ->
+                    encoder = encoderFactory.open(output, preset, ::checkActive)
+                    try {
+                        var completed = 0L
+                        val total = manifest.timelineDurationFrames
+                        while (completed < total) {
+                            checkActive()
+                            val count = minOf(RENDER_CHUNK_FRAMES.toLong(), total - completed).toInt()
+                            val pcm = renderer?.render(manifest.renderSession, completed, count)
+                                ?: error("Editor renderer is unavailable")
+                            check(pcm.size == count) { "Renderer returned ${pcm.size} frames for $count" }
+                            currentCoroutineContext().ensureActive()
+                            encoder?.write(pcm)
+                            completed += count
+                            onProgress(completed, total)
+                        }
                         checkActive()
-                        val count = minOf(RENDER_CHUNK_FRAMES.toLong(), total - completed).toInt()
-                        val pcm = renderer.render(manifest.renderSession, completed, count)
-                        check(pcm.size == count) { "Renderer returned ${pcm.size} frames for $count" }
-                        currentCoroutineContext().ensureActive()
-                        encoder?.write(pcm)
-                        completed += count
-                        onProgress(completed, total)
+                        encoder?.finish()
+                        finished = true
+                    } finally {
+                        if (!finished) encoder?.close()
+                        encoder = null
                     }
-                    checkActive()
-                    encoder?.finish()
-                    finished = true
-                } finally {
-                    if (!finished) encoder?.close()
-                    encoder = null
                 }
             }
             checkActive()
-            publishedUri = storage.publish(partialFile, outputName)
+            if (recoveredUri == null) {
+                publishedUri = storage.publishReserved(
+                    partialFile ?: error("Editor partial output is unavailable"),
+                    outputName,
+                    manifest.reservedOutputUri,
+                )
+            }
             checkActive()
-            check(storage.validatePublished(publishedUri)) { "Published OGG metadata is invalid" }
+            val published = publishedUri ?: error("Editor output is unavailable")
+            check(storage.validatePublished(published)) { "Published OGG metadata is invalid" }
             checkActive()
             val durationSeconds = ceil(manifest.timelineDurationFrames / SAMPLE_RATE.toDouble())
                 .toInt()
             val item = ConversionHistory(
                 originalFileName = manifest.sourceFileName,
                 outputFileName = outputName,
-                outputFilePath = publishedUri.toString(),
+                outputFilePath = published.toString(),
                 durationSeconds = durationSeconds,
-                fileSizeBytes = storage.sizeBytes(publishedUri),
+                fileSizeBytes = storage.sizeBytes(published),
                 waveform = WaveformCodec.encode(emptyList()),
                 bitrateKbps = preset.bitrateKbps,
                 createdAt = System.currentTimeMillis(),
@@ -266,7 +314,7 @@ internal class EditorExportRunner(
             )
         } finally {
             encoder?.let { cleanupWarning = cleanupWarning ?: safeClose(it, "encoder") }
-            renderer.let { cleanupWarning = cleanupWarning ?: safeClose(it, "renderer") }
+            renderer?.let { cleanupWarning = cleanupWarning ?: safeClose(it, "renderer") }
             if (outcome != null) {
                 if (outcome is EditorExportResult.Success) {
                     partialFile?.let {
@@ -292,13 +340,21 @@ internal class EditorExportRunner(
     ): String? =
         withContext(NonCancellable) {
             val warnings = ArrayList<String>(3)
+            var historyDeleted = true
             if (historyCreatedByRun) {
                 historyId?.let {
-                    safeDeleteHistory(it)?.let(warnings::add)
+                    safeDeleteHistory(it)?.let {
+                        warnings += it
+                        historyDeleted = false
+                    }
                 }
             }
-            published?.let {
-                cleanupWarning(storage.deletePublished(it), "published output cleanup failed")?.let(warnings::add)
+            if (historyDeleted) {
+                published?.let {
+                    cleanupWarning(storage.deletePublished(it), "published output cleanup failed")?.let(warnings::add)
+                }
+            } else if (published != null) {
+                warnings += "published output retained because history cleanup failed"
             }
             partial?.let {
                 cleanupWarning(storage.deletePartial(it), "partial output cleanup failed")?.let(warnings::add)
@@ -377,6 +433,16 @@ internal class EditorExportWorker(
             file.delete()
             return failure("Editor export attempt does not match its manifest", canRetry = false)
         }
+        val requestedOutputUri = inputData.getString(EditorExportWork.OUTPUT_URI)
+        if (manifest.reservedOutputUri != null && requestedOutputUri != manifest.reservedOutputUri) {
+            file.delete()
+            return failure("Editor output identity does not match its manifest", canRetry = false)
+        }
+        val requestedOutputName = inputData.getString(EditorExportWork.OUTPUT_NAME)
+        if (manifest.reservedOutputName != null && requestedOutputName != manifest.reservedOutputName) {
+            file.delete()
+            return failure("Editor output name does not match its manifest", canRetry = false)
+        }
         val requestedPreset = EditorExportWork.preset(inputData)
         try {
             setForeground(createForegroundInfo(inputData.getString(EditorExportWork.OUTPUT_NAME).orEmpty()))
@@ -397,7 +463,7 @@ internal class EditorExportWorker(
         return try {
             when (val result = runner.run(
                 manifest = manifest,
-                requestedOutputName = inputData.getString(EditorExportWork.OUTPUT_NAME),
+                requestedOutputName = requestedOutputName,
                 preset = requestedPreset,
                 onProgress = { completed, total ->
                     setProgress(
@@ -536,7 +602,7 @@ private class RoomEditorExportHistory(
         dao.getByEditorExportAttemptId(attemptId)
 }
 
-private class AndroidEditorExportStorage(
+internal class AndroidEditorExportStorage(
     private val context: Context,
 ) : EditorExportStorage {
     override fun createPartialFile(workId: String): File {
@@ -547,6 +613,30 @@ private class AndroidEditorExportStorage(
 
     override fun publish(partialFile: File, outputName: String): Uri =
         VoiceNoteStorage.saveToPublicStorage(context, partialFile, outputName)
+
+    override fun publishReserved(partialFile: File, outputName: String, outputUri: String?): Uri {
+        if (outputUri == null) return publish(partialFile, outputName)
+        val uri = Uri.parse(outputUri)
+        if (validatePublished(uri)) return uri
+        when (uri.scheme) {
+            ContentResolver.SCHEME_CONTENT -> {
+                context.contentResolver.openOutputStream(uri)?.use { output ->
+                    FileInputStream(partialFile).use { input -> input.copyTo(output) }
+                } ?: error("Cannot open reserved editor output")
+                val values = ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) }
+                check(context.contentResolver.update(uri, values, null, null) == 1) {
+                    "Cannot publish reserved editor output"
+                }
+            }
+            ContentResolver.SCHEME_FILE -> {
+                FileOutputStream(uri.path ?: error("Reserved editor output path is missing")).use { output ->
+                    FileInputStream(partialFile).use { input -> input.copyTo(output) }
+                }
+            }
+            else -> error("Reserved editor output identity is invalid")
+        }
+        return uri
+    }
 
     override fun validatePublished(uri: Uri): Boolean {
         return try {
@@ -583,6 +673,40 @@ private class AndroidEditorExportStorage(
         return VoiceNoteStorage.resolveOutputFileName(context, candidate)
     }
 
+    internal fun reserveOutput(
+        requestedName: String?,
+        manifest: EditorRenderManifest,
+    ): EditorExportOutputIdentity {
+        val requested = safeExportName(requestedName, manifest)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Audio.Media.DISPLAY_NAME, requested)
+                put(MediaStore.Audio.Media.MIME_TYPE, "audio/ogg")
+                put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/VoiceNoteConverter")
+                put(MediaStore.Audio.Media.IS_PENDING, 1)
+            }
+            val uri = context.contentResolver.insert(
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                values,
+            ) ?: error("Cannot reserve editor output")
+            return EditorExportOutputIdentity(requested, uri.toString())
+        }
+
+        @Suppress("DEPRECATION")
+        val directory = VoiceNoteStorage.getStorageFolder()
+        check(directory.exists() || directory.mkdirs()) { "Cannot create editor output directory" }
+        var candidate = requested
+        var suffix = 1
+        while (true) {
+            val file = File(directory, candidate)
+            if (file.createNewFile()) {
+                return EditorExportOutputIdentity(candidate, Uri.fromFile(file).toString())
+            }
+            val stem = requested.removeSuffix(".ogg")
+            candidate = "${stem.take(71)}_${suffix++}.ogg"
+        }
+    }
+
     private fun open(uri: Uri): InputStream {
         return when {
             uri.scheme == ContentResolver.SCHEME_CONTENT ->
@@ -602,6 +726,20 @@ private class AndroidEditorExportStorage(
         }
         return count
     }
+}
+
+internal class AndroidEditorExportReservationStore(
+    private val context: Context,
+) : EditorExportReservationStore {
+    private val storage = AndroidEditorExportStorage(context)
+
+    override fun reserve(
+        manifest: EditorRenderManifest,
+        requestedName: String?,
+    ): EditorExportOutputIdentity = storage.reserveOutput(requestedName, manifest)
+
+    override fun release(identity: EditorExportOutputIdentity): Boolean =
+        storage.deletePublished(Uri.parse(identity.uri))
 }
 
 private val ExportPreset.bitrateKbps: Int

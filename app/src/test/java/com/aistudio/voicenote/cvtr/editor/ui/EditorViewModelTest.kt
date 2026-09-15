@@ -6,6 +6,8 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.work.OneTimeWorkRequest
 import androidx.work.WorkInfo
 import com.aistudio.voicenote.cvtr.editor.work.EditorExportWork
+import com.aistudio.voicenote.cvtr.editor.work.EditorExportOutputIdentity
+import com.aistudio.voicenote.cvtr.editor.work.EditorExportReservationStore
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
@@ -240,6 +242,7 @@ class EditorViewModelTest {
         },
         waveformLoader = { emptyList() },
         exportScheduler = exportScheduler,
+        exportReservation = TestExportReservationStore(),
     )
 
     private class RecordingExportScheduler : EditorExportScheduler {
@@ -267,5 +270,14 @@ class EditorViewModelTest {
         override fun observe(id: UUID): Flow<WorkInfo?> = emptyFlow()
 
         suspend fun awaitFirst() = withTimeout(5_000L) { firstEnqueue.await() }
+    }
+
+    private class TestExportReservationStore : EditorExportReservationStore {
+        override fun reserve(
+            manifest: com.aistudio.voicenote.cvtr.editor.audio.EditorRenderManifest,
+            requestedName: String?,
+        ): EditorExportOutputIdentity = EditorExportOutputIdentity("test.ogg", "file:///test.ogg")
+
+        override fun release(identity: EditorExportOutputIdentity): Boolean = true
     }
 }

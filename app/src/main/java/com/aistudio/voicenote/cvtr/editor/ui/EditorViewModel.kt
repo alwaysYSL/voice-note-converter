@@ -41,6 +41,9 @@ import com.aistudio.voicenote.cvtr.editor.model.TimelineError
 import com.aistudio.voicenote.cvtr.editor.model.TimelineResult
 import com.aistudio.voicenote.cvtr.editor.model.value
 import com.aistudio.voicenote.cvtr.editor.work.EditorExportWork
+import com.aistudio.voicenote.cvtr.editor.work.AndroidEditorExportReservationStore
+import com.aistudio.voicenote.cvtr.editor.work.EditorExportOutputIdentity
+import com.aistudio.voicenote.cvtr.editor.work.EditorExportReservationStore
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -225,6 +228,8 @@ internal class EditorViewModel(
     private val exportScheduler: EditorExportScheduler = WorkManagerEditorExportScheduler(
         WorkManager.getInstance(application)
     ),
+    private val exportReservation: EditorExportReservationStore =
+        AndroidEditorExportReservationStore(application),
 ) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(EditorUiState())
     val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
@@ -538,26 +543,49 @@ internal class EditorViewModel(
         }
         viewModelScope.launch(Dispatchers.IO) {
             var manifest: File? = null
+            var reservation: EditorExportOutputIdentity? = null
+            var reservationCreatedByCall = false
+            var reservationTransferred = false
             try {
-                val preset = current.export.preset
                 manifest = EditorRenderManifest.writePrivate(
                     context = getApplication(),
                     session = current.session,
                     sourceHistoryId = editorSourceHistoryId,
-                    preset = preset,
+                    preset = current.export.preset,
                     exportAttemptId = exportAttemptId,
                 )
+                val manifestFile = manifest ?: error("Editor manifest is unavailable")
+                val manifestSnapshot = EditorRenderManifest.readValidated(manifestFile)
+                val existingReservation = if (
+                    manifestSnapshot.reservedOutputName != null && manifestSnapshot.reservedOutputUri != null
+                ) {
+                    EditorExportOutputIdentity(
+                        manifestSnapshot.reservedOutputName,
+                        manifestSnapshot.reservedOutputUri,
+                    )
+                } else null
+                reservation = existingReservation ?: exportReservation.reserve(
+                    manifest = manifestSnapshot,
+                    requestedName = current.export.outputName.ifBlank { defaultExportName(current.session) },
+                ).also { reservationCreatedByCall = true }
+                val reserved = reservation ?: error("Editor output reservation is unavailable")
+                manifestSnapshot.copy(
+                    reservedOutputName = reserved.name,
+                    reservedOutputUri = reserved.uri,
+                ).writeTo(manifestFile)
                 val request = EditorExportWork.request(
-                    manifestPath = manifest.absolutePath,
-                    outputName = current.export.outputName.ifBlank { defaultExportName(current.session) },
-                    preset = preset,
+                    manifestPath = manifestFile.absolutePath,
+                    outputName = reserved.name,
+                    preset = manifestSnapshot.preset,
                     exportAttemptId = exportAttemptId,
+                    outputUri = reserved.uri,
                 )
                 val id = exportScheduler.enqueueUnique(
                     uniqueName = EditorExportWork.uniqueWorkName(exportAttemptId),
                     request = request,
                     replaceExisting = replaceExisting,
                 )
+                reservationTransferred = true
                 exportWorkId = id
                 _uiState.update {
                     it.copy(export = it.export.copy(
@@ -570,10 +598,17 @@ internal class EditorViewModel(
                 }
                 observeExport(id)
             } catch (error: CancellationException) {
-                manifest?.delete()
+                if (reservationCreatedByCall && !reservationTransferred) {
+                    reservation?.let(exportReservation::release)
+                    manifest?.delete()
+                }
                 throw error
             } catch (error: Throwable) {
-                manifest?.delete()
+                if (reservationCreatedByCall && !reservationTransferred) {
+                    reservation?.let(exportReservation::release)
+                    manifest?.delete()
+                }
+                error.rethrowIfFatal()
                 _uiState.update {
                     it.copy(export = it.export.copy(status = EditorExportStatus.FAILED, error = error.message ?: "Export failed", canRetry = true))
                 }
@@ -663,6 +698,12 @@ internal class EditorViewModel(
             .map { it.timelineEndMs.coerceAtLeast(0L) }
             .maxOrNull() ?: return false
         return durationMs * 48L / 1_000L > 0L
+    }
+
+    private fun Throwable.rethrowIfFatal() {
+        if (this is VirtualMachineError || this is ThreadDeath || this is LinkageError) {
+            throw this
+        }
     }
 
     private fun seek(positionMs: Long) {

@@ -102,6 +102,47 @@ class EditorExportWorkerTest {
         assertEquals(1, storage.published.size)
     }
 
+    @Test
+    fun `retry after process death immediately after publish reuses reserved output`() = runBlocking {
+        val storage = FakeStorage()
+        val history = FakeHistory(crashBeforeInsert = true)
+        val snapshot = manifest().copy(
+            reservedOutputName = "reserved.ogg",
+            reservedOutputUri = "file:///reserved.ogg",
+        )
+
+        assertThrows(SimulatedProcessDeath::class.java) {
+            runBlocking { runner(storage, history).run(snapshot, "mix.ogg", snapshot.preset) }
+        }
+        assertEquals(1, storage.published.size)
+        assertTrue(history.rows.isEmpty())
+
+        val retry = runner(storage, history).run(snapshot, "mix.ogg", snapshot.preset)
+        assertTrue(retry is EditorExportResult.Success)
+        assertEquals(1, storage.published.size)
+        assertEquals(1, history.rows.size)
+        assertEquals("file:///reserved.ogg", history.rows.single().outputFilePath)
+    }
+
+    @Test
+    fun `history delete failure retains published output and reports warning`() = runBlocking {
+        val storage = FakeStorage()
+        val history = FakeHistory(failDelete = true)
+
+        val result = runner(storage, history).run(
+            manifest(),
+            "mix.ogg",
+            ExportPreset.HIGH_QUALITY_64,
+            isActive = { history.rows.isEmpty() },
+        )
+
+        assertTrue(result is EditorExportResult.Cancelled)
+        assertEquals(1, storage.published.size)
+        assertEquals(1, history.rows.size)
+        assertTrue(result.cleanupWarning().orEmpty().contains("published output retained"))
+        assertTrue(storage.partial.isEmpty())
+    }
+
     private fun runner(
         storage: FakeStorage,
         history: FakeHistory,
@@ -121,6 +162,7 @@ class EditorExportWorkerTest {
         encoderFactory = { output, _, _ -> FakeEncoder(output) },
         storage = storage,
         history = history,
+        workId = "test-export",
     )
 
     private fun manifest(): EditorRenderManifest = EditorRenderManifest.fromSession(
@@ -155,26 +197,54 @@ class EditorExportWorkerTest {
     }
 
     private class FakeStorage(private val validate: Boolean = true) : EditorExportStorage {
+        private val directory = File(System.getProperty("java.io.tmpdir"), "editor-export-test-${java.util.UUID.randomUUID()}")
         val partial = mutableListOf<File>()
         val published = mutableListOf<java.net.URI>()
-        override fun createPartialFile(workId: String): File = File.createTempFile(workId, ".partial").also(partial::add)
+        override fun createPartialFile(workId: String): File = File(directory.apply { mkdirs() }, "$workId.partial")
+            .also { if (it !in partial) partial += it }
         override fun publish(partialFile: File, outputName: String): android.net.Uri =
             android.net.Uri.fromFile(File(partialFile.parentFile, outputName)).also {
                 published += java.net.URI.create(it.toString())
             }
-        override fun validatePublished(uri: android.net.Uri): Boolean = validate
+        override fun publishReserved(
+            partialFile: File,
+            outputName: String,
+            outputUri: String?,
+        ): android.net.Uri = outputUri?.let { android.net.Uri.parse(it).also { value -> published += java.net.URI.create(value.toString()) } }
+            ?: publish(partialFile, outputName)
+        override fun validatePublished(uri: android.net.Uri): Boolean =
+            validate && java.net.URI.create(uri.toString()) in published
         override fun deletePublished(uri: android.net.Uri): Boolean = published.remove(java.net.URI.create(uri.toString()))
         override fun deletePartial(file: File): Boolean = partial.remove(file) && file.delete()
     }
 
-    private class FakeHistory : EditorExportHistory {
+    private class FakeHistory(
+        private var crashBeforeInsert: Boolean = false,
+        private val failDelete: Boolean = false,
+    ) : EditorExportHistory {
         val rows = mutableListOf<com.aistudio.voicenote.cvtr.data.local.ConversionHistory>()
         override suspend fun insert(item: com.aistudio.voicenote.cvtr.data.local.ConversionHistory): Long {
-            rows += item
-            return rows.size.toLong()
+            if (crashBeforeInsert) {
+                crashBeforeInsert = false
+                throw SimulatedProcessDeath()
+            }
+            val id = rows.size.toLong() + 1L
+            rows += item.copy(id = id)
+            return id
         }
-        override suspend fun delete(id: Long) { rows.removeAt(id.toInt() - 1) }
+        override suspend fun delete(id: Long) {
+            if (failDelete) error("history delete failed")
+            rows.removeIf { it.id == id }
+        }
         override suspend fun findByExportAttemptId(attemptId: String): com.aistudio.voicenote.cvtr.data.local.ConversionHistory? =
             rows.firstOrNull { it.editorExportAttemptId == attemptId }
+    }
+
+    private class SimulatedProcessDeath : VirtualMachineError()
+
+    private fun EditorExportResult.cleanupWarning(): String? = when (this) {
+        is EditorExportResult.Success -> cleanupWarning
+        is EditorExportResult.Failure -> cleanupWarning
+        is EditorExportResult.Cancelled -> cleanupWarning
     }
 }
