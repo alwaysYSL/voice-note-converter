@@ -71,7 +71,11 @@ internal fun EditorScreen(
                 CircularProgressIndicator()
             }
         } else {
-            EditorTransport(state.session)
+            EditorTransport(
+                session = state.session,
+                playback = state.playback,
+                onIntent = onIntent,
+            )
             ContextualEditorToolbar(
                 session = state.session,
                 selectedClip = selectedClip,

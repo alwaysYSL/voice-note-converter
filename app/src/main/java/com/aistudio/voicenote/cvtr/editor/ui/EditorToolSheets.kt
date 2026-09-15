@@ -14,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Redo
 import androidx.compose.material.icons.filled.Undo
 import androidx.compose.material3.Button
@@ -40,6 +41,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import com.aistudio.voicenote.cvtr.editor.model.AudioClip
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
+import com.aistudio.voicenote.cvtr.editor.audio.EditorPlaybackState
 import com.aistudio.voicenote.cvtr.ui.theme.AccentCoral
 import com.aistudio.voicenote.cvtr.ui.theme.CardSurfaceWhite
 import com.aistudio.voicenote.cvtr.ui.theme.DeepNavyDisplay
@@ -238,6 +240,8 @@ internal fun EditorToolSheet(
 @Composable
 internal fun EditorTransport(
     session: EditorSession,
+    playback: EditorPlaybackState = EditorPlaybackState(),
+    onIntent: (EditorIntent) -> Unit = {},
 ) {
     Row(
         modifier = Modifier
@@ -248,21 +252,26 @@ internal fun EditorTransport(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         IconButton(
-            onClick = {},
-            enabled = false,
+            onClick = {
+                onIntent(if (playback.playing) EditorIntent.Pause else EditorIntent.Play)
+            },
+            enabled = playback.durationMs > 0L || session.tracks.any { it.clips.isNotEmpty() },
             modifier = Modifier
                 .size(48.dp)
-                .testTag("editor_play_disabled")
+                .testTag(if (playback.playing) "editor_pause" else "editor_play")
                 .semantics {
-                    contentDescription = "Play disabled until Phase 2 audio renderer is connected"
-                    stateDescription = "Disabled until Phase 2"
+                    contentDescription = if (playback.playing) "Pause audio playback" else "Play audio preview"
+                    stateDescription = if (playback.playing) "Playing" else "Paused"
                 },
         ) {
-            Icon(Icons.Filled.PlayArrow, contentDescription = null)
+            Icon(
+                if (playback.playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                contentDescription = null,
+            )
         }
         Icon(
             Icons.Filled.GraphicEq,
-            contentDescription = "Audio playback available in Phase 2",
+            contentDescription = "Audio preview",
             tint = AccentCoral,
         )
         Text(
@@ -271,7 +280,7 @@ internal fun EditorTransport(
             color = DeepNavyDisplay,
         )
         Text(
-            text = "Playback connects in Phase 2",
+            text = if (playback.error == null) "Preview follows the played head" else "Preview unavailable",
             style = MaterialTheme.typography.bodySmall,
             color = LightSlateCaption,
         )

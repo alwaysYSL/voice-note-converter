@@ -22,6 +22,10 @@ import com.aistudio.voicenote.cvtr.editor.command.SetTrackMutedCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetTrackVolumeCommand
 import com.aistudio.voicenote.cvtr.editor.command.SplitClipCommand
 import com.aistudio.voicenote.cvtr.editor.command.TrimClipCommand
+import com.aistudio.voicenote.cvtr.editor.audio.DefaultTimelineRenderer
+import com.aistudio.voicenote.cvtr.editor.audio.EditorPlaybackState
+import com.aistudio.voicenote.cvtr.editor.audio.EditorPreviewEngine
+import com.aistudio.voicenote.cvtr.editor.audio.MediaCodecPcmSourceReaderFactory
 import com.aistudio.voicenote.cvtr.editor.model.AudioClip
 import com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
@@ -37,6 +41,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -77,6 +82,8 @@ internal enum class EditorSheet {
 
 /** Intents shared by the editor shell and its timeline controls. */
 internal sealed interface EditorIntent {
+    data object Play : EditorIntent
+    data object Pause : EditorIntent
     data class Seek(val positionMs: Long) : EditorIntent
     data class SelectClip(val clipId: String?) : EditorIntent
     data class Split(val splitTimelineMs: Long) : EditorIntent
@@ -107,6 +114,7 @@ internal data class EditorUiState(
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
     val importInFlight: Boolean = false,
+    val playback: EditorPlaybackState = EditorPlaybackState(),
 )
 
 /**
@@ -126,6 +134,9 @@ internal class EditorViewModel(
     private val waveformLoader: suspend (Uri) -> List<Int> = { uri ->
         VoiceNoteConverter.extractWaveform(application, uri)
     },
+    private val previewEngine: EditorPreviewEngine = EditorPreviewEngine(
+        renderer = DefaultTimelineRenderer(MediaCodecPcmSourceReaderFactory(application)),
+    ),
 ) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(EditorUiState())
     val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
@@ -137,6 +148,16 @@ internal class EditorViewModel(
     private var launchJob: Job
 
     init {
+        viewModelScope.launch {
+            previewEngine.state.collect { playback ->
+                _uiState.update { state ->
+                    state.copy(
+                        playback = playback,
+                        session = state.session.copy(playheadMs = playback.positionMs),
+                    )
+                }
+            }
+        }
         launchJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 resolveLaunch()
@@ -151,6 +172,8 @@ internal class EditorViewModel(
 
     fun dispatch(intent: EditorIntent) {
         when (intent) {
+            EditorIntent.Play -> previewEngine.play()
+            EditorIntent.Pause -> previewEngine.pause()
             is EditorIntent.Seek -> seek(intent.positionMs)
             is EditorIntent.SelectClip -> runSerializedMutation {
                 commandHistory?.let { history ->
@@ -362,6 +385,7 @@ internal class EditorViewModel(
 
     private fun finishLoading(session: EditorSession) {
         commandHistory = CommandHistory(session)
+        previewEngine.load(session)
         _uiState.update {
             it.copy(
                 loading = false,
@@ -373,8 +397,10 @@ internal class EditorViewModel(
     }
 
     private fun seek(positionMs: Long) {
+        val bounded = positionMs.coerceIn(0L, MAX_TIMELINE_MS)
+        previewEngine.seekTo(bounded)
         _uiState.update { state ->
-            state.copy(session = state.session.copy(playheadMs = positionMs.coerceIn(0L, MAX_TIMELINE_MS)))
+            state.copy(session = state.session.copy(playheadMs = bounded))
         }
     }
 
@@ -403,6 +429,7 @@ internal class EditorViewModel(
 
     private fun publishSession(session: EditorSession) {
         val history = commandHistory
+        previewEngine.load(session)
         _uiState.update {
             it.copy(
                 session = session,
@@ -462,6 +489,7 @@ internal class EditorViewModel(
 
     override fun onCleared() {
         launchJob.cancel()
+        previewEngine.release()
         super.onCleared()
     }
 }
