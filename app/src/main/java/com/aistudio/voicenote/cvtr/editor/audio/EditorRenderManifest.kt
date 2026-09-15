@@ -36,6 +36,8 @@ internal data class EditorRenderManifest(
     val exportAttemptId: String = UUID.randomUUID().toString(),
     val reservedOutputName: String? = null,
     val reservedOutputUri: String? = null,
+    /** The immutable public target paired with [reservedOutputUri] (pending on pre-Q). */
+    val reservedOutputFinalUri: String? = null,
 ) {
     val renderSession: EditorSession = EditorSession(
         id = sessionId,
@@ -65,6 +67,12 @@ internal data class EditorRenderManifest(
         }
         require(reservedOutputUri == null || reservedOutputUri.isNotBlank()) {
             "Manifest output identity is invalid"
+        }
+        require(reservedOutputFinalUri == null || reservedOutputFinalUri.isNotBlank()) {
+            "Manifest final output identity is invalid"
+        }
+        require(reservedOutputFinalUri == null || reservedOutputName != null) {
+            "Manifest final output identity is incomplete"
         }
     }
 
@@ -104,6 +112,7 @@ internal data class EditorRenderManifest(
         put(KEY_EXPORT_ATTEMPT_ID, exportAttemptId)
         put(KEY_RESERVED_OUTPUT_NAME, reservedOutputName ?: JSONObject.NULL)
         put(KEY_RESERVED_OUTPUT_URI, reservedOutputUri ?: JSONObject.NULL)
+        put(KEY_RESERVED_OUTPUT_FINAL_URI, reservedOutputFinalUri ?: JSONObject.NULL)
         put(KEY_TRACKS, JSONArray().also { tracksArray ->
             tracks.forEach { track ->
                 tracksArray.put(JSONObject().apply {
@@ -130,6 +139,7 @@ internal data class EditorRenderManifest(
         private const val KEY_EXPORT_ATTEMPT_ID = "exportAttemptId"
         private const val KEY_RESERVED_OUTPUT_NAME = "reservedOutputName"
         private const val KEY_RESERVED_OUTPUT_URI = "reservedOutputUri"
+        private const val KEY_RESERVED_OUTPUT_FINAL_URI = "reservedOutputFinalUri"
         private const val KEY_TRACKS = "tracks"
         private const val SAMPLE_RATE = 48_000L
 
@@ -140,6 +150,7 @@ internal data class EditorRenderManifest(
             exportAttemptId: String = UUID.randomUUID().toString(),
             reservedOutputName: String? = null,
             reservedOutputUri: String? = null,
+            reservedOutputFinalUri: String? = null,
         ): EditorRenderManifest {
             val audioSession = session.copy(
                 selectedClipId = null,
@@ -168,6 +179,7 @@ internal data class EditorRenderManifest(
                 exportAttemptId = exportAttemptId,
                 reservedOutputName = reservedOutputName,
                 reservedOutputUri = reservedOutputUri,
+                reservedOutputFinalUri = reservedOutputFinalUri,
             )
         }
 
@@ -210,6 +222,7 @@ internal data class EditorRenderManifest(
             val exportAttemptId = json.optString(KEY_EXPORT_ATTEMPT_ID, "").ifBlank { "legacy-$sessionId" }
             val reservedOutputName = json.optionalString(KEY_RESERVED_OUTPUT_NAME)
             val reservedOutputUri = json.optionalString(KEY_RESERVED_OUTPUT_URI)
+            val reservedOutputFinalUri = json.optionalString(KEY_RESERVED_OUTPUT_FINAL_URI)
             val manifest = fromSession(
                 EditorSession(sessionId, tracks, exportPreset = preset),
                 sourceHistoryId = sourceHistoryId,
@@ -217,6 +230,7 @@ internal data class EditorRenderManifest(
                 exportAttemptId = exportAttemptId,
                 reservedOutputName = reservedOutputName,
                 reservedOutputUri = reservedOutputUri,
+                reservedOutputFinalUri = reservedOutputFinalUri,
             ).copy(sourceFileName = sourceFileName.ifBlank { "voice_note" })
             require(manifest.timelineDurationFrames == requestedDuration) {
                 "Manifest duration does not match its clips"
@@ -232,6 +246,7 @@ internal data class EditorRenderManifest(
             exportAttemptId: String = UUID.randomUUID().toString(),
             reservedOutputName: String? = null,
             reservedOutputUri: String? = null,
+            reservedOutputFinalUri: String? = null,
         ): File {
             val directory = File(context.filesDir, "editor/manifests")
             require(directory.exists() || directory.mkdirs()) { "Cannot create editor manifest directory" }
@@ -257,6 +272,7 @@ internal data class EditorRenderManifest(
                 exportAttemptId,
                 reservedOutputName,
                 reservedOutputUri,
+                reservedOutputFinalUri,
             ).writeTo(target)
             return target
         }

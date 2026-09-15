@@ -77,10 +77,17 @@ internal interface EditorExportStorage {
 internal data class EditorExportOutputIdentity(
     val name: String,
     val uri: String,
+    /** The final public URI; on pre-Q [uri] is the pending file and this is its rename target. */
+    val finalUri: String? = null,
 )
 
 internal interface EditorExportReservationStore {
     fun reserve(manifest: EditorRenderManifest, requestedName: String?): EditorExportOutputIdentity
+    /** Resolve an identity without creating a public target when the platform permits it. */
+    fun resolve(manifest: EditorRenderManifest, requestedName: String?): EditorExportOutputIdentity =
+        reserve(manifest, requestedName)
+    /** Claim a previously resolved identity using no-overwrite semantics. */
+    fun claim(identity: EditorExportOutputIdentity): Boolean = true
     fun release(identity: EditorExportOutputIdentity): Boolean
 }
 
@@ -173,10 +180,13 @@ internal class EditorExportRunner(
             if (manifest.reservedOutputName != null && manifest.reservedOutputUri != null) {
                 manifest
             } else {
-                reservationStore?.reserve(manifest, requestedOutputName)?.let { identity ->
+                reservationStore?.resolve(manifest, requestedOutputName)?.also { identity ->
+                    check(reservationStore.claim(identity)) { "Could not claim editor output" }
+                }?.let { identity ->
                     manifest.copy(
                         reservedOutputName = identity.name,
                         reservedOutputUri = identity.uri,
+                        reservedOutputFinalUri = identity.finalUri,
                     )
                 } ?: manifest
             }
@@ -197,6 +207,7 @@ internal class EditorExportRunner(
         isActive: () -> Boolean,
     ): EditorExportResult {
         val reservedUri = manifest.reservedOutputUri?.let(Uri::parse)
+        val reservedFinalUri = manifest.reservedOutputFinalUri?.let(Uri::parse)
         var recoveredUri: Uri? = null
         var renderer: TimelineRenderer? = null
         var partialFile: File? = null
@@ -214,13 +225,10 @@ internal class EditorExportRunner(
 
         try {
             checkActive()
-            recoveredUri = reservedUri?.let { uri ->
-                if (!storage.validatePublished(uri)) {
-                    null
-                } else {
-                    check(storage.finalizeReserved(uri)) { "Reserved editor output could not be finalized" }
-                    uri
-                }
+            recoveredUri = listOfNotNull(reservedFinalUri, reservedUri).firstOrNull { uri ->
+                if (!storage.validatePublished(uri)) return@firstOrNull false
+                check(storage.finalizeReserved(uri)) { "Reserved editor output could not be finalized" }
+                true
             }
             renderer = if (recoveredUri == null) rendererFactory(manifest) else null
             val outputName = manifest.reservedOutputName
@@ -442,7 +450,7 @@ internal class EditorExportWorker(
         val manifestPath = inputData.getString(EditorExportWork.MANIFEST_PATH)
             ?: return failure("Editor manifest is missing", canRetry = false)
         val file = File(manifestPath)
-        val manifest = try {
+        var manifest = try {
             EditorRenderManifest.readValidated(file)
         } catch (error: Throwable) {
             error.rethrowIfFatal()
@@ -455,15 +463,14 @@ internal class EditorExportWorker(
             return failure("Editor export attempt does not match its manifest", canRetry = false)
         }
         val requestedOutputUri = inputData.getString(EditorExportWork.OUTPUT_URI)
-        if (manifest.reservedOutputUri != null && requestedOutputUri != manifest.reservedOutputUri) {
+        if (manifest.reservedOutputUri != null && !requestedOutputUri.isNullOrBlank() &&
+            requestedOutputUri != manifest.reservedOutputUri &&
+            requestedOutputUri != manifest.reservedOutputFinalUri
+        ) {
             file.delete()
             return failure("Editor output identity does not match its manifest", canRetry = false)
         }
         val requestedOutputName = inputData.getString(EditorExportWork.OUTPUT_NAME)
-        if (manifest.reservedOutputName != null && requestedOutputName != manifest.reservedOutputName) {
-            file.delete()
-            return failure("Editor output name does not match its manifest", canRetry = false)
-        }
         val requestedPreset = EditorExportWork.preset(inputData)
         try {
             setForeground(createForegroundInfo(inputData.getString(EditorExportWork.OUTPUT_NAME).orEmpty()))
@@ -472,12 +479,43 @@ internal class EditorExportWorker(
             file.delete()
             return failure(error.message ?: "Editor export cannot start in background", canRetry = true)
         }
+        // Resolve the complete output identity before claiming any pre-Q file. The resolved
+        // manifest is the durable owner record, so a process death at any later point can only
+        // recover/release these exact paths. API 29+ resolution may insert its pending row here;
+        // that platform behavior is unchanged and is keyed by the same attempt id.
+        var resolvedIdentity: EditorExportOutputIdentity? = null
+        var identityClaimed = false
+        try {
+            if (manifest.reservedOutputName == null || manifest.reservedOutputUri == null) {
+                val identity = dependencies.reservation.resolve(manifest, requestedOutputName)
+                resolvedIdentity = identity
+                manifest = manifest.copy(
+                    reservedOutputName = identity.name,
+                    reservedOutputUri = identity.uri,
+                    reservedOutputFinalUri = identity.finalUri,
+                )
+                manifest.writeTo(file)
+                identityClaimed = dependencies.reservation.claim(identity)
+                check(identityClaimed) { "Could not claim editor output" }
+            }
+        } catch (error: CancellationException) {
+            if (identityClaimed) resolvedIdentity?.let { dependencies.reservation.release(it) }
+            file.delete()
+            throw error
+        } catch (error: Throwable) {
+            error.rethrowIfFatal()
+            if (identityClaimed) resolvedIdentity?.let { dependencies.reservation.release(it) }
+            file.delete()
+            return failure(error.message ?: "Could not reserve editor output", canRetry = true)
+        }
         val runner = EditorExportRunner(
             rendererFactory = dependencies.rendererFactory,
             encoderFactory = dependencies.encoderFactory,
             storage = dependencies.storage,
             history = dependencies.history,
-            reservationStore = dependencies.reservation,
+            // Reservation is resolved and claimed above, after its immutable manifest was
+            // atomically persisted. Passing no store prevents a second identity allocation.
+            reservationStore = null,
             // The attempt id survives WorkManager process recreation, unlike a transient worker
             // instance. This also makes any unfinished private partial path deterministic.
             workId = manifest.exportAttemptId,
@@ -723,6 +761,14 @@ internal class AndroidEditorExportStorage(
     internal fun reserveOutput(
         requestedName: String?,
         manifest: EditorRenderManifest,
+    ): EditorExportOutputIdentity = resolveOutput(requestedName, manifest).also { identity ->
+        check(claimOutput(identity)) { "Cannot claim editor output" }
+    }
+
+    /** Resolve an attempt-owned target without creating a pre-Q file. */
+    internal fun resolveOutput(
+        requestedName: String?,
+        manifest: EditorRenderManifest,
     ): EditorExportOutputIdentity {
         val requested = safeExportName(requestedName, manifest)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -738,7 +784,7 @@ internal class AndroidEditorExportStorage(
                 MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
                 values,
             ) ?: error("Cannot reserve editor output")
-            return EditorExportOutputIdentity(requested, uri.toString())
+            return EditorExportOutputIdentity(requested, uri.toString(), uri.toString())
         }
 
         @Suppress("DEPRECATION")
@@ -746,26 +792,43 @@ internal class AndroidEditorExportStorage(
         check(directory.exists() || directory.mkdirs()) { "Cannot create editor output directory" }
         val suffix = stableAttemptSuffix(manifest.exportAttemptId)
         val stem = requested.removeSuffix(".ogg").take(PRE_Q_OUTPUT_STEM_LIMIT)
-        val finalName = "${stem}_$suffix.ogg"
-        val finalFile = File(directory, finalName)
-        val pendingFile = File(directory, "$finalName$PRE_Q_PENDING_SUFFIX")
-        val temporaryFile = File(directory, "$finalName$PRE_Q_RENAME_TEMP_SUFFIX")
-        if (finalFile.isFile && validatePreQFile(finalFile)) {
-            return EditorExportOutputIdentity(finalName, Uri.fromFile(finalFile).toString())
+        val baseName = "${stem}_$suffix.ogg"
+        var collision = 0
+        while (true) {
+            val finalName = if (collision == 0) baseName else {
+                "${baseName.removeSuffix(".ogg")}_$collision.ogg"
+            }
+            val finalFile = File(directory, finalName)
+            val pendingFile = File(directory, "$finalName$PRE_Q_PENDING_SUFFIX")
+            val temporaryFile = File(directory, "$finalName$PRE_Q_RENAME_TEMP_SUFFIX")
+            // Before the manifest records ownership every existing candidate is external,
+            // regardless of whether it happens to contain a valid OGG. Never touch it.
+            if (!finalFile.exists() && !pendingFile.exists() && !temporaryFile.exists()) {
+                return EditorExportOutputIdentity(
+                    name = finalName,
+                    uri = Uri.fromFile(pendingFile).toString(),
+                    finalUri = Uri.fromFile(finalFile).toString(),
+                )
+            }
+            collision++
         }
-        if (finalFile.exists()) {
-            check(finalFile.delete()) { "Cannot replace invalid editor output" }
-        }
-        if (temporaryFile.exists()) {
-            check(temporaryFile.delete()) { "Cannot clean editor output rename temporary" }
-        }
-        if (pendingFile.exists() && !pendingFile.delete()) {
-            check(validatePreQFile(pendingFile)) { "Cannot replace invalid editor output partial" }
-        }
-        if (!pendingFile.exists()) {
-            check(pendingFile.createNewFile()) { "Cannot reserve editor output partial" }
-        }
-        return EditorExportOutputIdentity(finalName, Uri.fromFile(pendingFile).toString())
+    }
+
+    /** Claim only the exact pre-Q pending path already persisted in the manifest. */
+    internal fun claimOutput(identity: EditorExportOutputIdentity): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ||
+            Uri.parse(identity.uri).scheme != ContentResolver.SCHEME_FILE
+        ) return true
+        val pendingPath = Uri.parse(identity.uri).path ?: return false
+        val pendingFile = File(pendingPath)
+        val finalPath = identity.finalUri?.let { Uri.parse(it).path }
+            ?: pendingPath.removeSuffix(PRE_Q_PENDING_SUFFIX)
+        // A file appearing after resolve but before claim is not ours. A valid final may be an
+        // already-published retry artifact; an invalid one must remain untouched for collision
+        // safety and make this claim fail.
+        if (pendingFile.exists()) return false
+        if (File(finalPath).exists()) return validatePreQFile(File(finalPath))
+        return pendingFile.createNewFile()
     }
 
     private fun findMediaStoreReservation(attemptId: String): EditorExportOutputIdentity? {
@@ -787,7 +850,7 @@ internal class AndroidEditorExportStorage(
             EditorExportOutputIdentity(
                 name = name,
                 uri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id).toString(),
-            )
+            ).let { identity -> identity.copy(finalUri = identity.uri) }
         }
     }
 
@@ -890,6 +953,13 @@ internal class AndroidEditorExportReservationStore(
         manifest: EditorRenderManifest,
         requestedName: String?,
     ): EditorExportOutputIdentity = storage.reserveOutput(requestedName, manifest)
+
+    override fun resolve(
+        manifest: EditorRenderManifest,
+        requestedName: String?,
+    ): EditorExportOutputIdentity = storage.resolveOutput(requestedName, manifest)
+
+    override fun claim(identity: EditorExportOutputIdentity): Boolean = storage.claimOutput(identity)
 
     override fun release(identity: EditorExportOutputIdentity): Boolean =
         storage.deletePublished(Uri.parse(identity.uri))

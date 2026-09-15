@@ -34,6 +34,10 @@ class EditorExportWorkerTest {
             session = session,
             sourceHistoryId = 41L,
             preset = ExportPreset.HIGH_QUALITY_64,
+            exportAttemptId = "manifest-attempt",
+            reservedOutputName = "voice_manifest-attempt.ogg",
+            reservedOutputUri = "file:///music/voice_manifest-attempt.ogg.pending",
+            reservedOutputFinalUri = "file:///music/voice_manifest-attempt.ogg",
         )
         val file = File.createTempFile("editor-manifest", ".json")
         try {
@@ -186,6 +190,8 @@ class EditorExportWorkerTest {
         val reservation = PreQFakeReservationStore(root)
         val requested = File(root, "mix.ogg").also { it.writeText("keep-source") }
         val snapshot = manifest()
+        val collision = File(root, reservation.baseCandidateName(snapshot, "mix.ogg"))
+            .also { it.writeText("keep-collision") }
         storage.crashAfterCopy = true
 
         try {
@@ -202,6 +208,19 @@ class EditorExportWorkerTest {
             assertTrue(storage.pendingFiles.none { it.exists() })
             assertFalse(root.listFiles()?.any { it.name.endsWith(".marker") } == true)
             assertEquals("keep-source", requested.readText())
+            assertEquals("keep-collision", collision.readText())
+
+            val firstFinal = storage.finalFiles.single { it.exists() }
+            val changedSnapshot = manifest().copy(exportAttemptId = "changed-attempt")
+            val changed = runner(storage, FakeHistory(), reservation).run(
+                changedSnapshot,
+                "changed.ogg",
+                changedSnapshot.preset,
+            )
+            assertTrue(changed is EditorExportResult.Success)
+            assertTrue(firstFinal.exists())
+            assertEquals(2, storage.finalFiles.count { it.exists() })
+            assertEquals("keep-collision", collision.readText())
         } finally {
             root.deleteRecursively()
         }
@@ -323,20 +342,37 @@ class EditorExportWorkerTest {
     ) : EditorExportReservationStore {
         private val identities = mutableMapOf<String, EditorExportOutputIdentity>()
 
+        fun baseCandidateName(manifest: EditorRenderManifest, requestedName: String): String {
+            val suffix = manifest.exportAttemptId.replace(Regex("[^A-Za-z0-9]"), "").take(12)
+            return "${requestedName.removeSuffix(".ogg")}_$suffix.ogg"
+        }
+
         override fun reserve(
             manifest: EditorRenderManifest,
             requestedName: String?,
         ): EditorExportOutputIdentity = identities.getOrPut(manifest.exportAttemptId) {
-            val suffix = manifest.exportAttemptId.replace(Regex("[^A-Za-z0-9]"), "").take(12)
-            val finalName = "${requestedName?.removeSuffix(".ogg") ?: "mix"}_$suffix.ogg"
+            val base = baseCandidateName(manifest, requestedName ?: "mix.ogg")
+            var index = 0
+            var finalName: String
+            do {
+                finalName = if (index == 0) base else {
+                    "${base.removeSuffix(".ogg")}_$index.ogg"
+                }
+                index++
+            } while (
+                File(root, finalName).exists() ||
+                    File(root, "$finalName.pending").exists()
+            )
             val final = File(root, finalName)
             val pending = File(root, "$finalName.pending")
-            when {
-                final.exists() -> EditorExportOutputIdentity(finalName, android.net.Uri.fromFile(final).toString())
-                else -> {
-                    check(pending.exists() || pending.createNewFile())
-                    EditorExportOutputIdentity(finalName, android.net.Uri.fromFile(pending).toString())
-                }
+            EditorExportOutputIdentity(
+                finalName,
+                android.net.Uri.fromFile(pending).toString(),
+                android.net.Uri.fromFile(final).toString(),
+            ).also {
+                // The fake models the post-manifest claim performed by the worker-owned
+                // reservation; direct runner tests still exercise the same retry identity.
+                check(pending.exists() || pending.createNewFile())
             }
         }
 

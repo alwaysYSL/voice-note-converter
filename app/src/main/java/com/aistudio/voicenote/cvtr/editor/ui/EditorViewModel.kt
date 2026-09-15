@@ -114,6 +114,9 @@ internal data class EditorExportUiState(
     val canRetry: Boolean = false,
     val cleanupWarning: String? = null,
     val exportAttemptId: String? = null,
+    /** Immutable request values associated with [exportAttemptId] for safe retry decisions. */
+    val attemptOutputName: String? = null,
+    val attemptPreset: com.aistudio.voicenote.cvtr.editor.model.ExportPreset? = null,
 )
 
 internal interface EditorExportScheduler {
@@ -544,6 +547,7 @@ internal class EditorViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             var manifest: File? = null
             try {
+                val requestedOutputName = current.export.outputName.ifBlank { defaultExportName(current.session) }
                 manifest = EditorRenderManifest.writePrivate(
                     context = getApplication(),
                     session = current.session,
@@ -558,7 +562,7 @@ internal class EditorViewModel(
                 }
                 val request = EditorExportWork.request(
                     manifestPath = manifestFile.absolutePath,
-                    outputName = current.export.outputName.ifBlank { defaultExportName(current.session) },
+                    outputName = requestedOutputName,
                     preset = current.export.preset,
                     exportAttemptId = exportAttemptId,
                 )
@@ -591,6 +595,8 @@ internal class EditorViewModel(
                         canRetry = false,
                         progress = 0f,
                         exportAttemptId = exportAttemptId,
+                        attemptOutputName = requestedOutputName,
+                        attemptPreset = current.export.preset,
                     ))
                 }
                 observeExport(id)
@@ -686,12 +692,21 @@ internal class EditorViewModel(
     }
 
     private fun retryExport() {
-        if (_uiState.value.export.canRetry || _uiState.value.export.status == EditorExportStatus.CANCELLED) {
-            val previousAttemptId = _uiState.value.export.exportAttemptId
+        val export = _uiState.value.export
+        if (export.canRetry || export.status == EditorExportStatus.CANCELLED) {
+            val requestedOutputName = export.outputName.ifBlank { defaultExportName(_uiState.value.session) }
+            val previousAttemptId = export.exportAttemptId
+            val reuseAttempt = previousAttemptId != null &&
+                export.attemptOutputName == requestedOutputName &&
+                export.attemptPreset == export.preset
             _uiState.update { it.copy(export = it.export.copy(status = EditorExportStatus.IDLE, error = null, progress = 0f)) }
-            // Reuse a terminal attempt key with REPLACE so an uncertain process-retry that
-            // already committed history converges instead of creating a second export.
-            startExport(previousAttemptId, replaceExisting = previousAttemptId != null)
+            // Reuse a terminal attempt only when the request identity is unchanged. A changed
+            // name or preset must get a fresh manifest/attempt so its persisted output identity
+            // cannot be accidentally reused or cleaned by the new export.
+            startExport(
+                requestedAttemptId = previousAttemptId.takeIf { reuseAttempt },
+                replaceExisting = reuseAttempt,
+            )
         }
     }
 

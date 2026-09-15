@@ -245,6 +245,33 @@ class EditorViewModelTest {
         assertFalse(manifest.exists())
     }
 
+    @Test
+    fun `retry after changing output name creates a new export attempt`() = runBlocking {
+        val scheduler = RecordingExportScheduler()
+        val vm = editorViewModel(
+            EditorLaunchSource.Converted(Uri.parse("content://media/result.ogg"), null, "voice.ogg"),
+            exportScheduler = scheduler,
+        )
+        vm.awaitReady()
+
+        vm.dispatch(EditorIntent.StartExport)
+        scheduler.awaitRequestCount(1)
+        val firstAttempt = scheduler.uniqueRequests.single().workSpec.input
+            .getString(EditorExportWork.EXPORT_ATTEMPT_ID)
+
+        vm.dispatch(EditorIntent.CancelExport)
+        vm.dispatch(EditorIntent.SetExportName("changed.ogg"))
+        vm.dispatch(EditorIntent.RetryExport)
+        scheduler.awaitRequestCount(2)
+
+        val secondAttempt = scheduler.uniqueRequests.last().workSpec.input
+            .getString(EditorExportWork.EXPORT_ATTEMPT_ID)
+        assertFalse(firstAttempt.isNullOrBlank())
+        assertFalse(secondAttempt.isNullOrBlank())
+        assertFalse(firstAttempt == secondAttempt)
+        assertFalse(scheduler.uniqueNames[0] == scheduler.uniqueNames[1])
+    }
+
     private suspend fun awaitTrackCount(vm: EditorViewModel, count: Int) {
         withTimeout(5_000L) {
             while (vm.uiState.value.session.tracks.size < count) delay(10L)
@@ -293,5 +320,9 @@ class EditorViewModelTest {
         override fun observe(id: UUID): Flow<WorkInfo?> = emptyFlow()
 
         suspend fun awaitFirst() = withTimeout(5_000L) { firstEnqueue.await() }
+
+        suspend fun awaitRequestCount(count: Int) = withTimeout(5_000L) {
+            while (uniqueRequests.size < count) delay(10L)
+        }
     }
 }
