@@ -65,3 +65,16 @@ No audio files were present on the emulator and `ffmpeg`, `sox`, `avconv`, and `
 - Workspace contained no `*.partial` files.
 - Debuggable emulator app data contained no `*.partial` or `*.pending` files after the exercised launch/install flow.
 - Deferred: reproduce the aggregate History semantics flake under a deterministic synchronization fix; perform real-device editor smoke with a valid audio fixture; rerun the full post-fix broad gate when the History test is stabilized.
+
+## Final verification rerun at `1ed3a84`
+
+Date: 2026-09-16 (Asia/Jakarta). No code or test sources were changed for this rerun.
+
+| Command | Exit | Evidence |
+|---|---:|---|
+| `gradlew.bat :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon` | 1 | `BUILD FAILED in 2m 30s`; `217 tests completed, 1 failed, 1 skipped`. The failing test was `EditorFinalReviewStateTest.cleanup before save keeps cache key across private promotion and reopen`, ending in `TimeoutCancellationException`. `:app:lintDebug` completed and its report contained 0 errors/72 warnings; `:app:assembleDebug` completed. |
+| `gradlew.bat :app:verifyRoborazziDebug --tests "*.EditorScreenshotTest" --tests "*.GreetingScreenshotTest" --no-daemon` | 0 | `BUILD SUCCESSFUL in 29s`; 33 actionable tasks (2 executed, 31 up-to-date). |
+| `git diff --check` | 0 | No whitespace errors. |
+| `git status --short --branch` | 0 | Clean `codex/audio-editor` worktree at HEAD `1ed3a84`. |
+
+Final rerun status remains **PARTIAL**: focused screenshot verification passes, but the broad gate is blocked by the cleanup/draft promotion timeout above. This rerun did not alter production or test code.
