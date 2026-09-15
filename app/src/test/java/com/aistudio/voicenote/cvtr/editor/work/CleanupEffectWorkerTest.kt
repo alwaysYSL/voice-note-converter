@@ -10,8 +10,11 @@ import androidx.work.WorkerFactory
 import androidx.work.WorkerParameters
 import androidx.work.impl.utils.taskexecutor.SerialExecutor
 import androidx.work.impl.utils.taskexecutor.TaskExecutor
+import com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength
+import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioKey
 import com.google.common.util.concurrent.Futures
 import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNotEquals
 import org.junit.Rule
@@ -54,6 +57,36 @@ class CleanupEffectWorkerTest {
         val after = StableSourceFingerprint.compute(context, sourceUri, "source-fingerprint-v2:unverified")
 
         assertNotEquals(before, after)
+    }
+
+    @Test
+    fun `byte-identical sources share a processed key regardless of path`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val first = tempFolder.newFile("source-first.raw")
+        val second = tempFolder.newFile("source-second.raw")
+        val bytes = ByteArray(256 * 1024) { (it * 17).toByte() }
+        first.writeBytes(bytes)
+        second.writeBytes(bytes)
+
+        val firstFingerprint = StableSourceFingerprint.compute(context, first.toURI().toString(), "ignored")
+        val secondFingerprint = StableSourceFingerprint.compute(context, second.toURI().toString(), "ignored")
+        val firstKey = ProcessedAudioKey(
+            sourceFingerprint = firstFingerprint,
+            sourceStartMs = 0L,
+            sourceEndMs = 1_000L,
+            cleanup = CleanupStrength.MEDIUM,
+            normalized = true,
+        ).toFilename()
+        val secondKey = ProcessedAudioKey(
+            sourceFingerprint = secondFingerprint,
+            sourceStartMs = 0L,
+            sourceEndMs = 1_000L,
+            cleanup = CleanupStrength.MEDIUM,
+            normalized = true,
+        ).toFilename()
+
+        assertEquals(firstFingerprint, secondFingerprint)
+        assertEquals(firstKey, secondKey)
     }
 
     private fun workerParameters(input: Data): WorkerParameters {

@@ -2,7 +2,6 @@ package com.aistudio.voicenote.cvtr.editor.work
 
 import android.content.Context
 import android.net.Uri
-import android.provider.OpenableColumns
 import androidx.work.CoroutineWorker
 import androidx.work.Data
 import androidx.work.WorkerParameters
@@ -58,7 +57,7 @@ internal class CleanupEffectWorker(
         )
         // A verified caller fingerprint is an optimistic concurrency token, never the cache-key
         // source. Recompute from bytes and reject a changed source before rendering.
-        if (requestedFingerprint.startsWith("source-fingerprint-v2:") &&
+        if (requestedFingerprint.startsWith("source-content-sha256-v1:") &&
             requestedFingerprint != sourceFingerprint
         ) {
             return@withContext failure("Source changed before cleanup started")
@@ -326,25 +325,18 @@ private fun Long.checkedMultiplyForEstimate(value: Long): Long =
 private fun Long.checkedAddForEstimate(value: Long): Long =
     if (value < 0L || this > Long.MAX_VALUE - value) Long.MAX_VALUE else this + value
 
-/** Stable content-aware fingerprint without retaining an entire media file in memory. */
+/** Stable content identity without retaining an entire media file in memory. */
 internal object StableSourceFingerprint {
-    private const val VERSION = "source-fingerprint-v2"
+    private const val VERSION = "source-content-sha256-v1"
     private const val HASH_BUFFER_BYTES = 64 * 1024
 
     @Suppress("UNUSED_PARAMETER")
     fun compute(context: Context, sourceUri: String, requested: String): String {
         val digest = MessageDigest.getInstance("SHA-256")
         val uri = Uri.parse(sourceUri)
-        val metadata = queryMetadata(context, uri, sourceUri)
-        val canonicalPrefix =
-            "$VERSION|${ProcessedAudioCache.KEY_FORMAT_VERSION}|" +
-                "${ProcessedAudioCache.CACHE_ALGORITHM_VERSION}|" +
-                "${canonicalField("uri", sourceUri)}|" +
-                "${canonicalField("metadata", metadata)}|content="
-        digest.update(canonicalPrefix.toByteArray(Charsets.UTF_8))
-        runCatching {
-            val stream = openStream(context, uri, sourceUri)
-                ?: throw IOException("Unable to open source for fingerprint")
+        val stream = runCatching { openStream(context, uri, sourceUri) }.getOrNull()
+            ?: return "$VERSION:unreadable"
+        return try {
             stream.use { input ->
                 val buffer = ByteArray(HASH_BUFFER_BYTES)
                 while (true) {
@@ -354,56 +346,22 @@ internal object StableSourceFingerprint {
                     digest.update(buffer, 0, read)
                 }
             }
-        }.onFailure {
-            // The caller-supplied fingerprint is deliberately ignored. Decoder/render failure
-            // remains the source of truth when a source cannot be read for identity computation.
-            digest.update("|unreadable|".toByteArray(Charsets.UTF_8))
+            // The identity deliberately contains only the complete source bytes. URI, path,
+            // display name, provider metadata, and caller-supplied tokens are not identity data.
+            "$VERSION:" + digest.digest().toHex()
+        } catch (_: Throwable) {
+            // An unreadable source cannot produce a verified content identity. Keep this marker
+            // path-free so it can never alias a valid cache entry from another source.
+            "$VERSION:unreadable"
         }
-        return "$VERSION:" + digest.digest().toHex()
     }
 
-    private fun queryMetadata(context: Context, uri: Uri, fallback: String): String {
-        val file = if (uri.scheme.isNullOrBlank()) File(fallback) else null
-        var size = file?.takeIf { it.isFile }?.length()
-        var displayName = file?.takeIf { it.isFile }?.name.orEmpty()
-        if (size == null || displayName.isEmpty()) {
-            runCatching {
-                context.contentResolver.query(
-                    uri,
-                    arrayOf(OpenableColumns.SIZE, OpenableColumns.DISPLAY_NAME),
-                    null,
-                    null,
-                    null,
-                )?.use { cursor ->
-                    if (cursor.moveToFirst()) {
-                        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-                        val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                        if (size == null && sizeIndex >= 0) {
-                            size = cursor.getLong(sizeIndex).takeIf { it >= 0L }
-                        }
-                        if (displayName.isEmpty() && nameIndex >= 0 && !cursor.isNull(nameIndex)) {
-                            displayName = cursor.getString(nameIndex).orEmpty()
-                        }
-                    }
-                }
-            }
-        }
-        val modified = file?.takeIf { it.isFile }?.lastModified() ?: 0L
-        val type = runCatching { context.contentResolver.getType(uri) }.getOrNull().orEmpty()
-        return listOf(
-            "size=${size ?: -1L}",
-            "modified=$modified",
-            canonicalField("mime", type),
-            canonicalField("displayName", displayName),
-        ).joinToString("|")
+    private fun openStream(context: Context, uri: Uri, fallback: String): InputStream? {
+        // Draft sources are persisted as plain paths. Check the path first so a Windows drive
+        // letter is not misread by Uri.parse as a URI scheme during JVM validation.
+        File(fallback).takeIf { it.isFile }?.let { return it.inputStream() }
+        return if (uri.scheme.isNullOrBlank()) null else context.contentResolver.openInputStream(uri)
     }
-
-    private fun openStream(context: Context, uri: Uri, fallback: String): InputStream? =
-        if (uri.scheme.isNullOrBlank()) File(fallback).inputStream() else
-            context.contentResolver.openInputStream(uri)
-
-    private fun canonicalField(name: String, value: String): String =
-        "$name=${value.length}:$value"
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 }

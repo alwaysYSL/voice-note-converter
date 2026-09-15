@@ -290,6 +290,8 @@ internal data class EditorUiState(
     val offlineClipIds: Set<String> = emptySet(),
     val sourceError: String? = null,
     val effectRecoveryClipIds: Set<String> = emptySet(),
+    /** True while a draft's persisted cleanup keys are being validated against source bytes. */
+    val cleanupInspectionPending: Boolean = false,
 )
 
 private data class CleanupTarget(
@@ -490,8 +492,10 @@ internal class EditorViewModel(
             }
             EditorIntent.ClearMessage -> _uiState.update { it.copy(message = null) }
             is EditorIntent.ShowSheet -> _uiState.update { it.copy(activeSheet = intent.sheet) }
-            is EditorIntent.ShowExportSheet -> _uiState.update {
-                it.copy(export = it.export.copy(sheetOpen = intent.open))
+            is EditorIntent.ShowExportSheet -> if (intent.open && _uiState.value.cleanupInspectionPending) {
+                rejectPendingExport()
+            } else {
+                _uiState.update { it.copy(export = it.export.copy(sheetOpen = intent.open)) }
             }
             is EditorIntent.SetExportName -> _uiState.update {
                 it.copy(export = it.export.copy(outputName = intent.name))
@@ -520,6 +524,18 @@ internal class EditorViewModel(
     private fun saveDraft(exitAfterSave: Boolean) {
         val current = _uiState.value
         if (current.loading || current.draft.status == EditorDraftSaveStatus.SAVING) return
+        if (current.cleanupInspectionPending) {
+            _uiState.update {
+                it.copy(draft = it.draft.copy(
+                    status = EditorDraftSaveStatus.FAILED,
+                    progress = 0f,
+                    error = "Cleanup cache validation in progress",
+                    canRetry = false,
+                    exitAfterSave = exitAfterSave,
+                ))
+            }
+            return
+        }
         _uiState.update {
             it.copy(draft = it.draft.copy(
                 status = EditorDraftSaveStatus.SAVING,
@@ -828,8 +844,29 @@ internal class EditorViewModel(
             finishLoading(EditorSession.empty())
             return
         }
-        finishLoading(loaded.session)
-        val availability = inspectDraftSources(loaded)
+        val hasCleanupMetadata = loaded.session.hasCleanupCacheMetadata()
+        finishLoading(loaded.session, cleanupInspectionPending = hasCleanupMetadata)
+        val availability = try {
+            inspectDraftSources(loaded)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            // Keep the draft open, but make every persisted cleanup result recoverable instead
+            // of allowing export/save to proceed on an unverified cache reference.
+            val recoveryIds = loaded.session.cleanupCacheClipIds()
+            _uiState.update {
+                it.copy(
+                    cleanupInspectionPending = false,
+                    effectRecoveryClipIds = recoveryIds,
+                    sourceError = if (recoveryIds.isEmpty()) {
+                        "Draft cleanup validation failed"
+                    } else {
+                        "Draft cleanup cache could not be validated"
+                    },
+                )
+            }
+            return
+        }
         _uiState.update {
             it.copy(
                 offlineClipIds = availability.unavailableClipIds,
@@ -840,6 +877,7 @@ internal class EditorViewModel(
                 },
                 draft = it.draft.copy(draftId = draftId),
                 effectRecoveryClipIds = availability.effectRecoveryClipIds,
+                cleanupInspectionPending = false,
             )
         }
         availability.sourceUris
@@ -929,7 +967,10 @@ internal class EditorViewModel(
         )
     }
 
-    private fun finishLoading(session: EditorSession) {
+    private fun finishLoading(
+        session: EditorSession,
+        cleanupInspectionPending: Boolean = false,
+    ) {
         commandHistory = CommandHistory(session)
         syncCacheReferences()
         previewEngine.load(session)
@@ -954,6 +995,7 @@ internal class EditorViewModel(
                 offlineClipIds = emptySet(),
                 sourceError = null,
                 effectRecoveryClipIds = emptySet(),
+                cleanupInspectionPending = cleanupInspectionPending,
             )
         }
     }
@@ -970,6 +1012,10 @@ internal class EditorViewModel(
                 current.export.status == EditorExportStatus.QUEUED ||
                 current.export.status == EditorExportStatus.RUNNING
             ) return
+            if (current.cleanupInspectionPending) {
+                rejectPendingExport()
+                return
+            }
             if (!hasRenderableAudio(current.session)) {
                 _uiState.update {
                     it.copy(export = it.export.copy(
@@ -1101,6 +1147,10 @@ internal class EditorViewModel(
         preset: CleanupStrength,
         wholeTrack: Boolean,
     ) {
+        if (_uiState.value.cleanupInspectionPending) {
+            rejectPendingCleanup()
+            return
+        }
         val session = _uiState.value.session
         val clipId = targetClipId ?: session.selectedClipId ?: return
         val track = session.tracks.firstOrNull { track -> track.clips.any { it.id == clipId } } ?: return
@@ -1362,6 +1412,10 @@ internal class EditorViewModel(
 
     private fun reapplyCleanup(clipId: String?) {
         val state = _uiState.value
+        if (state.cleanupInspectionPending) {
+            rejectPendingCleanup()
+            return
+        }
         val targetId = clipId ?: state.effectRecoveryClipIds.firstOrNull() ?: return
         val clip = state.session.findClipForCleanup(targetId) ?: return
         val strength = runCatching {
@@ -1663,6 +1717,38 @@ internal class EditorViewModel(
     private fun showMessage(message: EditorMessage) {
         _uiState.update { it.copy(message = message) }
     }
+
+    private fun rejectPendingExport() {
+        _uiState.update {
+            it.copy(export = it.export.copy(
+                status = EditorExportStatus.FAILED,
+                error = "Cleanup cache validation in progress",
+                canRetry = false,
+                progress = 0f,
+                sheetOpen = false,
+            ))
+        }
+    }
+
+    private fun rejectPendingCleanup() {
+        _uiState.update {
+            it.copy(cleanup = it.cleanup.copy(
+                status = EditorCleanupStatus.FAILED,
+                error = "Cleanup cache validation in progress",
+                canRetry = false,
+            ))
+        }
+    }
+
+    private fun EditorSession.hasCleanupCacheMetadata(): Boolean =
+        tracks.asSequence().flatMap { it.clips.asSequence() }
+            .any { it.effects.processedCacheKey != null }
+
+    private fun EditorSession.cleanupCacheClipIds(): Set<String> =
+        tracks.asSequence().flatMap { it.clips.asSequence() }
+            .filter { it.effects.processedCacheKey != null }
+            .map { it.id }
+            .toSet()
 
     private fun sameAudioContent(left: EditorSession, right: EditorSession): Boolean {
         if (left.tracks.size != right.tracks.size) return false

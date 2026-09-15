@@ -409,6 +409,7 @@ internal fun EditorBottomActions(
     canRedo: Boolean,
     exportState: EditorExportUiState = EditorExportUiState(),
     draftState: EditorDraftUiState = EditorDraftUiState(),
+    cleanupInspectionPending: Boolean = false,
     onIntent: (EditorIntent) -> Unit,
     onPickTrack: () -> Unit,
 ) {
@@ -450,7 +451,7 @@ internal fun EditorBottomActions(
         }
         Button(
             onClick = { onIntent(EditorIntent.SaveDraft()) },
-            enabled = draftState.status != EditorDraftSaveStatus.SAVING,
+            enabled = !cleanupInspectionPending && draftState.status != EditorDraftSaveStatus.SAVING,
             modifier = Modifier
                 .weight(1f)
                 .heightIn(min = 48.dp)
@@ -466,7 +467,7 @@ internal fun EditorBottomActions(
         }
         Button(
             onClick = { onIntent(EditorIntent.ShowExportSheet(true)) },
-            enabled = session.tracks.isNotEmpty() &&
+            enabled = !cleanupInspectionPending && session.tracks.isNotEmpty() &&
                 exportState.status != EditorExportStatus.QUEUED &&
                 exportState.status != EditorExportStatus.RUNNING,
             modifier = Modifier

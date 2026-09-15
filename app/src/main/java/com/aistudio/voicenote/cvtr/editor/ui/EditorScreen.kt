@@ -196,6 +196,7 @@ internal fun EditorScreen(
                 canRedo = state.canRedo,
                 exportState = state.export,
                 draftState = state.draft,
+                cleanupInspectionPending = state.cleanupInspectionPending,
                 onIntent = onIntent,
                 onPickTrack = onPickTrack,
             )

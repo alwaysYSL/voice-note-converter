@@ -195,6 +195,159 @@ class EditorFinalReviewStateTest {
         }
     }
 
+    @Test
+    fun `cleanup before save keeps cache key across private promotion and reopen`() = runBlocking {
+        val external = File.createTempFile("editor-cleanup-external", ".wav")
+        val privateSource = File(app.filesDir, "editor-final-cleanup/private.wav").apply {
+            parentFile?.mkdirs()
+        }
+        writeCanonicalWav(external, 48_000)
+        external.copyTo(privateSource, overwrite = true)
+        val scheduler = CleanupSchedulerFake()
+        var durable: EditorDraftLoad? = null
+        try {
+            val vm = EditorViewModel(
+                application = app,
+                launchSource = EditorLaunchSource.Converted(Uri.fromFile(external), null, "voice"),
+                persistDraft = { session, _ ->
+                    val promoted = session.copy(
+                        id = "draft-cleanup-promotion",
+                        draftId = "draft-cleanup-promotion",
+                        dirty = false,
+                        tracks = session.tracks.map { track ->
+                            track.copy(clips = track.clips.map { clip ->
+                                clip.copy(source = clip.source.copy(uri = privateSource.absolutePath))
+                            })
+                        },
+                    )
+                    EditorDraftLoad(promoted, emptyList()).also { durable = it }
+                },
+                loadDraft = { durable },
+                sourceAnalyzer = { AudioSourceInfo("voice", 1_000L) },
+                waveformLoader = { emptyList() },
+                cleanupScheduler = scheduler,
+            )
+            vm.awaitReady()
+            vm.dispatch(EditorIntent.StartCleanup("clip-1", normalize = true, preset = CleanupStrength.MEDIUM))
+            val request = scheduler.awaitRequest()
+            val input = request.workRequest.workSpec.input
+            val key = ProcessedAudioKey(
+                sourceFingerprint = input.getString(CleanupEffectWork.SOURCE_FINGERPRINT)!!,
+                sourceStartMs = input.getLong(CleanupEffectWork.SOURCE_START_MS, 0L),
+                sourceEndMs = input.getLong(CleanupEffectWork.SOURCE_END_MS, 0L),
+                cleanup = CleanupStrength.valueOf(input.getString(CleanupEffectWork.CLEANUP_STRENGTH)!!),
+                normalized = input.getBoolean(CleanupEffectWork.NORMALIZED, false),
+                algorithmVersion = input.getString(CleanupEffectWork.ALGORITHM_VERSION)!!,
+            )
+            val cacheFile = File(app.cacheDir, "processed_audio/${key.toFilename()}.pcm")
+            cacheFile.parentFile?.mkdirs()
+            writeCanonicalWav(cacheFile, 48_000)
+            scheduler.emitSuccess(
+                request.id,
+                Data.Builder()
+                    .putString(CleanupEffectWork.RESULT_CACHE_KEY_FILENAME, key.toFilename())
+                    .putString(CleanupEffectWork.RESULT_CACHE_KEY_FINGERPRINT, key.sourceFingerprint)
+                    .putLong(CleanupEffectWork.RESULT_SOURCE_START_MS, key.sourceStartMs)
+                    .putLong(CleanupEffectWork.RESULT_SOURCE_END_MS, key.sourceEndMs)
+                    .putString(CleanupEffectWork.RESULT_CLEANUP_STRENGTH, key.cleanup.name)
+                    .putBoolean(CleanupEffectWork.RESULT_NORMALIZED, key.normalized)
+                    .putString(CleanupEffectWork.RESULT_ALGORITHM_VERSION, key.algorithmVersion)
+                    .build(),
+            )
+            awaitCondition { vm.uiState.value.cleanup.status == EditorCleanupStatus.SUCCEEDED }
+
+            val keyBeforeSave = vm.uiState.value.session.tracks.single().clips.single()
+                .effects.processedCacheKey
+            assertNotNull(keyBeforeSave)
+            vm.dispatch(EditorIntent.SaveDraft())
+            awaitDraft(vm, EditorDraftSaveStatus.SUCCEEDED)
+            assertEquals(keyBeforeSave, vm.uiState.value.session.tracks.single().clips.single().effects.processedCacheKey)
+
+            val reopened = EditorViewModel(
+                application = app,
+                launchSource = EditorLaunchSource.Draft("draft-cleanup-promotion"),
+                loadDraft = { durable },
+                sourceAnalyzer = { AudioSourceInfo("voice", 1_000L) },
+                waveformLoader = { emptyList() },
+            )
+            reopened.awaitReady()
+            assertEquals(
+                keyBeforeSave,
+                reopened.uiState.value.session.tracks.single().clips.single().effects.processedCacheKey,
+            )
+            assertTrue(reopened.uiState.value.effectRecoveryClipIds.isEmpty())
+        } finally {
+            external.delete()
+            privateSource.delete()
+        }
+    }
+
+    @Test
+    fun `draft cache inspection is synchronously pending and blocks export and save`() = runBlocking {
+        val source = File.createTempFile("editor-pending-source", ".wav")
+        writeCanonicalWav(source, 48_000)
+        val fingerprint = com.aistudio.voicenote.cvtr.editor.work.StableSourceFingerprint.compute(
+            app,
+            source.toURI().toString(),
+            "ignored",
+        )
+        val durable = EditorDraftLoad(
+            session = session(
+                Uri.fromFile(source).toString(),
+                durationMs = 1_000L,
+                effects = ClipEffects(
+                    processedCacheKey = ProcessedAudioKey(
+                        sourceFingerprint = fingerprint,
+                        sourceStartMs = 0L,
+                        sourceEndMs = 1_000L,
+                        cleanup = CleanupStrength.MEDIUM,
+                        normalized = true,
+                    ).toFilename(),
+                    cleanupStrength = CleanupStrength.MEDIUM.name,
+                    cleanupNormalized = true,
+                    cleanupAlgorithmVersion = ProcessedAudioCache.CACHE_ALGORITHM_VERSION,
+                ),
+            ),
+            missingPrivateSources = emptyList(),
+        )
+        val pendingCache = File(
+            app.cacheDir,
+            "processed_audio/${durable.session.tracks.single().clips.single().effects.processedCacheKey}.pcm",
+        )
+        pendingCache.delete()
+        val sourceProbe = CompletableDeferred<AudioSourceInfo>()
+        var saveAttempts = 0
+        try {
+            val vm = EditorViewModel(
+                application = app,
+                launchSource = EditorLaunchSource.Draft("draft-pending-inspection"),
+                loadDraft = { durable },
+                persistDraft = { _, _ ->
+                    saveAttempts++
+                    durable
+                },
+                sourceAnalyzer = { sourceProbe.await() },
+                waveformLoader = { emptyList() },
+            )
+            awaitCondition { vm.uiState.value.cleanupInspectionPending }
+
+            vm.dispatch(EditorIntent.StartExport)
+            vm.dispatch(EditorIntent.SaveDraft())
+            assertEquals(EditorExportStatus.FAILED, vm.uiState.value.export.status)
+            assertEquals("Cleanup cache validation in progress", vm.uiState.value.export.error)
+            assertEquals(EditorDraftSaveStatus.FAILED, vm.uiState.value.draft.status)
+            assertEquals(0, saveAttempts)
+
+            sourceProbe.complete(AudioSourceInfo("source", 1_000L))
+            vm.awaitReady()
+            assertFalse(vm.uiState.value.cleanupInspectionPending)
+            assertTrue(vm.uiState.value.effectRecoveryClipIds.contains("clip-1"))
+        } finally {
+            source.delete()
+            pendingCache.delete()
+        }
+    }
+
     private suspend fun awaitDraft(vm: EditorViewModel, status: EditorDraftSaveStatus) {
         awaitCondition { vm.uiState.value.draft.status == status }
     }

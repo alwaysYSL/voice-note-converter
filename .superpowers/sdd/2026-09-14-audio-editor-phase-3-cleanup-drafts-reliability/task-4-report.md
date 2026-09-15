@@ -56,3 +56,25 @@ Verification:
 - Isolated replacement tests: **3 tests, 0 failures**.
 - Focused Task-4/ViewModel/maintenance/export suite: **40 tests, 0 failures**.
 - `git diff --check` — clean.
+
+## Final cache-promotion and inspection reliability pass
+
+- Processed-audio identity now hashes the complete source bytes only. URI/path, display name, and
+  provider metadata no longer affect the cache key; range, PCM format key version, cleanup effect,
+  normalize flag, and algorithm version remain part of the canonical key.
+- Draft load publishes a synchronous cleanup-cache inspection gate before the suspending source/cache
+  validation. Export, draft save, cleanup start, and cleanup reapply are rejected while inspection is
+  pending; validation then clears the gate and either preserves the valid key or exposes recovery IDs.
+- Added the combined regression for cleanup-before-save -> private source promotion -> reopen, plus the
+  immediate export/save rejection while inspection was forced pending.
+
+Verification:
+
+- `git diff --check` — passed.
+- `:app:testDebugUnitTest --tests '*.EditorFinalReviewStateTest' --tests '*.EditorViewModelTest' --tests '*.ProcessedAudioCacheTest' --tests '*.CleanupEffectWorkerTest'` —
+  blocked during project configuration because this shell has no installed Android NDK; AGP fails in
+  `NdkLocatorKt.getNdkVersionedFolders` before tests execute.
+- `:app:assembleDebug` — same Android NDK configuration blocker; rerun in a provisioned Android
+  environment.
+
+Residual risk: final Gradle test/build evidence still requires the configured SDK/NDK toolchain.
