@@ -63,11 +63,36 @@ internal class CommandHistory(
         if (result is TimelineResult.Accepted) {
             undo.addLast(session)
             trimToCapacity(undo)
-            session = withDirtyBaseline(result.value)
+            session = withDirtyBaseline(result.value.copy(revision = session.revision + 1))
             redo.clear()
         }
         return result
     }
+
+    /** Applies a command from an explicit baseline snapshot, rejecting stale revisions. */
+    @Synchronized
+    fun executeFromBaseline(
+        baseline: EditorSession,
+        command: EditorCommand,
+    ): TimelineResult {
+        if (!sameRevision(session, baseline)) {
+            return TimelineResult.Rejected(TimelineError.STALE_BASELINE)
+        }
+
+        return when (val result = command.applyTo(baseline)) {
+            is TimelineResult.Rejected -> result
+            is TimelineResult.Accepted -> {
+                undo.addLast(session)
+                trimToCapacity(undo)
+                session = withDirtyBaseline(result.value.copy(revision = session.revision + 1))
+                redo.clear()
+                TimelineResult.Accepted(session)
+            }
+        }
+    }
+
+    private fun sameRevision(left: EditorSession, right: EditorSession): Boolean =
+        left.revision == right.revision && sameRenderedContent(left, right)
 
     /** Restores the latest snapshot, or leaves the current session unchanged if empty. */
     @Synchronized

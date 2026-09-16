@@ -107,6 +107,33 @@ internal object TimelineOperations {
         return commit(session.replaceClip(location, location.clip.copy(timelineStartMs = timelineStartMs)))
     }
 
+    fun moveClipPreview(
+        session: EditorSession,
+        clipId: String,
+        timelineStartMs: Long,
+    ): TimelineResult {
+        val location = session.findClip(clipId) ?: return TimelineResult.Rejected(TimelineError.MISSING_ID)
+        if (timelineStartMs < 0L) return TimelineResult.Rejected(TimelineError.INVALID_TIMELINE_RANGE)
+        val candidate = session.replaceClip(location, location.clip.copy(timelineStartMs = timelineStartMs))
+        return validate(candidate)
+    }
+
+    fun trimClipPreview(
+        session: EditorSession,
+        clipId: String,
+        sourceStartMs: Long,
+        sourceEndMs: Long,
+    ): TimelineResult {
+        val location = session.findClip(clipId) ?: return TimelineResult.Rejected(TimelineError.MISSING_ID)
+        val candidate = location.clip.copy(
+            sourceStartMs = sourceStartMs,
+            sourceEndMs = sourceEndMs,
+            effects = location.clip.effects.clearCleanup(),
+        )
+        sourceRangeError(candidate)?.let { return TimelineResult.Rejected(it) }
+        return validate(session.replaceClip(location, candidate))
+    }
+
     /**
      * Deletes a clip. By default the deleted duration is rippled through later clips on
      * the same track. [ripple] = false preserves the gap.
@@ -212,6 +239,41 @@ internal object TimelineOperations {
             )
         }
         return commit(candidate)
+    }
+
+    fun reorderClip(session: EditorSession, clipId: String, targetIndex: Int): TimelineResult {
+        val sequence = session.toSequenceSession()
+        val currentIdx = sequence.indexOfClip(clipId)
+        if (currentIdx < 0) return TimelineResult.Rejected(TimelineError.MISSING_ID)
+        if (targetIndex !in 0 until sequence.clips.size) {
+            return TimelineResult.Rejected(TimelineError.INVALID_TIMELINE_RANGE)
+        }
+        val reorderedSeq = sequence.reorderClip(clipId, targetIndex)
+        return commit(reorderedSeq.toRenderSession())
+    }
+
+    fun appendClips(session: EditorSession, newClips: List<AudioClip>): TimelineResult {
+        if (newClips.isEmpty()) return TimelineResult.Rejected(TimelineError.MISSING_ID)
+        for (clip in newClips) {
+            val err = sourceRangeError(clip)
+            if (err != null) return TimelineResult.Rejected(err)
+        }
+        val sequence = session.toSequenceSession()
+        val seqClips = newClips.map { clip ->
+            SequenceClip(
+                id = clip.id,
+                source = clip.source,
+                sourceStartMs = clip.sourceStartMs,
+                sourceEndMs = clip.sourceEndMs,
+                effects = clip.effects,
+            )
+        }
+        val appendedSeq = sequence.appendClips(seqClips)
+        val rendered = appendedSeq.toRenderSession()
+        if (rendered.tracks.firstOrNull()?.clips?.lastOrNull()?.timelineEndMs?.let { it > MAX_TIMELINE_MS } == true) {
+            return TimelineResult.Rejected(TimelineError.DURATION_LIMIT)
+        }
+        return commit(rendered)
     }
 
     /** Validates and canonicalizes one immutable session without mutating the caller's lists. */

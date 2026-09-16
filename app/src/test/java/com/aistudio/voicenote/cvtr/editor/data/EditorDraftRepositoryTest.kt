@@ -73,6 +73,58 @@ class EditorDraftRepositoryTest {
     }
 
     @Test
+    fun `legacy multitrack draft flattens to sequence when loaded`() = runBlocking {
+        val fileA = File(root, "file-a.ogg").apply { parentFile!!.mkdirs(); writeBytes(byteArrayOf(1, 2, 3)) }
+        val fileB = File(root, "file-b.ogg").apply { writeBytes(byteArrayOf(4, 5, 6)) }
+        val db = Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).build()
+        val storage = DraftSourceStorage(root = File(root, "files"))
+        val repository = EditorDraftRepository(db, storage)
+        try {
+            val multitrackSession = EditorSession(
+                id = "legacy-draft",
+                tracks = listOf(
+                    EditorTrack(
+                        id = "track-1",
+                        name = "Track 1",
+                        clips = listOf(
+                            AudioClip(
+                                id = "clip-1",
+                                source = AudioSourceRef(fileA.toURI().toString(), 3_000L),
+                                sourceStartMs = 0L,
+                                sourceEndMs = 3_000L,
+                                timelineStartMs = 0L,
+                            )
+                        )
+                    ),
+                    EditorTrack(
+                        id = "track-2",
+                        name = "Track 2",
+                        clips = listOf(
+                            AudioClip(
+                                id = "clip-2",
+                                source = AudioSourceRef(fileB.toURI().toString(), 4_000L),
+                                sourceStartMs = 0L,
+                                sourceEndMs = 4_000L,
+                                timelineStartMs = 2_000L,
+                            )
+                        )
+                    )
+                )
+            )
+            val id = repository.save(multitrackSession)
+            val loaded = repository.load(id)
+            org.junit.Assert.assertNotNull(loaded)
+            assertEquals(1, loaded!!.tracks.size)
+            assertEquals(2, loaded.tracks.single().clips.size)
+            assertEquals(0L, loaded.tracks.single().clips[0].timelineStartMs)
+            assertEquals(3_000L, loaded.tracks.single().clips[1].timelineStartMs)
+            assertEquals(7_000L, loaded.tracks.single().clips[1].timelineEndMs)
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
     fun `delete rejects traversal and removes only canonical draft directory`() = runBlocking {
         val db = Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).build()
         val storage = DraftSourceStorage(root = File(root, "files"))

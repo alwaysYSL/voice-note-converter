@@ -389,7 +389,7 @@ internal class EditorPreviewEngine(
 
     private companion object {
         const val RENDER_CHUNK_FRAMES = 960
-        const val TARGET_QUEUE_FRAMES = EDITOR_SAMPLE_RATE * 3L
+        const val TARGET_QUEUE_FRAMES = EDITOR_SAMPLE_RATE * 1L
     }
 }
 

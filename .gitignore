@@ -17,3 +17,7 @@
 local.properties
 .env
 debug.keystore
+.gradle-*
+.android-*
+.idea/
+.superpowers/

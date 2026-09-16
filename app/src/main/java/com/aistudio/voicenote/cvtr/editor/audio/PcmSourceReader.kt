@@ -26,6 +26,7 @@ internal const val MAX_PCM_READ_FRAMES = 1_920
 internal interface PcmSourceReader : AutoCloseable {
     val sampleRate: Int
     fun read(sourceFrame: Long, frameCount: Int): ShortArray
+    fun invalidate() {}
 }
 
 internal fun interface PcmSourceReaderFactory {
@@ -92,6 +93,14 @@ internal class MediaCodecPcmSourceReader(
         closed || Thread.currentThread().isInterrupted
     }
 
+    private var cursorFrame: Long? = null
+    private var pcmProcessor: StreamingPcmProcessor? = null
+    private var nextDecodedFrame = 0L
+    private var inputEnded = false
+    private var outputEnded = false
+    private var pendingBuffer = ShortArray(0)
+    private var pendingOffset = 0
+
     init {
         try {
             setDataSource()
@@ -145,19 +154,48 @@ internal class MediaCodecPcmSourceReader(
 
         val codec = checkNotNull(decoder) { "PCM decoder is unavailable" }
         cancellation.check()
-        val seekUs = sourceFrame * 1_000_000L / EDITOR_SAMPLE_RATE
-        extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-        codec.flush()
+
+        val availablePending = pendingBuffer.size - pendingOffset
+        val pendingStart = cursorFrame ?: -1L
+        val pendingEnd = if (cursorFrame != null) cursorFrame!! + availablePending else -1L
+
+        if (cursorFrame != null && sourceFrame >= pendingStart && sourceFrame <= pendingEnd) {
+            val skip = (sourceFrame - pendingStart).toInt()
+            pendingOffset += skip
+            cursorFrame = sourceFrame
+        } else {
+            val seekUs = sourceFrame * 1_000_000L / EDITOR_SAMPLE_RATE
+            extractor.seekTo(seekUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            codec.flush()
+            pcmProcessor = StreamingPcmProcessor(trackChannels, trackSampleRate)
+            inputEnded = false
+            outputEnded = false
+            nextDecodedFrame = 0L
+            pendingBuffer = ShortArray(0)
+            pendingOffset = 0
+            cursorFrame = null
+        }
 
         val output = ShortArray(requestedCount)
-        val bufferInfo = MediaCodec.BufferInfo()
-        var inputEnded = false
-        var outputEnded = false
-        var pcmProcessor = StreamingPcmProcessor(trackChannels, trackSampleRate)
-        var nextDecodedFrame = 0L
-        var writtenUntil = sourceFrame
+        var written = 0
 
-        while (!outputEnded && writtenUntil < sourceFrame + requestedCount) {
+        val alignedPending = pendingBuffer.size - pendingOffset
+        if (alignedPending > 0 && cursorFrame == sourceFrame) {
+            val toCopy = minOf(requestedCount - written, alignedPending)
+            pendingBuffer.copyInto(output, written, pendingOffset, pendingOffset + toCopy)
+            pendingOffset += toCopy
+            written += toCopy
+            cursorFrame = sourceFrame + written
+            if (pendingOffset == pendingBuffer.size) {
+                pendingBuffer = ShortArray(0)
+                pendingOffset = 0
+            }
+        }
+
+        val processor = pcmProcessor ?: StreamingPcmProcessor(trackChannels, trackSampleRate).also { pcmProcessor = it }
+        val bufferInfo = MediaCodec.BufferInfo()
+
+        while (!outputEnded && written < requestedCount) {
             cancellation.check()
             if (!inputEnded) {
                 val inputIndex = codec.dequeueInputBuffer(TIMEOUT_US)
@@ -195,24 +233,33 @@ internal class MediaCodecPcmSourceReader(
                             encoding = trackPcmEncoding,
                             channels = trackChannels,
                         )
-                        val normalized = pcmProcessor.process(decoded)
+                        val normalized = processor.process(decoded)
                         val timestampFrame = presentationFrame(bufferInfo.presentationTimeUs)
                         val chunkStart = max(timestampFrame, nextDecodedFrame)
                         nextDecodedFrame = chunkStart + normalized.size
                         if (normalized.isNotEmpty()) {
-                            val copyStart = max(sourceFrame, chunkStart)
-                            val copyEnd = min(sourceFrame + requestedCount, chunkStart + normalized.size)
-                            if (copyStart < copyEnd) {
+                            val currentTarget = sourceFrame + written
+                            val chunkEnd = chunkStart + normalized.size
+                            val copyStart = max(currentTarget, chunkStart)
+                            if (copyStart < chunkEnd) {
                                 val sourceOffset = (copyStart - chunkStart).toInt()
-                                val destinationOffset = (copyStart - sourceFrame).toInt()
-                                val copyCount = (copyEnd - copyStart).toInt()
+                                val needed = requestedCount - written
+                                val availableInChunk = (chunkEnd - copyStart).toInt()
+                                val copyCount = minOf(needed, availableInChunk)
                                 normalized.copyInto(
                                     output,
-                                    destinationOffset,
+                                    written,
                                     sourceOffset,
                                     sourceOffset + copyCount,
                                 )
-                                writtenUntil = max(writtenUntil, copyEnd)
+                                written += copyCount
+                                cursorFrame = sourceFrame + written
+
+                                val leftoverStart = sourceOffset + copyCount
+                                if (leftoverStart < normalized.size) {
+                                    pendingBuffer = normalized.copyOfRange(leftoverStart, normalized.size)
+                                    pendingOffset = 0
+                                }
                             }
                         }
                     }
@@ -225,18 +272,37 @@ internal class MediaCodecPcmSourceReader(
                 trackSampleRate = outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                 trackChannels = outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                 trackPcmEncoding = pcmEncoding(outputFormat)
-                pcmProcessor = StreamingPcmProcessor(trackChannels, trackSampleRate)
+                val newProcessor = StreamingPcmProcessor(trackChannels, trackSampleRate)
+                pcmProcessor = newProcessor
             }
         }
 
-        val count = (writtenUntil - sourceFrame).coerceIn(0L, requestedCount.toLong()).toInt()
-        return if (count == output.size) output else output.copyOf(count)
+        cursorFrame = sourceFrame + written
+        return if (written == output.size) output else output.copyOf(written)
+    }
+
+    override fun invalidate() {
+        synchronized(readLock) {
+            cursorFrame = null
+            pendingBuffer = ShortArray(0)
+            pendingOffset = 0
+            if (decoderStarted) {
+                runCatching { decoder?.flush() }
+            }
+            pcmProcessor = null
+            inputEnded = false
+            outputEnded = false
+            nextDecodedFrame = 0L
+        }
     }
 
     override fun close() {
         synchronized(closeLock) {
             if (closed) return
             closed = true
+            cursorFrame = null
+            pendingBuffer = ShortArray(0)
+            pendingOffset = 0
             if (decoderStarted) runCatching { decoder?.stop() }
             runCatching { decoder?.release() }
             decoder = null

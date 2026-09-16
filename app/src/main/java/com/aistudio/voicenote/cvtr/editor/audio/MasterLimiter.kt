@@ -18,6 +18,10 @@ internal class MasterLimiter(
 
     private var gain = 1f
 
+    fun reset() {
+        gain = 1f
+    }
+
     /** Exposed only for deterministic state-boundary tests. */
     internal val gainForTest: Float
         get() = gain

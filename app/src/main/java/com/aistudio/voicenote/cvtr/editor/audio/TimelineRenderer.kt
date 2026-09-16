@@ -39,6 +39,8 @@ internal class DefaultTimelineRenderer(
     private var sessionId: String? = null
     private var closed = false
     private var pendingWarning: String? = null
+    private val limiter = MasterLimiter()
+    private var lastRenderEndFrame = -1L
 
     override fun render(session: EditorSession, startFrame: Long, frameCount: Int): ShortArray {
         synchronized(renderLock) {
@@ -49,9 +51,12 @@ internal class DefaultTimelineRenderer(
             sessionId = session.id
             if (frameCount == 0) return ShortArray(0)
 
+            if (startFrame != lastRenderEndFrame) {
+                limiter.reset()
+            }
+
             val output = ShortArray(frameCount)
             val endFrame = startFrame + frameCount.toLong()
-            val limiter = MasterLimiter()
             var chunkStart = startFrame
             var outputOffset = 0
             // The smallest task-2 source read can be doubled by a 2x speed clip. 960 keeps every
@@ -66,6 +71,7 @@ internal class DefaultTimelineRenderer(
                 chunkStart = chunkEnd
                 outputOffset += chunkFrames
             }
+            lastRenderEndFrame = endFrame
             return output
         }
     }
@@ -188,23 +194,37 @@ internal class DefaultTimelineRenderer(
         synchronized(renderLock) {
             if (closed) return
             clipProcessor.close()
+            limiter.reset()
+            lastRenderEndFrame = -1L
             if (sourceIds.isEmpty()) {
-                readers.values.forEach { runCatching { it.close() } }
+                readers.values.forEach {
+                    runCatching { it.invalidate() }
+                    runCatching { it.close() }
+                }
                 readers.clear()
-                cacheReaders.values.forEach { runCatching { it.close() } }
+                cacheReaders.values.forEach {
+                    runCatching { it.invalidate() }
+                    runCatching { it.close() }
+                }
                 cacheReaders.clear()
                 cacheReaderSources.clear()
             } else {
                 val removed = readers.keys.filter { it.uri in sourceIds }
                 removed.forEach { source ->
-                    readers.remove(source)?.let { runCatching { it.close() } }
+                    readers.remove(source)?.let {
+                        runCatching { it.invalidate() }
+                        runCatching { it.close() }
+                    }
                 }
                 val staleCacheKeys = cacheReaderSources
                     .filterValues { sources -> sources.any(sourceIds::contains) }
                     .keys
                     .toList()
                 staleCacheKeys.forEach { key ->
-                    cacheReaders.remove(key)?.let { runCatching { it.close() } }
+                    cacheReaders.remove(key)?.let {
+                        runCatching { it.invalidate() }
+                        runCatching { it.close() }
+                    }
                     cacheReaderSources.remove(key)
                 }
             }
@@ -216,6 +236,8 @@ internal class DefaultTimelineRenderer(
             if (closed) return
             closed = true
             clipProcessor.close()
+            limiter.reset()
+            lastRenderEndFrame = -1L
             readers.values.forEach { runCatching { it.close() } }
             readers.clear()
             cacheReaders.values.forEach { runCatching { it.close() } }

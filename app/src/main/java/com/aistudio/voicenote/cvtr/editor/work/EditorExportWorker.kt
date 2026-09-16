@@ -68,6 +68,7 @@ internal interface EditorExportStorage {
     /** Makes an app-owned reserved target visible; safe to call after it is already visible. */
     fun finalizeReserved(uri: Uri): Boolean = true
     fun validatePublished(uri: Uri): Boolean
+    fun validatePartial(file: File): Boolean = file.exists() && file.length() > 0L
     fun sizeBytes(uri: Uri): Long = 0L
     fun deletePublished(uri: Uri): Boolean
     fun deletePartial(file: File): Boolean
@@ -284,9 +285,11 @@ internal class EditorExportRunner(
                 }
             }
             checkActive()
+            val partial = partialFile ?: error("Editor partial output is unavailable")
+            check(storage.validatePartial(partial)) { "Exported OGG partial file failed validation" }
             if (recoveredUri == null) {
                 publishedUri = storage.publishReserved(
-                    partialFile ?: error("Editor partial output is unavailable"),
+                    partial,
                     outputName,
                     manifest.reservedOutputUri,
                 )
@@ -798,21 +801,16 @@ internal class AndroidEditorExportStorage(
         }
         return try {
             open(uri).use { input ->
-                val bytes = ByteArray(64 * 1024)
-                val read = input.read(bytes)
-                if (read < 4) return false
-                val hasOgg = bytes.copyOf(read).copyOfRange(0, 4).contentEquals(byteArrayOf(0x4f, 0x67, 0x67, 0x53))
-                val header = "OpusHead".toByteArray(Charsets.US_ASCII)
-                val hasOpus = (0..(read - header.size).coerceAtLeast(-1)).any { offset ->
-                    bytes.copyOfRange(offset, offset + header.size).contentEquals(header)
-                }
-                hasOgg && hasOpus
+                OggOpusValidator.validateStream(input).valid
             }
         } catch (error: Throwable) {
             error.rethrowIfFatal()
             false
         }
     }
+
+    override fun validatePartial(file: File): Boolean =
+        OggOpusValidator.validateFile(file).valid
 
     override fun sizeBytes(uri: Uri): Long = try {
         open(uri).use { input -> input.countBytes() }

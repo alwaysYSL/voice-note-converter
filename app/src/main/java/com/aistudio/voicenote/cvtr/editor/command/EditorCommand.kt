@@ -78,6 +78,21 @@ internal data class MoveClipCommand(
         TimelineOperations.moveClip(session, clipId, timelineStartMs)
 }
 
+internal data class ReorderClipCommand(
+    val clipId: String,
+    val targetIndex: Int,
+) : EditorCommand {
+    override fun applyTo(session: EditorSession): TimelineResult =
+        TimelineOperations.reorderClip(session, clipId, targetIndex)
+}
+
+internal data class AppendClipsCommand(
+    val newClips: List<com.aistudio.voicenote.cvtr.editor.model.AudioClip>,
+) : EditorCommand {
+    override fun applyTo(session: EditorSession): TimelineResult =
+        TimelineOperations.appendClips(session, newClips)
+}
+
 internal data class DeleteClipCommand(
     val trackId: String,
     val clipId: String,

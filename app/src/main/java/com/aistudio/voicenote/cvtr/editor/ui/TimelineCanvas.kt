@@ -63,6 +63,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aistudio.voicenote.cvtr.editor.model.AudioClip
+import com.aistudio.voicenote.cvtr.editor.model.TrimEdge
 import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
 import com.aistudio.voicenote.cvtr.editor.model.MAX_TIMELINE_MS
 import com.aistudio.voicenote.cvtr.ui.theme.AccentCoral
@@ -99,9 +100,20 @@ internal fun TimelineCanvas(
     val horizontalScroll = rememberScrollState()
     val verticalScroll = rememberScrollState()
     val scope = rememberCoroutineScope()
-    val timelineWidth = (BaseDpPerSecond.value * (MAX_TIMELINE_MS / 1_000f) * zoom).dp
     val dpPerMs = BaseDpPerSecond.value * zoom / 1_000f
+
+    val maxClipEndMs = state.session.tracks
+        .flatMap { it.clips }
+        .maxOfOrNull { it.timelineEndMs } ?: 0L
+    val effectiveDurationMs = maxOf(maxClipEndMs, state.session.playheadMs, 5_000L)
+    val tailPaddingMs = 3_000L
+    val dynamicDurationMs = (effectiveDurationMs + tailPaddingMs).coerceAtMost(MAX_TIMELINE_MS)
+    val timelineWidth = maxOf(320.dp, (dynamicDurationMs * dpPerMs).dp)
     val selectedClipId = state.session.selectedClipId
+
+    val currentHorizontalScroll by rememberUpdatedState(horizontalScroll)
+    val currentOnIntent by rememberUpdatedState(onIntent)
+    val currentDensity by rememberUpdatedState(density)
 
     Column(modifier = modifier) {
         Row(
@@ -127,7 +139,8 @@ internal fun TimelineCanvas(
             ) {
                 TimeRuler(
                     timelineWidth = timelineWidth,
-                    zoom = zoom,
+                    durationMs = dynamicDurationMs,
+                    dpPerMs = dpPerMs,
                 )
             }
         }
@@ -168,20 +181,34 @@ internal fun TimelineCanvas(
                     .fillMaxHeight()
                     .horizontalScroll(horizontalScroll)
                     .verticalScroll(verticalScroll)
-                    .pointerInput(horizontalScroll, zoom) {
+                    .pointerInput(Unit) {
                         detectTapGestures { offset ->
-                            val x = offset.x + horizontalScroll.value
-                            val position = (x / (dpPerMs * density)).roundToLong()
-                            onIntent(EditorIntent.SelectClip(null))
-                            onIntent(EditorIntent.Seek(position))
+                            val currentDpPerMs = BaseDpPerSecond.value * zoom / 1_000f
+                            val x = offset.x + currentHorizontalScroll.value
+                            val position = (x / (currentDpPerMs * currentDensity)).roundToLong()
+                            currentOnIntent(EditorIntent.SelectClip(null))
+                            currentOnIntent(EditorIntent.Seek(position))
                         }
                     }
-                    .pointerInput(zoom) {
-                        detectTransformGestures { _, pan, gestureZoom, _ ->
-                            zoom = (zoom * gestureZoom).coerceIn(.65f, 3f)
+                    .pointerInput(Unit) {
+                        detectTransformGestures { centroid, pan, gestureZoom, _ ->
+                            if (gestureZoom != 1f) {
+                                val oldZoom = zoom
+                                val newZoom = (oldZoom * gestureZoom).coerceIn(0.5f, 4f)
+                                if (newZoom != oldZoom) {
+                                    val oldDpPerMs = BaseDpPerSecond.value * oldZoom / 1_000f
+                                    val newDpPerMs = BaseDpPerSecond.value * newZoom / 1_000f
+                                    val anchorTimeMs = (centroid.x + currentHorizontalScroll.value) / (oldDpPerMs * currentDensity)
+                                    zoom = newZoom
+                                    val newScrollTarget = (anchorTimeMs * newDpPerMs * currentDensity) - centroid.x
+                                    scope.launch {
+                                        currentHorizontalScroll.scrollTo(newScrollTarget.roundToLong().toInt().coerceAtLeast(0))
+                                    }
+                                }
+                            }
                             if (pan.x != 0f) {
                                 scope.launch {
-                                    horizontalScroll.scrollBy(-pan.x)
+                                    currentHorizontalScroll.scrollBy(-pan.x)
                                 }
                             }
                         }
@@ -232,18 +259,28 @@ internal fun TimelineCanvas(
 @Composable
 private fun TimeRuler(
     timelineWidth: Dp,
-    zoom: Float,
+    durationMs: Long,
+    dpPerMs: Float,
 ) {
+    val stepMs = when {
+        dpPerMs >= 0.08f -> 1_000L
+        dpPerMs >= 0.035f -> 2_000L
+        dpPerMs >= 0.015f -> 5_000L
+        else -> 10_000L
+    }
     Row(
         modifier = Modifier
             .width(timelineWidth)
             .fillMaxHeight(),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        (0L..MAX_TIMELINE_MS step 10_000L).forEach { timeMs ->
+        val count = ((durationMs / stepMs) + 1).toInt()
+        (0 until count).forEach { i ->
+            val timeMs = i * stepMs
+            val boxWidth = (stepMs * dpPerMs).dp
             Box(
                 modifier = Modifier
-                    .width((BaseDpPerSecond.value * 10f * zoom).dp)
+                    .width(boxWidth)
                     .fillMaxHeight(),
                 contentAlignment = Alignment.CenterStart,
             ) {
@@ -251,7 +288,7 @@ private fun TimeRuler(
                     Text(
                         text = formatTimelineTime(timeMs),
                         color = LightSlateCaption,
-                        fontSize = 11.sp,
+                        fontSize = 10.sp,
                     )
                     Spacer(
                         Modifier
@@ -338,7 +375,7 @@ private fun TrackTimelineRow(
 ) {
     Box(
         modifier = Modifier
-            .width((BaseDpPerSecond.value * (MAX_TIMELINE_MS / 1_000f) * (dpPerMs / BaseDpPerSecond.value * 1_000f)).dp)
+            .fillMaxWidth()
             .height(TrackRowHeight)
             .background(Color.White.copy(alpha = .55f)),
         contentAlignment = Alignment.CenterStart,
@@ -346,19 +383,25 @@ private fun TrackTimelineRow(
         track.clips.forEach { clip ->
             val clipWidth = (clip.timelineDurationMs.coerceAtLeast(400L) * dpPerMs).dp
             val clipOffset = (clip.timelineStartMs * dpPerMs).dp
+            val fullPeaks = waveformBySource[clip.source.uri].orEmpty()
+            val slicedPeaks = remember(fullPeaks, clip.sourceStartMs, clip.sourceEndMs, clip.source.durationMs) {
+                visiblePeaks(
+                    allPeaks = fullPeaks,
+                    sourceStartMs = clip.sourceStartMs,
+                    sourceEndMs = clip.sourceEndMs,
+                    sourceDurationMs = clip.source.durationMs,
+                )
+            }
             TimelineClip(
                 clip = clip,
-                waveform = waveformBySource[clip.source.uri].orEmpty(),
+                waveform = slicedPeaks,
                 selected = selectedClipId == clip.id,
                 enabled = clip.id !in offlineClipIds,
                 width = clipWidth,
                 offset = clipOffset,
                 dpPerMs = dpPerMs,
                 onSelect = { onIntent(EditorIntent.SelectClip(clip.id)) },
-                onMove = { start -> onIntent(EditorIntent.Move(start)) },
-                onTrim = { sourceStart, sourceEnd ->
-                    onIntent(EditorIntent.Trim(sourceStart, sourceEnd))
-                },
+                onIntent = onIntent,
             )
         }
     }
@@ -374,17 +417,17 @@ private fun TimelineClip(
     offset: Dp,
     dpPerMs: Float,
     onSelect: () -> Unit,
-    onMove: (Long) -> Unit,
-    onTrim: (Long, Long) -> Unit,
+    onIntent: (EditorIntent) -> Unit,
 ) {
-    var dragOffsetPx by remember(clip.id) { mutableFloatStateOf(0f) }
+    var originStartMs by remember(clip.id) { mutableLongStateOf(clip.timelineStartMs) }
     var originalSourceStartMs by remember(clip.id) { mutableLongStateOf(clip.sourceStartMs) }
     var originalSourceEndMs by remember(clip.id) { mutableLongStateOf(clip.sourceEndMs) }
+    var dragOffsetPx by remember(clip.id) { mutableFloatStateOf(0f) }
+    var totalTrimDragPx by remember(clip.id) { mutableFloatStateOf(0f) }
     val density = LocalDensity.current.density
     val currentClip by rememberUpdatedState(clip)
     val currentSelected by rememberUpdatedState(selected)
-    val currentOnMove by rememberUpdatedState(onMove)
-    val currentOnTrim by rememberUpdatedState(onTrim)
+    val currentOnIntent by rememberUpdatedState(onIntent)
     val trimGesturesEnabled = width >= 96.dp
     val interactionWidth = if (width < 48.dp) 48.dp else width
     val interactionPadding = (interactionWidth - width) / 2f
@@ -414,56 +457,76 @@ private fun TimelineClip(
             .pointerInput(clip.id, dpPerMs, selected, enabled) {
                 if (!enabled) return@pointerInput
                 var dragMode = 0
-                var totalTrimDragPx = 0f
                 detectHorizontalDragGestures(
                     onDragStart = { startOffset ->
                         dragOffsetPx = 0f
                         totalTrimDragPx = 0f
+                        originStartMs = currentClip.timelineStartMs
+                        originalSourceStartMs = currentClip.sourceStartMs
+                        originalSourceEndMs = currentClip.sourceEndMs
                         dragMode = when {
                             !currentSelected || !trimGesturesEnabled -> 0
                             startOffset.x <= 48f * density -> 1
                             startOffset.x >= size.width - (48f * density) -> 2
                             else -> 0
                         }
-                        if (dragMode != 0) {
-                            originalSourceStartMs = currentClip.sourceStartMs
-                            originalSourceEndMs = currentClip.sourceEndMs
+                        if (dragMode == 0) {
+                            currentOnIntent(EditorIntent.BeginMove(currentClip.id))
+                        } else {
+                            val edge = if (dragMode == 1) TrimEdge.START else TrimEdge.END
+                            currentOnIntent(EditorIntent.BeginTrim(currentClip.id, edge))
                         }
                     },
                     onHorizontalDrag = { change, dragAmount ->
                         change.consume()
                         if (dragMode == 0) {
                             dragOffsetPx += dragAmount
-                            currentOnMove(
-                                (currentClip.timelineStartMs + dragOffsetPx / (dpPerMs * density))
-                                    .roundToLong()
-                                    .coerceAtLeast(0L)
-                            )
+                            val proposedStartMs = (originStartMs + dragOffsetPx / (dpPerMs * density))
+                                .roundToLong()
+                                .coerceAtLeast(0L)
+                            currentOnIntent(EditorIntent.UpdateMove(currentClip.id, proposedStartMs))
                         } else {
                             totalTrimDragPx += dragAmount
                             val timelineDeltaMs = (totalTrimDragPx / (dpPerMs * density)).roundToLong()
                             val deltaMs = (timelineDeltaMs * currentClip.effects.normalizedSpeed).roundToLong()
                             if (dragMode == 1) {
-                                currentOnTrim(
-                                    (originalSourceStartMs + deltaMs)
-                                        .coerceIn(0L, originalSourceEndMs - 1L),
-                                    originalSourceEndMs,
-                                )
+                                val startMs = (originalSourceStartMs + deltaMs)
+                                    .coerceIn(0L, originalSourceEndMs - 1L)
+                                currentOnIntent(EditorIntent.UpdateTrim(currentClip.id, startMs, originalSourceEndMs))
                             } else {
-                                currentOnTrim(
-                                    originalSourceStartMs,
-                                    (originalSourceEndMs + deltaMs)
-                                        .coerceIn(originalSourceStartMs + 1L, currentClip.source.sourceDurationOrEnd()),
-                                )
+                                val endMs = (originalSourceEndMs + deltaMs)
+                                    .coerceIn(originalSourceStartMs + 1L, currentClip.source.sourceDurationOrEnd())
+                                currentOnIntent(EditorIntent.UpdateTrim(currentClip.id, originalSourceStartMs, endMs))
                             }
                         }
                     },
                     onDragEnd = {
+                        if (dragMode == 0) {
+                            val proposedStartMs = (originStartMs + dragOffsetPx / (dpPerMs * density))
+                                .roundToLong()
+                                .coerceAtLeast(0L)
+                            currentOnIntent(EditorIntent.Move(timelineStartMs = proposedStartMs, clipId = currentClip.id))
+                            currentOnIntent(EditorIntent.CommitMove(currentClip.id))
+                        } else if (dragMode == 1 || dragMode == 2) {
+                            val timelineDeltaMs = (totalTrimDragPx / (dpPerMs * density)).roundToLong()
+                            val deltaMs = (timelineDeltaMs * currentClip.effects.normalizedSpeed).roundToLong()
+                            if (dragMode == 1) {
+                                val startMs = (originalSourceStartMs + deltaMs)
+                                    .coerceIn(0L, originalSourceEndMs - 1L)
+                                currentOnIntent(EditorIntent.Trim(sourceStartMs = startMs, sourceEndMs = originalSourceEndMs, clipId = currentClip.id))
+                            } else {
+                                val endMs = (originalSourceEndMs + deltaMs)
+                                    .coerceIn(originalSourceStartMs + 1L, currentClip.source.sourceDurationOrEnd())
+                                currentOnIntent(EditorIntent.Trim(sourceStartMs = originalSourceStartMs, sourceEndMs = endMs, clipId = currentClip.id))
+                            }
+                            currentOnIntent(EditorIntent.CommitTrim(currentClip.id))
+                        }
                         dragOffsetPx = 0f
                         totalTrimDragPx = 0f
                         dragMode = 0
                     },
                     onDragCancel = {
+                        currentOnIntent(EditorIntent.CancelGesture)
                         dragOffsetPx = 0f
                         totalTrimDragPx = 0f
                         dragMode = 0
@@ -505,21 +568,30 @@ private fun TimelineClip(
                         cornerRadius = CornerRadius(12.dp.toPx()),
                     )
                 }
+                var lastCalculatedStartMs = clip.sourceStartMs
+                var lastCalculatedEndMs = clip.sourceEndMs
                 TrimHandle(
                     modifier = Modifier.align(Alignment.CenterStart),
                     contentDescription = "Trim start of ${clip.id}",
                     onDragStart = {
                         originalSourceStartMs = clip.sourceStartMs
                         originalSourceEndMs = clip.sourceEndMs
+                        lastCalculatedStartMs = clip.sourceStartMs
+                        currentOnIntent(EditorIntent.BeginTrim(clip.id, TrimEdge.START))
                     },
                     onDrag = { deltaPx ->
                         val timelineDeltaMs = (deltaPx / (dpPerMs * density)).roundToLong()
                         val deltaMs = (timelineDeltaMs * clip.effects.normalizedSpeed).roundToLong()
-                        onTrim(
-                            (originalSourceStartMs + deltaMs)
-                                .coerceIn(0L, originalSourceEndMs - 1L),
-                            originalSourceEndMs,
-                        )
+                        val newStart = (originalSourceStartMs + deltaMs).coerceIn(0L, originalSourceEndMs - 1L)
+                        lastCalculatedStartMs = newStart
+                        currentOnIntent(EditorIntent.UpdateTrim(clip.id, newStart, originalSourceEndMs))
+                    },
+                    onDragEnd = {
+                        currentOnIntent(EditorIntent.Trim(sourceStartMs = lastCalculatedStartMs, sourceEndMs = originalSourceEndMs, clipId = clip.id))
+                        currentOnIntent(EditorIntent.CommitTrim(clip.id))
+                    },
+                    onDragCancel = {
+                        currentOnIntent(EditorIntent.CancelGesture)
                     },
                 )
                 TrimHandle(
@@ -528,15 +600,23 @@ private fun TimelineClip(
                     onDragStart = {
                         originalSourceStartMs = clip.sourceStartMs
                         originalSourceEndMs = clip.sourceEndMs
+                        lastCalculatedEndMs = clip.sourceEndMs
+                        currentOnIntent(EditorIntent.BeginTrim(clip.id, TrimEdge.END))
                     },
                     onDrag = { deltaPx ->
                         val timelineDeltaMs = (deltaPx / (dpPerMs * density)).roundToLong()
                         val deltaMs = (timelineDeltaMs * clip.effects.normalizedSpeed).roundToLong()
-                        onTrim(
-                            originalSourceStartMs,
-                            (originalSourceEndMs + deltaMs)
-                                .coerceIn(originalSourceStartMs + 1L, clip.source.sourceDurationOrEnd()),
-                        )
+                        val newEnd = (originalSourceEndMs + deltaMs)
+                            .coerceIn(originalSourceStartMs + 1L, clip.source.sourceDurationOrEnd())
+                        lastCalculatedEndMs = newEnd
+                        currentOnIntent(EditorIntent.UpdateTrim(clip.id, originalSourceStartMs, newEnd))
+                    },
+                    onDragEnd = {
+                        currentOnIntent(EditorIntent.Trim(sourceStartMs = originalSourceStartMs, sourceEndMs = lastCalculatedEndMs, clipId = clip.id))
+                        currentOnIntent(EditorIntent.CommitTrim(clip.id))
+                    },
+                    onDragCancel = {
+                        currentOnIntent(EditorIntent.CancelGesture)
                     },
                 )
             }
@@ -550,9 +630,13 @@ private fun TrimHandle(
     contentDescription: String,
     onDragStart: () -> Unit,
     onDrag: (Float) -> Unit,
+    onDragEnd: () -> Unit = {},
+    onDragCancel: () -> Unit = {},
 ) {
     val currentOnDragStart by rememberUpdatedState(onDragStart)
     val currentOnDrag by rememberUpdatedState(onDrag)
+    val currentOnDragEnd by rememberUpdatedState(onDragEnd)
+    val currentOnDragCancel by rememberUpdatedState(onDragCancel)
     Box(
         modifier = modifier
             .size(width = 48.dp, height = 72.dp)
@@ -573,8 +657,14 @@ private fun TrimHandle(
                         totalDragPx += amount
                         currentOnDrag(totalDragPx)
                     },
-                    onDragEnd = { totalDragPx = 0f },
-                    onDragCancel = { totalDragPx = 0f },
+                    onDragEnd = {
+                        totalDragPx = 0f
+                        currentOnDragEnd()
+                    },
+                    onDragCancel = {
+                        totalDragPx = 0f
+                        currentOnDragCancel()
+                    },
                 )
             },
     )
@@ -615,3 +705,22 @@ private fun trackSemanticsTag(id: String): String =
 
 private fun com.aistudio.voicenote.cvtr.editor.model.AudioSourceRef.sourceDurationOrEnd(): Long =
     durationMs.takeIf { it >= 0L } ?: Long.MAX_VALUE
+
+internal fun visiblePeaks(
+    allPeaks: List<Int>,
+    sourceStartMs: Long,
+    sourceEndMs: Long,
+    sourceDurationMs: Long,
+): List<Int> {
+    if (allPeaks.isEmpty() || sourceDurationMs <= 0L || sourceEndMs <= sourceStartMs) {
+        return emptyList()
+    }
+    val totalPeaks = allPeaks.size
+    val startIndex = ((sourceStartMs.toDouble() / sourceDurationMs) * totalPeaks)
+        .toInt()
+        .coerceIn(0, totalPeaks - 1)
+    val endIndex = ((sourceEndMs.toDouble() / sourceDurationMs) * totalPeaks)
+        .toInt()
+        .coerceIn(startIndex + 1, totalPeaks)
+    return allPeaks.subList(startIndex, endIndex)
+}

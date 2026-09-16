@@ -12,12 +12,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Redo
+import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.Redo
-import androidx.compose.material.icons.filled.Undo
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -76,14 +78,10 @@ internal fun ContextualEditorToolbar(
             label = "Trim",
             enabled = hasSelection,
             onClick = {
-                selectedClip?.let { clip ->
-                    // The toolbar action must make a real, accessible adjustment. Drag handles
-                    // remain available for precise editing; this nudges the end boundary by 100 ms.
-                    onIntent(EditorIntent.NudgeTrim(endDeltaMs = -100L))
-                }
+                onIntent(EditorIntent.ShowSheet(EditorSheet.TRIM))
             },
             modifier = Modifier.semantics {
-                contentDescription = "Trim end by 100 milliseconds"
+                contentDescription = "Trim"
             },
         )
         EditorToolButton(
@@ -212,9 +210,10 @@ internal fun EditorToolSheet(
                 Text(
                     text = when (sheet) {
                         EditorSheet.FADE -> "Fade"
-                        EditorSheet.PITCH -> "Pitch"
-                        EditorSheet.SPEED -> "Speed"
-                        EditorSheet.CLEANUP -> "Cleanup / Normalize"
+                        EditorSheet.PITCH -> "Pitch / Nada"
+                        EditorSheet.SPEED -> "Speed / Kecepatan"
+                        EditorSheet.CLEANUP -> "Cleanup / Pembersihan Suara"
+                        EditorSheet.TRIM -> "Trim / Potong Klip"
                     },
                     style = MaterialTheme.typography.titleSmall,
                     color = DeepNavyDisplay,
@@ -273,6 +272,96 @@ internal fun EditorToolSheet(
                         onValueChange = { onIntent(EditorIntent.SetSpeed(it)) },
                         valueRange = .5f..2f,
                         modifier = Modifier.heightIn(min = 48.dp),
+                    )
+                }
+                EditorSheet.TRIM -> {
+                    val maxSourceDuration = clip.source.durationMs.takeIf { it > 0L } ?: 300_000L
+                    Text("Rentang Sumber: ${formatTransportTime(clip.sourceStartMs)} s/d ${formatTransportTime(clip.sourceEndMs)}", color = LightSlateCaption)
+                    Spacer(Modifier.height(4.dp))
+                    Text("Titik Awal: ${clip.sourceStartMs} ms", color = DeepNavyDisplay, style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                val newStart = (clip.sourceStartMs - 1_000L).coerceAtLeast(0L)
+                                onIntent(EditorIntent.Trim(sourceStartMs = newStart, sourceEndMs = clip.sourceEndMs, clipId = clip.id))
+                            },
+                            enabled = clip.sourceStartMs > 0L,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("-1d") }
+                        OutlinedButton(
+                            onClick = {
+                                val newStart = (clip.sourceStartMs - 100L).coerceAtLeast(0L)
+                                onIntent(EditorIntent.Trim(sourceStartMs = newStart, sourceEndMs = clip.sourceEndMs, clipId = clip.id))
+                            },
+                            enabled = clip.sourceStartMs > 0L,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("-100ms") }
+                        OutlinedButton(
+                            onClick = {
+                                val newStart = (clip.sourceStartMs + 100L).coerceAtMost(clip.sourceEndMs - 100L)
+                                onIntent(EditorIntent.Trim(sourceStartMs = newStart, sourceEndMs = clip.sourceEndMs, clipId = clip.id))
+                            },
+                            enabled = clip.sourceStartMs < clip.sourceEndMs - 100L,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("+100ms") }
+                        OutlinedButton(
+                            onClick = {
+                                val newStart = (clip.sourceStartMs + 1_000L).coerceAtMost(clip.sourceEndMs - 100L)
+                                onIntent(EditorIntent.Trim(sourceStartMs = newStart, sourceEndMs = clip.sourceEndMs, clipId = clip.id))
+                            },
+                            enabled = clip.sourceStartMs < clip.sourceEndMs - 100L,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("+1d") }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    Text("Titik Akhir: ${clip.sourceEndMs} ms", color = DeepNavyDisplay, style = MaterialTheme.typography.labelMedium)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                val newEnd = (clip.sourceEndMs - 1_000L).coerceAtLeast(clip.sourceStartMs + 100L)
+                                onIntent(EditorIntent.Trim(sourceStartMs = clip.sourceStartMs, sourceEndMs = newEnd, clipId = clip.id))
+                            },
+                            enabled = clip.sourceEndMs > clip.sourceStartMs + 100L,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("-1d") }
+                        OutlinedButton(
+                            onClick = {
+                                val newEnd = (clip.sourceEndMs - 100L).coerceAtLeast(clip.sourceStartMs + 100L)
+                                onIntent(EditorIntent.Trim(sourceStartMs = clip.sourceStartMs, sourceEndMs = newEnd, clipId = clip.id))
+                            },
+                            enabled = clip.sourceEndMs > clip.sourceStartMs + 100L,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("-100ms") }
+                        OutlinedButton(
+                            onClick = {
+                                val newEnd = (clip.sourceEndMs + 100L).coerceAtMost(maxSourceDuration)
+                                onIntent(EditorIntent.Trim(sourceStartMs = clip.sourceStartMs, sourceEndMs = newEnd, clipId = clip.id))
+                            },
+                            enabled = clip.sourceEndMs < maxSourceDuration,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("+100ms") }
+                        OutlinedButton(
+                            onClick = {
+                                val newEnd = (clip.sourceEndMs + 1_000L).coerceAtMost(maxSourceDuration)
+                                onIntent(EditorIntent.Trim(sourceStartMs = clip.sourceStartMs, sourceEndMs = newEnd, clipId = clip.id))
+                            },
+                            enabled = clip.sourceEndMs < maxSourceDuration,
+                            modifier = Modifier.weight(1f),
+                        ) { Text("+1d") }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Durasi klip: ${formatTransportTime(clip.sourceEndMs - clip.sourceStartMs)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = LightSlateCaption,
                     )
                 }
                 EditorSheet.CLEANUP -> {
@@ -389,16 +478,20 @@ internal fun EditorTransport(
             contentDescription = "Audio preview",
             tint = AccentCoral,
         )
-        Text(
-            text = "${formatTransportTime(session.playheadMs)} / timeline",
-            style = MaterialTheme.typography.labelLarge,
-            color = DeepNavyDisplay,
-        )
-        Text(
-            text = if (playback.error == null) "Preview follows the played head" else "Preview unavailable",
-            style = MaterialTheme.typography.bodySmall,
-            color = LightSlateCaption,
-        )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "${formatTransportTime(session.playheadMs)} / timeline",
+                style = MaterialTheme.typography.labelLarge,
+                color = DeepNavyDisplay,
+                maxLines = 1,
+            )
+            Text(
+                text = if (playback.error == null) "Pratinjau mengikuti playhead" else "Pratinjau tidak tersedia",
+                style = MaterialTheme.typography.bodySmall,
+                color = LightSlateCaption,
+                maxLines = 1,
+            )
+        }
     }
 }
 
@@ -417,9 +510,10 @@ internal fun EditorBottomActions(
         modifier = Modifier
             .fillMaxWidth()
             .background(CardSurfaceWhite)
+            .horizontalScroll(rememberScrollState())
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         IconButton(
             onClick = { onIntent(EditorIntent.Undo) },
@@ -428,7 +522,7 @@ internal fun EditorBottomActions(
                 .size(48.dp)
                 .testTag("undo"),
         ) {
-            Icon(Icons.Filled.Undo, contentDescription = "Undo")
+            Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Undo")
         }
         IconButton(
             onClick = { onIntent(EditorIntent.Redo) },
@@ -437,13 +531,12 @@ internal fun EditorBottomActions(
                 .size(48.dp)
                 .testTag("redo"),
         ) {
-            Icon(Icons.Filled.Redo, contentDescription = "Redo")
+            Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = "Redo")
         }
         Button(
             onClick = onPickTrack,
             enabled = session.tracks.size < 5,
             modifier = Modifier
-                .weight(1f)
                 .heightIn(min = 48.dp)
                 .testTag("add_track"),
         ) {
@@ -453,7 +546,6 @@ internal fun EditorBottomActions(
             onClick = { onIntent(EditorIntent.SaveDraft()) },
             enabled = !cleanupInspectionPending && draftState.status != EditorDraftSaveStatus.SAVING,
             modifier = Modifier
-                .weight(1f)
                 .heightIn(min = 48.dp)
                 .testTag("editor_save_draft"),
         ) {
@@ -471,7 +563,6 @@ internal fun EditorBottomActions(
                 exportState.status != EditorExportStatus.QUEUED &&
                 exportState.status != EditorExportStatus.RUNNING,
             modifier = Modifier
-                .weight(1f)
                 .heightIn(min = 48.dp)
                 .testTag("editor_export")
                 .semantics {

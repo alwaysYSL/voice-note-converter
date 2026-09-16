@@ -8,6 +8,8 @@ import com.aistudio.voicenote.cvtr.editor.model.ClipEffects
 import com.aistudio.voicenote.cvtr.editor.model.EditorSession
 import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
 import com.aistudio.voicenote.cvtr.editor.model.ExportPreset
+import com.aistudio.voicenote.cvtr.editor.model.SequenceSession
+import com.aistudio.voicenote.cvtr.editor.model.toSequenceSession
 import com.aistudio.voicenote.cvtr.data.local.AppDatabase
 import java.io.File
 import java.io.IOException
@@ -235,19 +237,28 @@ internal class EditorDraftRepository(
                 clips = clipsByTrack[track.trackId].orEmpty().sortedBy { it.sortOrder }.map(::toClip),
             )
         }
+        val rawSession = EditorSession(
+            id = snapshot.draft.id,
+            tracks = tracks,
+            selectedClipId = snapshot.draft.selectedClipId,
+            playheadMs = snapshot.draft.playheadMs,
+            exportPreset = snapshot.draft.exportPreset.toExportPreset(),
+            dirty = false,
+            draftId = snapshot.draft.id,
+        )
+        val session = if (rawSession.tracks.size > 1) {
+            rawSession.toSequenceSession().toRenderSession()
+        } else {
+            rawSession
+        }
         return EditorDraftLoad(
-            session = EditorSession(
-                id = snapshot.draft.id,
-                tracks = tracks,
-                selectedClipId = snapshot.draft.selectedClipId,
-                playheadMs = snapshot.draft.playheadMs,
-                exportPreset = snapshot.draft.exportPreset.toExportPreset(),
-                dirty = false,
-                draftId = snapshot.draft.id,
-            ),
+            session = session,
             missingPrivateSources = missing,
         )
     }
+
+    suspend fun loadAsSequence(draftId: String): SequenceSession? =
+        load(draftId)?.toSequenceSession()
 
     suspend fun delete(draftId: String): Boolean = withDraftLock(draftId) {
         ensureReconciled()

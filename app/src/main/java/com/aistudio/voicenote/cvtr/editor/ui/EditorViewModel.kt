@@ -17,11 +17,14 @@ import com.aistudio.voicenote.cvtr.audio.WaveformCodec
 import com.aistudio.voicenote.cvtr.data.local.AppDatabase
 import com.aistudio.voicenote.cvtr.data.repository.ConversionHistoryRepository
 import com.aistudio.voicenote.cvtr.editor.command.AddTrackCommand
+import com.aistudio.voicenote.cvtr.editor.command.AppendClipsCommand
 import com.aistudio.voicenote.cvtr.editor.command.CommandHistory
 import com.aistudio.voicenote.cvtr.editor.command.DeleteClipCommand
 import com.aistudio.voicenote.cvtr.editor.command.EditorCommand
 import com.aistudio.voicenote.cvtr.editor.command.MoveClipCommand
 import com.aistudio.voicenote.cvtr.editor.command.RemoveTrackCommand
+import com.aistudio.voicenote.cvtr.editor.command.ReorderClipCommand
+import com.aistudio.voicenote.cvtr.editor.model.toSequenceSession
 import com.aistudio.voicenote.cvtr.editor.command.ReplaceClipSourceCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetClipFadeCommand
 import com.aistudio.voicenote.cvtr.editor.command.SetClipPitchCommand
@@ -32,12 +35,17 @@ import com.aistudio.voicenote.cvtr.editor.command.SetTrackVolumeCommand
 import com.aistudio.voicenote.cvtr.editor.command.SplitClipCommand
 import com.aistudio.voicenote.cvtr.editor.command.TrimClipCommand
 import com.aistudio.voicenote.cvtr.editor.audio.DefaultTimelineRenderer
+import com.aistudio.voicenote.cvtr.editor.audio.EditorMetrics
 import com.aistudio.voicenote.cvtr.editor.audio.EditorPlaybackState
 import com.aistudio.voicenote.cvtr.editor.audio.EditorPreviewEngine
 import com.aistudio.voicenote.cvtr.editor.audio.MediaCodecPcmSourceReaderFactory
 import com.aistudio.voicenote.cvtr.editor.audio.EditorRenderManifest
 import com.aistudio.voicenote.cvtr.editor.audio.CleanupStrength
 import com.aistudio.voicenote.cvtr.editor.audio.EDITOR_SAMPLE_RATE
+import com.aistudio.voicenote.cvtr.editor.model.GesturePreview
+import com.aistudio.voicenote.cvtr.editor.model.TrimEdge
+import com.aistudio.voicenote.cvtr.editor.model.findClip
+import com.aistudio.voicenote.cvtr.editor.model.requireClip
 import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioKey
 import com.aistudio.voicenote.cvtr.editor.cache.ProcessedAudioCache
 import com.aistudio.voicenote.cvtr.editor.cache.readValidatedCachedWav
@@ -51,6 +59,7 @@ import com.aistudio.voicenote.cvtr.editor.model.EditorSession
 import com.aistudio.voicenote.cvtr.editor.model.EditorTrack
 import com.aistudio.voicenote.cvtr.editor.model.MAX_TIMELINE_MS
 import com.aistudio.voicenote.cvtr.editor.model.TimelineError
+import com.aistudio.voicenote.cvtr.editor.model.TimelineOperations
 import com.aistudio.voicenote.cvtr.editor.model.TimelineResult
 import com.aistudio.voicenote.cvtr.editor.model.value
 import com.aistudio.voicenote.cvtr.editor.data.DraftSourceStorage
@@ -123,6 +132,7 @@ internal enum class EditorSheet {
     PITCH,
     SPEED,
     CLEANUP,
+    TRIM,
 }
 
 internal enum class EditorExportStatus {
@@ -237,21 +247,35 @@ internal sealed interface EditorIntent {
     data object Pause : EditorIntent
     data class Seek(val positionMs: Long) : EditorIntent
     data class SelectClip(val clipId: String?) : EditorIntent
-    data class Split(val splitTimelineMs: Long) : EditorIntent
+    data class Split(val splitTimelineMs: Long, val clipId: String? = null) : EditorIntent
     data class Trim(
         val sourceStartMs: Long,
         val sourceEndMs: Long,
+        val clipId: String? = null,
     ) : EditorIntent
     /** Accessible trim nudge used by the toolbar; unlike the old no-op dispatch, it changes a bound. */
-    data class NudgeTrim(val startDeltaMs: Long = 0L, val endDeltaMs: Long = 0L) : EditorIntent
-    data class Move(val timelineStartMs: Long) : EditorIntent
-    data class Delete(val ripple: Boolean = true) : EditorIntent
-    data class SetFade(val fadeInMs: Long, val fadeOutMs: Long) : EditorIntent
-    data class SetPitch(val pitchSemitones: Float) : EditorIntent
-    data class SetSpeed(val speed: Float) : EditorIntent
+    data class NudgeTrim(val startDeltaMs: Long = 0L, val endDeltaMs: Long = 0L, val clipId: String? = null) : EditorIntent
+    data class Move(val timelineStartMs: Long, val clipId: String? = null) : EditorIntent
+
+    data class BeginMove(val clipId: String) : EditorIntent
+    data class UpdateMove(val clipId: String, val proposedStartMs: Long) : EditorIntent
+    data class CommitMove(val clipId: String) : EditorIntent
+
+    data class BeginTrim(val clipId: String, val edge: TrimEdge) : EditorIntent
+    data class UpdateTrim(val clipId: String, val sourceStartMs: Long, val sourceEndMs: Long) : EditorIntent
+    data class CommitTrim(val clipId: String) : EditorIntent
+
+    data object CancelGesture : EditorIntent
+
+    data class Delete(val ripple: Boolean = true, val clipId: String? = null) : EditorIntent
+    data class SetFade(val fadeInMs: Long, val fadeOutMs: Long, val clipId: String? = null) : EditorIntent
+    data class SetPitch(val pitchSemitones: Float, val clipId: String? = null) : EditorIntent
+    data class SetSpeed(val speed: Float, val clipId: String? = null) : EditorIntent
     data class SetTrackVolume(val trackId: String, val volume: Float) : EditorIntent
     data class SetTrackMuted(val trackId: String, val muted: Boolean) : EditorIntent
     data class RemoveTrack(val trackId: String) : EditorIntent
+    data class ReorderClip(val clipId: String, val targetIndex: Int) : EditorIntent
+    data class AppendSources(val uris: List<Uri>) : EditorIntent
     data object Undo : EditorIntent
     data object Redo : EditorIntent
     data object ClearMessage : EditorIntent
@@ -277,7 +301,9 @@ internal sealed interface EditorIntent {
 
 internal data class EditorUiState(
     val loading: Boolean = true,
-    val session: EditorSession = EditorSession.empty(),
+    val committedSession: EditorSession = EditorSession.empty(),
+    val gesture: GesturePreview? = null,
+    val session: EditorSession = committedSession,
     val waveformBySource: Map<String, List<Int>> = emptyMap(),
     val message: EditorMessage? = null,
     val activeSheet: EditorSheet? = null,
@@ -293,7 +319,49 @@ internal data class EditorUiState(
     val effectRecoveryClipIds: Set<String> = emptySet(),
     /** True while a draft's persisted cleanup keys are being validated against source bytes. */
     val cleanupInspectionPending: Boolean = false,
-)
+) {
+    val visibleSession: EditorSession
+        get() = session
+
+    constructor(
+        loading: Boolean = true,
+        session: EditorSession = EditorSession.empty(),
+        gesture: GesturePreview? = null,
+        waveformBySource: Map<String, List<Int>> = emptyMap(),
+        message: EditorMessage? = null,
+        activeSheet: EditorSheet? = null,
+        canUndo: Boolean = false,
+        canRedo: Boolean = false,
+        importInFlight: Boolean = false,
+        playback: EditorPlaybackState = EditorPlaybackState(),
+        export: EditorExportUiState = EditorExportUiState(),
+        cleanup: EditorCleanupUiState = EditorCleanupUiState(),
+        draft: EditorDraftUiState = EditorDraftUiState(),
+        offlineClipIds: Set<String> = emptySet(),
+        sourceError: String? = null,
+        effectRecoveryClipIds: Set<String> = emptySet(),
+        cleanupInspectionPending: Boolean = false,
+    ) : this(
+        loading = loading,
+        committedSession = session,
+        gesture = gesture,
+        session = gesture?.previewSession ?: session,
+        waveformBySource = waveformBySource,
+        message = message,
+        activeSheet = activeSheet,
+        canUndo = canUndo,
+        canRedo = canRedo,
+        importInFlight = importInFlight,
+        playback = playback,
+        export = export,
+        cleanup = cleanup,
+        draft = draft,
+        offlineClipIds = offlineClipIds,
+        sourceError = sourceError,
+        effectRecoveryClipIds = effectRecoveryClipIds,
+        cleanupInspectionPending = cleanupInspectionPending,
+    )
+}
 
 private data class CleanupTarget(
     val clipId: String,
@@ -371,9 +439,12 @@ internal class EditorViewModel(
     private val cleanupScheduler: EditorCleanupScheduler = WorkManagerEditorExportScheduler(
         WorkManager.getInstance(application)
     ),
+    private val metrics: EditorMetrics = EditorMetrics.NoOp,
 ) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(EditorUiState())
     val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
+
+    internal fun debugUndoDepth(): Int = commandHistory?.undoDepth ?: 0
 
     private val ready = CompletableDeferred<Unit>()
     private val mutationMutex = Mutex()
@@ -437,14 +508,17 @@ internal class EditorViewModel(
                 }
             }
             is EditorIntent.Split -> runSerializedMutation {
-                selectedClip()?.let { execute(SplitClipCommand(it, intent.splitTimelineMs)) }
+                val targetId = intent.clipId ?: selectedClip()
+                targetId?.let { execute(SplitClipCommand(it, intent.splitTimelineMs)) }
             }
             is EditorIntent.Trim -> runSerializedMutation {
-                selectedClip()?.let { execute(TrimClipCommand(it, intent.sourceStartMs, intent.sourceEndMs)) }
+                val targetId = intent.clipId ?: selectedClip()
+                targetId?.let { execute(TrimClipCommand(it, intent.sourceStartMs, intent.sourceEndMs)) }
             }
             is EditorIntent.NudgeTrim -> runSerializedMutation {
-                selectedClip()?.let { clipId ->
-                    _uiState.value.session.findClipForCleanup(clipId)?.let { clip ->
+                val targetId = intent.clipId ?: selectedClip()
+                targetId?.let { clipId ->
+                    _uiState.value.committedSession.findClip(clipId)?.let { clip ->
                         val start = (clip.sourceStartMs + intent.startDeltaMs)
                             .coerceIn(0L, clip.sourceEndMs - 1L)
                         val end = (clip.sourceEndMs + intent.endDeltaMs)
@@ -454,21 +528,37 @@ internal class EditorViewModel(
                 }
             }
             is EditorIntent.Move -> runSerializedMutation {
-                selectedClip()?.let { execute(MoveClipCommand(it, intent.timelineStartMs)) }
+                val targetId = intent.clipId ?: selectedClip()
+                targetId?.let { execute(MoveClipCommand(it, intent.timelineStartMs)) }
             }
+            is EditorIntent.BeginMove -> beginMove(intent.clipId)
+            is EditorIntent.UpdateMove -> updateMove(intent.clipId, intent.proposedStartMs)
+            is EditorIntent.CommitMove -> commitMove(intent.clipId)
+
+            is EditorIntent.BeginTrim -> beginTrim(intent.clipId, intent.edge)
+            is EditorIntent.UpdateTrim -> updateTrim(intent.clipId, intent.sourceStartMs, intent.sourceEndMs)
+            is EditorIntent.CommitTrim -> commitTrim(intent.clipId)
+
+            EditorIntent.CancelGesture -> cancelGesture()
+
             is EditorIntent.Delete -> runSerializedMutation {
-                selectedLocation()?.let { (trackId, clipId) ->
+                val targetId = intent.clipId ?: selectedClip()
+                val targetLocation = targetId?.let { locationForClip(it) } ?: selectedLocation()
+                targetLocation?.let { (trackId, clipId) ->
                     execute(DeleteClipCommand(trackId, clipId, intent.ripple))
                 }
             }
             is EditorIntent.SetFade -> runSerializedMutation {
-                selectedClip()?.let { execute(SetClipFadeCommand(it, intent.fadeInMs, intent.fadeOutMs)) }
+                val targetId = intent.clipId ?: selectedClip()
+                targetId?.let { execute(SetClipFadeCommand(it, intent.fadeInMs, intent.fadeOutMs)) }
             }
             is EditorIntent.SetPitch -> runSerializedMutation {
-                selectedClip()?.let { execute(SetClipPitchCommand(it, intent.pitchSemitones)) }
+                val targetId = intent.clipId ?: selectedClip()
+                targetId?.let { execute(SetClipPitchCommand(it, intent.pitchSemitones)) }
             }
             is EditorIntent.SetSpeed -> runSerializedMutation {
-                selectedClip()?.let { execute(SetClipSpeedCommand(it, intent.speed)) }
+                val targetId = intent.clipId ?: selectedClip()
+                targetId?.let { execute(SetClipSpeedCommand(it, intent.speed)) }
             }
             is EditorIntent.SetTrackVolume -> runSerializedMutation {
                 execute(SetTrackVolumeCommand(intent.trackId, intent.volume))
@@ -479,6 +569,10 @@ internal class EditorViewModel(
             is EditorIntent.RemoveTrack -> runSerializedMutation {
                 execute(RemoveTrackCommand(intent.trackId))
             }
+            is EditorIntent.ReorderClip -> runSerializedMutation {
+                execute(ReorderClipCommand(intent.clipId, intent.targetIndex))
+            }
+            is EditorIntent.AppendSources -> appendSources(intent.uris)
             EditorIntent.Undo -> runSerializedMutation {
                 commandHistory?.let { history ->
                     history.undo()
@@ -761,6 +855,57 @@ internal class EditorViewModel(
         }
     }
 
+    fun appendSources(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        importsInFlight.incrementAndGet()
+        _uiState.update { it.copy(importInFlight = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val waveformUris = mutableListOf<Uri>()
+            try {
+                mutationMutex.withLock {
+                    val newClips = mutableListOf<AudioClip>()
+                    var candidateDuration = _uiState.value.committedSession.toSequenceSession().totalDurationMs
+                    for (uri in uris) {
+                        retainReadPermission(uri)
+                        val metadata = sourceAnalyzer(uri)
+                        val durationMs = metadata.durationMs
+                        if (durationMs <= 0L || candidateDuration + durationMs > MAX_TIMELINE_MS) {
+                            showMessage(EditorMessage.TIMELINE_LIMIT)
+                            return@withLock
+                        }
+                        candidateDuration += durationMs
+                        val clipId = "clip-${UUID.randomUUID()}"
+                        newClips += AudioClip(
+                            id = clipId,
+                            source = AudioSourceRef(uri.toString(), durationMs),
+                            sourceStartMs = 0L,
+                            sourceEndMs = durationMs,
+                            timelineStartMs = 0L,
+                        )
+                        waveformUris += uri
+                    }
+                    val result = commandHistory?.execute(AppendClipsCommand(newClips))
+                        ?: TimelineResult.Rejected(TimelineError.MISSING_ID)
+                    if (result is TimelineResult.Accepted) {
+                        newClips.firstOrNull()?.let { commandHistory?.updateSelection(it.id) }
+                        publishSession(commandHistory?.session ?: result.value)
+                    } else {
+                        showMessage((result as TimelineResult.Rejected).reason.toEditorMessage())
+                    }
+                }
+                waveformUris.forEach { loadWaveform(it) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                showMessage(EditorMessage.IMPORT_FAILED)
+            } finally {
+                if (importsInFlight.decrementAndGet() == 0) {
+                    _uiState.update { it.copy(importInFlight = false) }
+                }
+            }
+        }
+    }
+
     private suspend fun resolveLaunch() {
         try {
             when (val source = launchSource) {
@@ -993,6 +1138,7 @@ internal class EditorViewModel(
         _uiState.update {
             it.copy(
                 loading = false,
+                committedSession = session,
                 session = session,
                 canUndo = false,
                 canRedo = false,
@@ -1633,12 +1779,14 @@ internal class EditorViewModel(
 
     private fun publishSession(session: EditorSession) {
         val history = commandHistory
-        if (!sameAudioContent(_uiState.value.session, session)) {
+        if (!sameAudioContent(_uiState.value.committedSession, session)) {
             previewEngine.updateSession(session)
         }
         _uiState.update {
             it.copy(
+                committedSession = session,
                 session = session,
+                gesture = null,
                 message = null,
                 export = it.export.copy(
                     preset = session.exportPreset,
@@ -1655,6 +1803,159 @@ internal class EditorViewModel(
         }
         syncCacheReferences()
     }
+
+    private fun beginMove(clipId: String) {
+        val baseline = _uiState.value.committedSession
+        val clip = baseline.findClip(clipId) ?: return
+        metrics.gestureStarted("move", clipId)
+        _uiState.update {
+            val preview = GesturePreview.Moving(
+                clipId = clipId,
+                baseline = baseline,
+                previewSession = baseline,
+                originStartMs = clip.timelineStartMs,
+                previewStartMs = clip.timelineStartMs,
+            )
+            it.copy(
+                gesture = preview,
+                session = preview.previewSession,
+            )
+        }
+    }
+
+    private fun updateMove(clipId: String, proposedStartMs: Long) {
+        val moving = _uiState.value.gesture as? GesturePreview.Moving ?: return
+        if (moving.clipId != clipId) return cancelGesture()
+
+        val preview = when (
+            val result = TimelineOperations.moveClipPreview(
+                moving.baseline,
+                clipId,
+                proposedStartMs,
+            )
+        ) {
+            is TimelineResult.Accepted -> result.value
+            is TimelineResult.Rejected -> moving.previewSession
+        }
+
+        val updated = moving.copy(
+            previewSession = preview,
+            previewStartMs = proposedStartMs,
+        )
+        _uiState.update {
+            it.copy(
+                gesture = updated,
+                session = preview,
+            )
+        }
+    }
+
+    private fun commitMove(clipId: String) {
+        val moving = _uiState.value.gesture as? GesturePreview.Moving ?: return
+        if (moving.clipId != clipId) return cancelGesture()
+
+        val history = commandHistory
+        if (history != null) {
+            val command = MoveClipCommand(clipId, moving.previewStartMs)
+            when (val result = history.executeFromBaseline(moving.baseline, command)) {
+                is TimelineResult.Accepted -> publishSession(result.value)
+                is TimelineResult.Rejected -> showMessage(result.reason.toEditorMessage())
+            }
+        }
+        _uiState.update {
+            it.copy(
+                gesture = null,
+                session = it.committedSession,
+            )
+        }
+        metrics.gestureCommitted("move", 1, 0L)
+    }
+
+    private fun beginTrim(clipId: String, edge: TrimEdge) {
+        val baseline = _uiState.value.committedSession
+        val clip = baseline.findClip(clipId) ?: return
+        metrics.gestureStarted("trim", clipId)
+        _uiState.update {
+            val preview = GesturePreview.Trimming(
+                clipId = clipId,
+                baseline = baseline,
+                previewSession = baseline,
+                edge = edge,
+                originStartMs = clip.sourceStartMs,
+                originEndMs = clip.sourceEndMs,
+                previewStartMs = clip.sourceStartMs,
+                previewEndMs = clip.sourceEndMs,
+            )
+            it.copy(
+                gesture = preview,
+                session = preview.previewSession,
+            )
+        }
+    }
+
+    private fun updateTrim(clipId: String, sourceStartMs: Long, sourceEndMs: Long) {
+        val trimming = _uiState.value.gesture as? GesturePreview.Trimming ?: return
+        if (trimming.clipId != clipId) return cancelGesture()
+
+        val preview = when (
+            val result = TimelineOperations.trimClipPreview(
+                trimming.baseline,
+                clipId,
+                sourceStartMs,
+                sourceEndMs,
+            )
+        ) {
+            is TimelineResult.Accepted -> result.value
+            is TimelineResult.Rejected -> trimming.previewSession
+        }
+
+        val updated = trimming.copy(
+            previewSession = preview,
+            previewStartMs = sourceStartMs,
+            previewEndMs = sourceEndMs,
+        )
+        _uiState.update {
+            it.copy(
+                gesture = updated,
+                session = preview,
+            )
+        }
+    }
+
+    private fun commitTrim(clipId: String) {
+        val trimming = _uiState.value.gesture as? GesturePreview.Trimming ?: return
+        if (trimming.clipId != clipId) return cancelGesture()
+
+        val history = commandHistory
+        if (history != null) {
+            val command = TrimClipCommand(clipId, trimming.previewStartMs, trimming.previewEndMs)
+            when (val result = history.executeFromBaseline(trimming.baseline, command)) {
+                is TimelineResult.Accepted -> publishSession(result.value)
+                is TimelineResult.Rejected -> showMessage(result.reason.toEditorMessage())
+            }
+        }
+        _uiState.update {
+            it.copy(
+                gesture = null,
+                session = it.committedSession,
+            )
+        }
+        metrics.gestureCommitted("trim", 1, 0L)
+    }
+
+    private fun cancelGesture() {
+        _uiState.update {
+            it.copy(
+                gesture = null,
+                session = it.committedSession,
+            )
+        }
+    }
+
+    private fun locationForClip(clipId: String): Pair<String, String>? =
+        _uiState.value.committedSession.tracks.firstNotNullOfOrNull { track ->
+            clipId.takeIf { id -> track.clips.any { it.id == id } }?.let { track.id to it }
+        }
 
     private fun syncCacheReferences() {
         val history = commandHistory ?: return

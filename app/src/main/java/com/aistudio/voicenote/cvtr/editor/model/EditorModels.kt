@@ -1,6 +1,7 @@
 package com.aistudio.voicenote.cvtr.editor.model
 
 import java.util.Collections
+import kotlin.math.roundToLong
 
 internal const val MAX_TRACKS = 5
 internal const val MAX_TIMELINE_MS = 300_000L
@@ -205,6 +206,7 @@ internal class EditorSession(
     val dirty: Boolean = false,
     /** Non-null only after the user explicitly saved this session as a durable draft. */
     val draftId: String? = null,
+    val revision: Long = 0L,
 ) {
     val tracks: List<EditorTrack> = immutableList(tracks)
 
@@ -215,6 +217,7 @@ internal class EditorSession(
     operator fun component5(): ExportPreset = exportPreset
     operator fun component6(): Boolean = dirty
     operator fun component7(): String? = draftId
+    operator fun component8(): Long = revision
 
     fun copy(
         id: String = this.id,
@@ -224,12 +227,13 @@ internal class EditorSession(
         exportPreset: ExportPreset = this.exportPreset,
         dirty: Boolean = this.dirty,
         draftId: String? = this.draftId,
-    ): EditorSession = EditorSession(id, tracks, selectedClipId, playheadMs, exportPreset, dirty, draftId)
+        revision: Long = this.revision,
+    ): EditorSession = EditorSession(id, tracks, selectedClipId, playheadMs, exportPreset, dirty, draftId, revision)
 
     override fun equals(other: Any?): Boolean = other is EditorSession &&
         id == other.id && tracks == other.tracks && selectedClipId == other.selectedClipId &&
         playheadMs == other.playheadMs && exportPreset == other.exportPreset && dirty == other.dirty &&
-            draftId == other.draftId
+        draftId == other.draftId && revision == other.revision
 
     override fun hashCode(): Int {
         var result = id.hashCode()
@@ -239,12 +243,13 @@ internal class EditorSession(
         result = 31 * result + exportPreset.hashCode()
         result = 31 * result + dirty.hashCode()
         result = 31 * result + (draftId?.hashCode() ?: 0)
+        result = 31 * result + revision.hashCode()
         return result
     }
 
     override fun toString(): String =
         "EditorSession(id=$id, tracks=$tracks, selectedClipId=$selectedClipId, " +
-            "playheadMs=$playheadMs, exportPreset=$exportPreset, dirty=$dirty, draftId=$draftId)"
+            "playheadMs=$playheadMs, exportPreset=$exportPreset, dirty=$dirty, draftId=$draftId, revision=$revision)"
 
     companion object {
         internal fun empty(id: String = "session"): EditorSession = EditorSession(id = id, tracks = emptyList())
@@ -267,6 +272,7 @@ internal enum class TimelineError {
     OVERLAP,
     MISSING_ID,
     DUPLICATE_ID,
+    STALE_BASELINE,
 }
 
 internal sealed class TimelineResult {
@@ -277,3 +283,51 @@ internal sealed class TimelineResult {
 /** Convenience accessor used by callers after they have established that a result was accepted. */
 internal val TimelineResult.value: EditorSession
     get() = (this as TimelineResult.Accepted).value
+
+internal enum class TrimEdge { START, END }
+
+internal sealed interface GesturePreview {
+    val clipId: String
+    val baseline: EditorSession
+    val previewSession: EditorSession
+
+    data class Moving(
+        override val clipId: String,
+        override val baseline: EditorSession,
+        override val previewSession: EditorSession,
+        val originStartMs: Long,
+        val previewStartMs: Long,
+    ) : GesturePreview
+
+    data class Trimming(
+        override val clipId: String,
+        override val baseline: EditorSession,
+        override val previewSession: EditorSession,
+        val edge: TrimEdge,
+        val originStartMs: Long,
+        val originEndMs: Long,
+        val previewStartMs: Long,
+        val previewEndMs: Long,
+    ) : GesturePreview
+}
+
+internal fun EditorSession.requireClip(clipId: String): AudioClip =
+    tracks.asSequence().flatMap { it.clips.asSequence() }.firstOrNull { it.id == clipId }
+        ?: throw IllegalArgumentException("Clip $clipId not found in session")
+
+internal fun EditorSession.findClip(clipId: String): AudioClip? =
+    tracks.asSequence().flatMap { it.clips.asSequence() }.firstOrNull { it.id == clipId }
+
+internal class MoveGestureTracker(
+    val originStartMs: Long,
+    val pxPerMs: Float,
+) {
+    private var totalDragPx: Float = 0f
+
+    val previewStartMs: Long
+        get() = (originStartMs + totalDragPx / pxPerMs).roundToLong().coerceAtLeast(0L)
+
+    fun addDeltaPx(deltaPx: Float) {
+        totalDragPx += deltaPx
+    }
+}

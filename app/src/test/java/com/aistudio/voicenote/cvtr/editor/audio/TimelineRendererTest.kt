@@ -181,6 +181,73 @@ class TimelineRendererTest {
         renderer.close()
     }
 
+    @Test
+    fun `limiter state is preserved across contiguous renders and reset on jump or invalidate`() {
+        val samples = ShortArray(1920) { index ->
+            if (index < 500) 30_000 else 10_000
+        }
+        val factory = PcmSourceReaderFactory {
+            object : PcmSourceReader {
+                override val sampleRate: Int = EDITOR_SAMPLE_RATE
+                override fun read(sourceFrame: Long, frameCount: Int): ShortArray {
+                    val start = sourceFrame.toInt().coerceAtMost(samples.size)
+                    val end = (sourceFrame + frameCount).toInt().coerceAtMost(samples.size)
+                    return samples.copyOfRange(start, end)
+                }
+                override fun close() = Unit
+            }
+        }
+        val renderer = DefaultTimelineRenderer(factory)
+        val clip1 = AudioClip("loud1", AudioSourceRef("s1", 200L), 0L, 200L, 0L)
+        val clip2 = AudioClip("loud2", AudioSourceRef("s2", 200L), 0L, 200L, 0L)
+        val session = EditorSession(
+            "limiter-session",
+            listOf(
+                EditorTrack("t1", "T1", clips = listOf(clip1)),
+                EditorTrack("t2", "T2", clips = listOf(clip2)),
+            ),
+        )
+
+        val chunk1 = renderer.render(session, 0L, 960)
+        val chunk2 = renderer.render(session, 960L, 960)
+        val diffContiguous = kotlin.math.abs(chunk2.first().toInt() - chunk1.last().toInt())
+        assertTrue("Expected smooth transition between contiguous chunks, but diff was $diffContiguous", diffContiguous <= 50)
+
+        renderer.invalidate()
+        val resetChunk2 = renderer.render(session, 960L, 960)
+        assertTrue(resetChunk2.first().toInt() > chunk2.first().toInt())
+
+        renderer.close()
+    }
+
+    @Test
+    fun `invalidate notifies open readers and closes them`() {
+        var invalidated = false
+        var closed = false
+        val factory = PcmSourceReaderFactory {
+            object : PcmSourceReader {
+                override val sampleRate: Int = EDITOR_SAMPLE_RATE
+                override fun read(sourceFrame: Long, frameCount: Int): ShortArray = ShortArray(frameCount)
+                override fun invalidate() {
+                    invalidated = true
+                }
+                override fun close() {
+                    closed = true
+                }
+            }
+        }
+        val renderer = DefaultTimelineRenderer(factory)
+        val session = EditorSession(
+            "session",
+            listOf(EditorTrack("track", "Track", clips = listOf(clip("c1", "s1", 0L)))),
+        )
+        renderer.render(session, 0L, 960)
+        renderer.invalidate()
+        assertTrue(invalidated)
+        assertTrue(closed)
+        renderer.close()
+    }
+
     private fun clip(id: String, source: String, timelineStartMs: Long): AudioClip = AudioClip(
         id = id,
         source = AudioSourceRef(source, durationMs = 20L),
