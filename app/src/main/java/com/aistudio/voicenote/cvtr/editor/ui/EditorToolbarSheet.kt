@@ -78,7 +78,7 @@ fun EditorToolbarSheet(
             ) {
                 Column {
                     Text(
-                        text = "Track : ",
+                        text = "Track ${slotIndex + 1}: ${clip.displayName}",
                         color = DeepNavyDisplay,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Bold,
@@ -114,7 +114,7 @@ fun EditorToolbarSheet(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Pitch:  semitones",
+                    text = String.format(Locale.US, "Pitch: %+.1f semitones", clip.pitchSemitones),
                     color = DarkNavyHeadline,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium
@@ -209,7 +209,7 @@ fun EditorToolbarSheet(
                             shape = RoundedCornerShape(8.dp)
                         ) {
                             Text(
-                                text = "Ke Track ",
+                                text = "Ke Track ${targetIndex + 1}",
                                 fontSize = 12.sp,
                                 maxLines = 1
                             )

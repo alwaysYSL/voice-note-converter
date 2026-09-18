@@ -45,7 +45,7 @@ object EditorExporter {
             val totalSamples = (totalDurationMs * SAMPLE_RATE / 1000L)
             val waveformAccumulator = WaveformAccumulator(100, totalSamples)
 
-            val tempOggFile = File(context.cacheDir, "editor_export_.ogg")
+            val tempOggFile = File(context.cacheDir, "editor_export_${System.currentTimeMillis()}.ogg")
             val fos = BufferedOutputStream(FileOutputStream(tempOggFile))
             val oggWriter = OggOpusWriter(fos)
 
@@ -160,7 +160,7 @@ object EditorExporter {
             // Record to Room Database
             val waveformData = WaveformCodec.encode(waveformAccumulator.result())
             val historyRecord = ConversionHistory(
-                originalFileName = "Editor_Mix__tracks",
+                originalFileName = "Editor_Mix_${activeTracks.size}_tracks",
                 outputFileName = fileName,
                 outputFilePath = publicUri.toString(),
                 durationSeconds = (totalDurationMs / 1000L).toInt().coerceAtLeast(1),

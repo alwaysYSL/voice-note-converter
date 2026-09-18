@@ -212,7 +212,7 @@ fun EditorScreen(
 
                     Column(horizontalAlignment = Alignment.End) {
                         Text(
-                            text = " / ",
+                            text = "$currentFormatted / $totalFormatted",
                             color = DeepNavyDisplay,
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Bold
@@ -312,7 +312,7 @@ fun EditorScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "%",
+                        text = "${(state.exportProgress * 100).roundToInt()}%",
                         color = LightSlateCaption,
                         fontSize = 12.sp,
                         modifier = Modifier.align(Alignment.End)

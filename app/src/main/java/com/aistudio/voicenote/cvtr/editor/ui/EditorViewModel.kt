@@ -44,7 +44,7 @@ class EditorViewModel(
             _timelineState.update { it.copy(isLoadingSource = true, errorMessage = null) }
             try {
                 val clipId = UUID.randomUUID().toString()
-                val pcmFile = File(getApplication<Application>().cacheDir, "editor_pcm_.pcm")
+                val pcmFile = File(getApplication<Application>().cacheDir, "editor_pcm_${slotIndex}_${clipId}.pcm")
 
                 val decoded = withContext(Dispatchers.IO) {
                     EditorPcmDecoder.decodeToPcm(getApplication(), uri, pcmFile)
@@ -75,7 +75,7 @@ class EditorViewModel(
                 _timelineState.update {
                     it.copy(
                         isLoadingSource = false,
-                        errorMessage = "Gagal memproses audio: "
+                        errorMessage = "Gagal memproses audio: ${e.message ?: "Format tidak didukung"}"
                     )
                 }
             }
@@ -184,11 +184,12 @@ class EditorViewModel(
             val activeClips = state.tracks.filterNotNull()
             if (activeClips.isEmpty() || state.totalDurationMs <= 0) return
 
-            _timelineState.update { it.copy(isPlaying = true) }
+            val startPos = if (state.playheadPositionMs >= state.totalDurationMs) 0L else state.playheadPositionMs
+            _timelineState.update { it.copy(isPlaying = true, playheadPositionMs = startPos) }
             audioEngine.startPlayback(
                 coroutineScope = viewModelScope,
                 tracks = activeClips,
-                startPositionMs = state.playheadPositionMs,
+                startPositionMs = startPos,
                 totalDurationMs = state.totalDurationMs
             )
         }
@@ -241,7 +242,7 @@ class EditorViewModel(
                     _timelineState.update {
                         it.copy(
                             isExporting = false,
-                            errorMessage = "Export gagal: "
+                            errorMessage = "Export gagal: ${error.message ?: "Terjadi kesalahan"}"
                         )
                     }
                 }

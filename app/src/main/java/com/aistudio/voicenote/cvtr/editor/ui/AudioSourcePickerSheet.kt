@@ -72,11 +72,13 @@ fun AudioSourcePickerSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var selectedTab by remember { mutableIntStateOf(0) }
 
+    val context = LocalContext.current
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            onSourceSelected(uri, "Audio_")
+            val name = queryDisplayName(context, uri) ?: "Audio_${targetSlotIndex + 1}"
+            onSourceSelected(uri, name)
             onDismiss()
         }
     }
@@ -93,7 +95,7 @@ fun AudioSourcePickerSheet(
                 .padding(horizontal = 20.dp, vertical = 8.dp)
         ) {
             Text(
-                text = "Pilih Audio untuk Track ",
+                text = "Pilih Audio untuk Track ${targetSlotIndex + 1}",
                 color = DeepNavyDisplay,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Bold
@@ -234,7 +236,7 @@ private fun HistoryAudioItem(
                 maxLines = 1
             )
             Text(
-                text = "s • ",
+                text = "${item.durationSeconds}s • $dateStr",
                 color = LightSlateCaption,
                 fontSize = 12.sp
             )
@@ -248,4 +250,21 @@ private fun HistoryAudioItem(
             Text("Pilih", fontSize = 12.sp)
         }
     }
+}
+
+private fun queryDisplayName(context: android.content.Context, uri: Uri): String? {
+    if (uri.scheme == "content") {
+        try {
+            context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (index != -1) {
+                        return cursor.getString(index)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+    return uri.lastPathSegment
 }

@@ -37,7 +37,7 @@ object EditorPcmDecoder {
             extractor.setDataSource(context, uri, null)
         } catch (e: Exception) {
             val pfd = context.contentResolver.openFileDescriptor(uri, "r")
-                ?: throw IllegalArgumentException("Cannot open file descriptor for: ")
+                ?: throw IllegalArgumentException("Cannot open file descriptor for: $uri")
             pfd.use {
                 extractor.setDataSource(it.fileDescriptor)
             }
@@ -57,7 +57,7 @@ object EditorPcmDecoder {
 
         if (trackIndex == -1 || format == null) {
             extractor.release()
-            throw IllegalArgumentException("No audio track found in: ")
+            throw IllegalArgumentException("No audio track found in: $uri")
         }
 
         extractor.selectTrack(trackIndex)
