@@ -40,6 +40,11 @@ class AppViewModelFactory(
             audioPlayerFactory = audioPlayerFactory
         ) as T
 
+        modelClass.isAssignableFrom(com.aistudio.voicenote.cvtr.editor.ui.EditorViewModel::class.java) -> com.aistudio.voicenote.cvtr.editor.ui.EditorViewModel(
+            application = application,
+            historyRepository = historyRepository
+        ) as T
+
         else -> throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")
     }
 }

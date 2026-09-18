@@ -2,6 +2,7 @@ package com.aistudio.voicenote.cvtr.ui
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -89,7 +90,8 @@ fun MainScreen(
     viewModel: MainViewModel,
     modifier: Modifier = Modifier,
     bottomOverlayClearance: Dp = 0.dp,
-    statusBarInset: Dp? = null
+    statusBarInset: Dp? = null,
+    onOpenEditor: ((Uri) -> Unit)? = null
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val playback by viewModel.playbackState.collectAsStateWithLifecycle()
@@ -194,7 +196,8 @@ fun MainScreen(
                             onConvert = startConversionWithPermission,
                             onSend = viewModel::sendConverted,
                             onConfirmSent = viewModel::confirmConvertedSent,
-                            onReset = viewModel::resetForNewFile
+                            onReset = viewModel::resetForNewFile,
+                            onOpenEditor = onOpenEditor
                         )
                     }
                 }
@@ -450,7 +453,8 @@ private fun ProcessActionArea(
     onConvert: () -> Unit,
     onSend: () -> Unit,
     onConfirmSent: () -> Unit,
-    onReset: () -> Unit
+    onReset: () -> Unit,
+    onOpenEditor: ((Uri) -> Unit)? = null
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
         when (state.processStatus) {
@@ -483,11 +487,28 @@ private fun ProcessActionArea(
                     color = SubtitleSlate
                 )
             }
-            ProcessStatus.CONVERTED -> PrimaryActionButton(
-                text = "Kirim ke Telegram",
-                icon = Icons.AutoMirrored.Filled.Send,
-                onClick = onSend
-            )
+            ProcessStatus.CONVERTED -> {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    PrimaryActionButton(
+                        text = "Kirim ke Telegram",
+                        icon = Icons.AutoMirrored.Filled.Send,
+                        onClick = onSend
+                    )
+                    if (state.convertedUri != null && onOpenEditor != null) {
+                        OutlinedButton(
+                            onClick = { onOpenEditor(state.convertedUri) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Edit & Mix di Editor", fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
             ProcessStatus.SHARE_OPENED -> {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.CheckCircle, contentDescription = null, tint = PastelMintText)

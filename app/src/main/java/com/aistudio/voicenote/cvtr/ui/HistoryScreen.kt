@@ -110,7 +110,8 @@ fun HistoryScreen(
     modifier: Modifier = Modifier,
     onStartConversion: () -> Unit = {},
     bottomOverlayClearance: Dp = 0.dp,
-    statusBarInset: Dp? = null
+    statusBarInset: Dp? = null,
+    onOpenInEditor: ((ConversionHistory) -> Unit)? = null
 ) {
     val historyItems = viewModel.historyItems.collectAsLazyPagingItems()
     val totalHistoryCount by viewModel.totalHistoryCount.collectAsStateWithLifecycle()
@@ -275,7 +276,8 @@ fun HistoryScreen(
                                         } else {
                                             selectedIds + item.id
                                         }
-                                    }
+                                    },
+                                    onOpenInEditor = onOpenInEditor?.let { cb -> { cb(item) } }
                                 )
                             }
                         }
@@ -571,7 +573,8 @@ private fun HistoryItemCard(
     onShare: () -> Unit,
     onConfirmSent: () -> Unit,
     onDelete: () -> Unit,
-    onToggleSelection: () -> Unit
+    onToggleSelection: () -> Unit,
+    onOpenInEditor: (() -> Unit)? = null
 ) {
     var showActions by remember(item.id) { mutableStateOf(false) }
     val waveform = remember(isCurrent, item.waveform) {
@@ -765,6 +768,19 @@ private fun HistoryItemCard(
                                         contentColor = AccentRoyalBlue
                                     )
                                 ) { Text("Kirim ulang") }
+                                if (onOpenInEditor != null) {
+                                    Button(
+                                        onClick = {
+                                            showActions = false
+                                            onOpenInEditor()
+                                        },
+                                        modifier = Modifier.weight(1f),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = PastelMintCardBg,
+                                            contentColor = PastelMintText
+                                        )
+                                    ) { Text("Edit") }
+                                }
                                 if (item.deliveryStatus == DeliveryStatus.SHARE_OPENED) {
                                     Button(
                                         onClick = {

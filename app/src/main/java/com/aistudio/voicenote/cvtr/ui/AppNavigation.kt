@@ -1,51 +1,61 @@
 package com.aistudio.voicenote.cvtr.ui
-import android.app.Application
 
+import android.app.Application
 import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Mic
-import androidx.compose.material3.IconButton
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.core.net.toUri
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import androidx.paging.compose.collectAsLazyPagingItems
+import com.aistudio.voicenote.cvtr.editor.ui.EditorScreen
+import com.aistudio.voicenote.cvtr.editor.ui.EditorViewModel
 import com.aistudio.voicenote.cvtr.ui.theme.AppCanvasBackground
 import com.aistudio.voicenote.cvtr.ui.theme.CardSurfaceWhite
 import com.aistudio.voicenote.cvtr.ui.theme.DeepNavyDisplay
 import com.aistudio.voicenote.cvtr.ui.theme.LightSlateCaption
 import com.aistudio.voicenote.cvtr.ui.theme.PastelMintCardBg
+import java.io.File
 
 private sealed class Screen(val route: String, val label: String) {
     data object Converter : Screen("converter", "Converter")
+    data object Editor : Screen("editor", "Editor")
     data object History : Screen("history", "Riwayat")
 }
 
@@ -62,7 +72,10 @@ fun AppNavigation(
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = backStackEntry?.destination
-    val screens = listOf(Screen.Converter, Screen.History)
+    val screens = listOf(Screen.Converter, Screen.Editor, Screen.History)
+
+    // Shared ViewModels across tabs
+    val editorViewModel: EditorViewModel = viewModel(factory = viewModelFactory)
 
     Box(
         modifier = modifier
@@ -84,9 +97,33 @@ fun AppNavigation(
                 }
                 MainScreen(
                     viewModel = converterViewModel,
-                    bottomOverlayClearance = BottomOverlayClearance
+                    bottomOverlayClearance = BottomOverlayClearance,
+                    onOpenEditor = { convertedUri ->
+                        editorViewModel.addTrackFromUri(0, convertedUri, "Converted_VoiceNote")
+                        navController.navigate(Screen.Editor.route) {
+                            popUpTo(navController.graph.startDestinationId) { saveState = true }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    }
                 )
             }
+
+            composable(Screen.Editor.route) {
+                val historyViewModel: HistoryViewModel = viewModel(factory = viewModelFactory)
+                val historyPaging = historyViewModel.historyItems.collectAsLazyPagingItems()
+                val historyList = remember(historyPaging.itemCount) {
+                    historyPaging.itemSnapshotList.items.filterNotNull()
+                }
+
+                EditorScreen(
+                    viewModel = editorViewModel,
+                    historyList = historyList,
+                    onNavigateBack = null,
+                    modifier = Modifier.padding(bottom = BottomOverlayClearance)
+                )
+            }
+
             composable(Screen.History.route) {
                 val historyViewModel: HistoryViewModel = viewModel(factory = viewModelFactory)
                 HistoryScreen(
@@ -97,10 +134,24 @@ fun AppNavigation(
                             restoreState = true
                         }
                     },
-                    bottomOverlayClearance = BottomOverlayClearance
+                    bottomOverlayClearance = BottomOverlayClearance,
+                    onOpenInEditor = { historyItem ->
+                        val uri = if (historyItem.outputFilePath.startsWith("content://")) {
+                            historyItem.outputFilePath.toUri()
+                        } else {
+                            Uri.fromFile(File(historyItem.outputFilePath))
+                        }
+                        editorViewModel.addTrackFromUri(0, uri, historyItem.originalFileName)
+                        navController.navigate(Screen.Editor.route) {
+                            popUpTo(navController.graph.startDestinationId) { saveState = true }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    }
                 )
             }
         }
+
         FloatingBottomNavigation(
             screens = screens,
             currentDestination = currentDestination,
@@ -145,12 +196,18 @@ private fun FloatingBottomNavigation(
                         modifier = Modifier
                             .size(52.dp)
                             .clip(CircleShape)
-                            .background(if (selected) PastelMintCardBg else androidx.compose.ui.graphics.Color.Transparent)
+                            .background(if (selected) PastelMintCardBg else Color.Transparent)
                             .semantics(mergeDescendants = true) { this.selected = selected }
                     ) {
                         when (screen) {
                             Screen.Converter -> Icon(
                                 if (selected) Icons.Filled.Mic else Icons.Outlined.Mic,
+                                contentDescription = screen.label,
+                                modifier = Modifier.size(26.dp),
+                                tint = if (selected) DeepNavyDisplay else LightSlateCaption
+                            )
+                            Screen.Editor -> Icon(
+                                if (selected) Icons.Filled.Tune else Icons.Outlined.Tune,
                                 contentDescription = screen.label,
                                 modifier = Modifier.size(26.dp),
                                 tint = if (selected) DeepNavyDisplay else LightSlateCaption
